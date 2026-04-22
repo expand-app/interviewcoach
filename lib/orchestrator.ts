@@ -27,9 +27,12 @@ export class LiveOrchestrator {
   private pendingCommentaryFor: string | null = null;  // question id we're generating for
   private lastCommentAt: Map<string, number> = new Map();
   private recentTranscript = "";
+  /** Deepgram speaker number → role, learned from the LLM on first hearing. */
+  private speakerRoles: Map<number, "interviewer" | "candidate"> = new Map();
 
   async start() {
     if (this.audio) return;
+    this.speakerRoles.clear();
 
     this.audio = new AudioSession({
       onInterimTranscript: (text) => {
@@ -38,7 +41,7 @@ export class LiveOrchestrator {
           new CustomEvent("ic:interim", { detail: text })
         );
       },
-      onFinalTranscript: (text) => this.onUtterance(text),
+      onFinalTranscript: (text, speaker) => this.onUtterance(text, speaker),
       onAudioReady: (audioUrl, _duration) => {
         // Stash on window for the End & Save flow to pick up.
         (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = audioUrl;
@@ -70,21 +73,63 @@ export class LiveOrchestrator {
 
   // ----- internals -----
 
-  private async onUtterance(text: string) {
+  private async onUtterance(text: string, dgSpeaker?: number) {
     const clean = text.trim();
     if (!clean) return;
 
     this.recentTranscript = (this.recentTranscript + " " + clean).slice(-1200);
 
-    // Classify: is this a new question from the interviewer?
-    const { isQuestion, question } = await this.classify(clean);
+    // Resolve the speaker's role.
+    //   - If Deepgram tagged the speaker AND we've already classified that
+    //     speaker number once, reuse the cached role (no LLM call needed for
+    //     candidates; only ask whether interviewer is asking a new question).
+    //   - Otherwise call the LLM classifier and cache the result.
+    let speaker: "interviewer" | "candidate" | "unknown";
+    let isQuestion = false;
+    let question = "";
+
+    const cached = dgSpeaker !== undefined ? this.speakerRoles.get(dgSpeaker) : undefined;
+    if (cached === "candidate") {
+      speaker = "candidate";
+      // No LLM call — candidates never trigger new questions.
+    } else if (cached === "interviewer") {
+      speaker = "interviewer";
+      // Still need to know if this specific utterance is a new question.
+      const result = await this.classify(clean);
+      isQuestion = result.isQuestion;
+      question = result.question;
+    } else {
+      // Unknown speaker (or first time hearing this Deepgram speaker number).
+      const result = await this.classify(clean);
+      speaker = result.speaker;
+      isQuestion = result.isQuestion;
+      question = result.question;
+      if (dgSpeaker !== undefined && (speaker === "interviewer" || speaker === "candidate")) {
+        this.speakerRoles.set(dgSpeaker, speaker);
+      }
+    }
+
+    // Log every finalized utterance for the live transcript ribbon.
+    {
+      const state = useStore.getState();
+      state.addUtterance({
+        id: rand("u"),
+        speaker,
+        text: isQuestion && question ? question : clean,
+        atSeconds: state.live.elapsedSeconds,
+      });
+    }
 
     if (isQuestion && question) {
       this.onNewQuestion(question);
       return;
     }
 
-    // Otherwise it's part of the current answer.
+    // Interviewer non-question utterances ("got it", "uh huh", role chatter)
+    // are not part of the candidate's answer — drop them.
+    if (speaker === "interviewer") return;
+
+    // Candidate or unknown → treat as part of the current answer.
     const { liveQuestions, live } = useStore.getState();
     if (!live.currentQuestionId) {
       // No question detected yet — we drop these utterances rather than guess.
@@ -100,7 +145,11 @@ export class LiveOrchestrator {
     }
   }
 
-  private async classify(utterance: string): Promise<{ isQuestion: boolean; question: string }> {
+  private async classify(utterance: string): Promise<{
+    speaker: "interviewer" | "candidate" | "unknown";
+    isQuestion: boolean;
+    question: string;
+  }> {
     try {
       const resp = await fetch("/api/detect-question", {
         method: "POST",
@@ -110,14 +159,19 @@ export class LiveOrchestrator {
           recentContext: this.recentTranscript,
         }),
       });
-      if (!resp.ok) return { isQuestion: false, question: "" };
+      if (!resp.ok) return { speaker: "unknown", isQuestion: false, question: "" };
       const data = (await resp.json()) as {
+        speaker?: "interviewer" | "candidate" | "unknown";
         isQuestion: boolean;
         question?: string;
       };
-      return { isQuestion: data.isQuestion, question: data.question || "" };
+      return {
+        speaker: data.speaker ?? "unknown",
+        isQuestion: data.isQuestion,
+        question: data.question || "",
+      };
     } catch {
-      return { isQuestion: false, question: "" };
+      return { speaker: "unknown", isQuestion: false, question: "" };
     }
   }
 

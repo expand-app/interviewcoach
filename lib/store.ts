@@ -5,7 +5,11 @@ import type {
   Question,
   Session,
   LiveState,
+  Utterance,
 } from "@/types/session";
+
+/** How many recent utterances to keep in the live transcript ribbon. */
+const UTTERANCE_DISPLAY_CAP = 30;
 
 interface StoreState {
   // === Language for AI commentary (questions stay in original language) ===
@@ -32,12 +36,15 @@ interface StoreState {
   liveQuestions: Question[];
   liveJd: string;
   liveResume: string;
+  /** Rolling window of finalized utterances with speaker labels (newest last). */
+  liveUtterances: Utterance[];
 
   startLive: (jd: string, resume: string) => void;
   addQuestion: (q: Question) => void;
   addCommentToQuestion: (questionId: string, c: Comment) => void;
+  addUtterance: (u: Utterance) => void;
   /** End the live session, snapshot it into past sessions with the given title. */
-  endLive: (title: string, audioUrl?: string) => Session | null;
+  endLive: (title: string, audioUrl?: string) => Session;
   /** Wipe live state (after End & Save, or a hard reset). */
   resetLive: () => void;
 }
@@ -81,12 +88,14 @@ export const useStore = create<StoreState>((set, get) => ({
   liveQuestions: [],
   liveJd: "",
   liveResume: "",
+  liveUtterances: [],
 
   startLive: (jd, resume) =>
     set({
       liveJd: jd,
       liveResume: resume,
       liveQuestions: [],
+      liveUtterances: [],
       live: { status: "recording", elapsedSeconds: 0, currentQuestionId: null },
     }),
 
@@ -103,9 +112,19 @@ export const useStore = create<StoreState>((set, get) => ({
       ),
     })),
 
+  addUtterance: (u) =>
+    set((s) => {
+      const next = [...s.liveUtterances, u];
+      return {
+        liveUtterances:
+          next.length > UTTERANCE_DISPLAY_CAP
+            ? next.slice(next.length - UTTERANCE_DISPLAY_CAP)
+            : next,
+      };
+    }),
+
   endLive: (title, audioUrl) => {
     const s = get();
-    if (s.liveQuestions.length === 0) return null;
     const session: Session = {
       id: `sess-${Date.now()}`,
       title,
@@ -123,6 +142,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveQuestions: [],
       liveJd: "",
       liveResume: "",
+      liveUtterances: [],
       live: emptyLive,
     }));
     return session;
@@ -133,6 +153,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveQuestions: [],
       liveJd: "",
       liveResume: "",
+      liveUtterances: [],
       live: emptyLive,
     }),
 }));

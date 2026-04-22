@@ -4,6 +4,17 @@
 
 export type CommentLanguage = "en" | "zh";
 
+export type Speaker = "interviewer" | "candidate" | "unknown";
+
+/** A finalized chunk of transcript with its detected speaker. */
+export interface Utterance {
+  id: string;
+  speaker: Speaker;
+  text: string;
+  /** Seconds from session start when the utterance was finalized. */
+  atSeconds: number;
+}
+
 /** A single piece of AI commentary on what the candidate just said. */
 export interface Comment {
   id: string;

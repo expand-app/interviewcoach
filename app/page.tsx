@@ -21,6 +21,7 @@ export default function Page() {
   const startLive = useStore((s) => s.startLive);
   const liveStatus = useStore((s) => s.live.status);
   const endLive = useStore((s) => s.endLive);
+  const selectPast = useStore((s) => s.selectPast);
   const renamePast = useStore((s) => s.renamePastSession);
   const deletePast = useStore((s) => s.deletePastSession);
   const setElapsed = useStore((s) => s.setElapsed);
@@ -99,8 +100,9 @@ export default function Page() {
     await getOrchestrator().stop();
     // Pick up the recorded audio URL that the orchestrator stashed.
     const audioUrl = (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl;
-    endLive(title, audioUrl);
+    const saved = endLive(title, audioUrl);
     (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = undefined;
+    selectPast(saved.id);
   };
 
   return (

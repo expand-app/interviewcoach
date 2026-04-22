@@ -1,13 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
+import type { Speaker, Utterance } from "@/types/session";
 
 export function LiveView() {
   const t = useTranslations();
   const questions = useStore((s) => s.liveQuestions);
   const live = useStore((s) => s.live);
+  const utterances = useStore((s) => s.liveUtterances);
 
   // Subscribe to the interim transcript via window events — keeps the event
   // bus out of the Zustand store (this state is noisy and doesn't need to
@@ -61,7 +63,7 @@ export function LiveView() {
           <div className="border-y border-rule py-3.5 relative">
             <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
-              {t("Current Question", "当前问题")}
+              {t("Current Question · Interviewer", "当前问题 · 面试官")}
             </div>
             <div className="font-serif text-[19px] leading-snug text-ink font-medium">
               {currentQ.text}
@@ -94,6 +96,21 @@ export function LiveView() {
       {/* Scrollable feed */}
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-40 max-[900px]:px-5">
+          {(utterances.length > 0 || interim) && (
+            <LiveCaptions
+              utterances={utterances}
+              interim={interim}
+              isRecording={live.status === "recording"}
+              labels={{
+                heading: t("Live Captions", "实时字幕"),
+                live: t("LIVE", "直播中"),
+                interviewer: t("Interviewer", "面试官"),
+                candidate: t("Candidate", "候选人"),
+                unknown: t("Speaker", "发言者"),
+              }}
+            />
+          )}
+
           {currentQ && (
             <div className="pb-6 pt-1">
               <div className="text-[11px] text-ink-lighter tracking-wide font-medium mb-2">
@@ -152,6 +169,112 @@ export function LiveView() {
         </div>
       </div>
     </>
+  );
+}
+
+/**
+ * Tencent-Meeting / Teams style live caption pane.
+ *
+ * - Consecutive utterances from the same speaker are merged into one paragraph
+ * - Speaker label (Interviewer / Candidate / Speaker) appears once at the
+ *   start of each paragraph and changes only when the speaker changes
+ * - Interim (not-yet-final) text is appended to the LAST paragraph in muted
+ *   italic, then replaced by the styled final text once Deepgram finalizes
+ * - Auto-scrolls to the bottom on update; if the user scrolls up to read
+ *   history, we stop force-scrolling until they scroll back near the bottom
+ */
+function LiveCaptions({
+  utterances,
+  interim,
+  isRecording,
+  labels,
+}: {
+  utterances: Utterance[];
+  interim: string;
+  isRecording: boolean;
+  labels: {
+    heading: string;
+    live: string;
+    interviewer: string;
+    candidate: string;
+    unknown: string;
+  };
+}) {
+  // Merge consecutive same-speaker utterances into paragraphs.
+  const paragraphs = useMemo(() => {
+    const out: Array<{ key: string; speaker: Speaker; text: string }> = [];
+    for (const u of utterances) {
+      const last = out[out.length - 1];
+      if (last && last.speaker === u.speaker) {
+        last.text += " " + u.text;
+      } else {
+        out.push({ key: u.id, speaker: u.speaker, text: u.text });
+      }
+    }
+    return out;
+  }, [utterances]);
+
+  // Auto-scroll to bottom when new content arrives, but only if the user is
+  // already near the bottom. This lets them scroll up to re-read without
+  // being yanked back down on the next utterance.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickRef.current = distanceFromBottom < 32;
+  };
+  useEffect(() => {
+    if (!stickRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [paragraphs, interim]);
+
+  const speakerName = (s: Speaker) =>
+    s === "interviewer" ? labels.interviewer : s === "candidate" ? labels.candidate : labels.unknown;
+  const speakerColor = (s: Speaker) =>
+    s === "interviewer" ? "text-accent" : s === "candidate" ? "text-ink" : "text-ink-lighter";
+
+  return (
+    <div className="mb-6 border border-rule rounded-md bg-paper-subtle overflow-hidden">
+      <div className="px-4 pt-2.5 pb-1.5 border-b border-rule flex items-center gap-2">
+        <span className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider">
+          {labels.heading}
+        </span>
+        {isRecording && (
+          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-accent uppercase tracking-wider">
+            <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
+            {labels.live}
+          </span>
+        )}
+      </div>
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        className="px-4 py-3 max-h-80 overflow-y-auto"
+      >
+        {paragraphs.map((p, i) => (
+          <p key={p.key} className="mb-3 last:mb-0 text-[14.5px] leading-relaxed">
+            <span className={`font-semibold mr-1.5 ${speakerColor(p.speaker)}`}>
+              {speakerName(p.speaker)}:
+            </span>
+            <span className="text-ink">{p.text}</span>
+            {i === paragraphs.length - 1 && interim && (
+              <span className="text-ink-lighter/70 italic"> {interim}</span>
+            )}
+          </p>
+        ))}
+        {paragraphs.length === 0 && interim && (
+          <p className="mb-0 text-[14.5px] leading-relaxed">
+            <span className="font-semibold mr-1.5 text-ink-lighter">
+              {labels.unknown}:
+            </span>
+            <span className="text-ink-lighter/70 italic">{interim}</span>
+          </p>
+        )}
+      </div>
+    </div>
   );
 }
 
