@@ -70,7 +70,8 @@ export class LiveOrchestrator {
       onInterimTranscript: (text) => {
         window.dispatchEvent(new CustomEvent("ic:interim", { detail: text }));
       },
-      onFinalTranscript: (text, speaker) => this.onUtterance(text, speaker),
+      onFinalTranscript: (text, speaker, duration) =>
+        this.onUtterance(text, speaker, duration),
       onAudioReady: (audioUrl) => {
         (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = audioUrl;
       },
@@ -109,7 +110,7 @@ export class LiveOrchestrator {
 
   // ----- internals -----
 
-  private async onUtterance(text: string, dgSpeaker?: number) {
+  private async onUtterance(text: string, dgSpeaker?: number, duration?: number) {
     const clean = text.trim();
     if (!clean) return;
 
@@ -123,6 +124,7 @@ export class LiveOrchestrator {
         dgSpeaker,
         text: clean,
         atSeconds: state.live.elapsedSeconds,
+        duration,
       });
     }
 
@@ -216,6 +218,12 @@ export class LiveOrchestrator {
         ? Date.now() - this.lastTranscriptAt
         : 0;
 
+      const currentQuestionText = (() => {
+        const s = useStore.getState();
+        const q = s.liveQuestions.find((x) => x.id === s.live.currentQuestionId);
+        return q?.text ?? "";
+      })();
+
       const resp = await fetch("/api/classify-moment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -223,6 +231,7 @@ export class LiveOrchestrator {
           utterances: sample,
           currentState,
           msSinceLastTranscript,
+          currentQuestionText,
         }),
       });
       if (!resp.ok) return;
@@ -230,10 +239,16 @@ export class LiveOrchestrator {
         state?: MomentStateKind;
         summary?: string;
         question?: string;
+        isNewQuestion?: boolean;
       };
       if (!data.state) return;
 
-      this.applyMoment(data.state, data.summary || "", data.question || "");
+      this.applyMoment(
+        data.state,
+        data.summary || "",
+        data.question || "",
+        Boolean(data.isNewQuestion)
+      );
     } catch {
       /* best-effort; the next trigger will retry */
     } finally {
@@ -244,18 +259,52 @@ export class LiveOrchestrator {
   private applyMoment(
     next: MomentStateKind,
     summary: string,
-    questionText: string
+    questionText: string,
+    isNewQuestion: boolean
   ) {
     const store = useStore.getState();
     const prev = store.liveMomentState.state;
+    const currentQ = store.liveQuestions.find(
+      (q) => q.id === store.live.currentQuestionId
+    );
 
-    // Always update the displayed state + summary (even if state didn't change,
-    // the summary may have been refined as the interviewer kept talking).
+    // ----- Anchoring rule -----
+    // Once a question is finalized, the displayed state SHOULD NOT change
+    // unless we have strong evidence a new TOPICAL question is being asked.
+    // Follow-ups, candidate clarifications, side-chitchat, interviewer
+    // self-corrections all keep Current Question pinned.
+    if (prev === "question_finalized") {
+      if (next === "question_finalized") {
+        // Same state — only act if Haiku surfaced a NEW question text.
+        const sameQuestion =
+          !questionText ||
+          (currentQ && questionText.trim() === currentQ.text.trim());
+        if (sameQuestion) return; // no-op
+        // Different question text → archive old, create new.
+        this.archiveCurrentQuestionAndStart(questionText, summary);
+        return;
+      }
+      if (next === "interviewer_speaking" && isNewQuestion) {
+        // Interviewer is starting a new topical question. Archive Q1, move
+        // display to interviewer_speaking. Q2 will finalize on a later tick.
+        store.setCurrentQuestionId(null);
+        store.setMomentState({ state: "interviewer_speaking", summary });
+        this.answerBuffer = "";
+        this.pendingAnswerBuffer = "";
+        this.pendingCommentaryFor = null;
+        return;
+      }
+      // Anything else (chitchat, follow-up interviewer_speaking, etc.) —
+      // keep showing Current Question, don't update state.
+      return;
+    }
+
+    // ----- Pre-finalization transitions (chitchat / interviewer / first Q) -----
     store.setMomentState({ state: next, summary });
 
-    if (next === "question_finalized" && prev !== "question_finalized") {
-      // New question: create the Question, carry over any candidate text the
-      // candidate has spoken since the interviewer started this question.
+    if (next === "question_finalized") {
+      // First question of the session, OR finalizing after interviewer_speaking
+      // / chitchat. Create the Question, carry over candidate text.
       const text = questionText || summary;
       if (text) {
         const q: Question = {
@@ -268,27 +317,36 @@ export class LiveOrchestrator {
         this.answerBuffer = this.pendingAnswerBuffer;
         this.pendingAnswerBuffer = "";
         this.pendingCommentaryFor = null;
-        // If the carried-over text already exceeds the trigger, fire commentary
-        // immediately for a snappy first reaction.
         if (this.shouldTriggerComment(q.id)) {
           void this.generateComment(q);
         }
       }
-    } else if (next !== "question_finalized" && prev === "question_finalized") {
-      // Leaving question_finalized — the just-completed question falls into
-      // "Earlier in this interview" by clearing currentQuestionId.
-      store.setCurrentQuestionId(null);
-      this.answerBuffer = "";
-      this.pendingCommentaryFor = null;
-      // Reset pending buffer for the NEW question that's beginning.
+    } else if (next === "interviewer_speaking" || next === "chitchat") {
+      // Reset pending buffer so chitchat / inter-speaker text doesn't leak
+      // into the next question's answer.
       this.pendingAnswerBuffer = "";
-    } else if (next === "interviewer_speaking" && prev !== "interviewer_speaking") {
-      // Entering interviewer_speaking from chitchat or idle — start a fresh
-      // pending buffer so candidate text from prior chitchat doesn't leak in.
-      this.pendingAnswerBuffer = "";
-    } else if (next === "chitchat") {
-      // Chitchat — nothing the candidate says is part of any answer.
-      this.pendingAnswerBuffer = "";
+    }
+  }
+
+  /** Archive the current question and create a new one in its place. Used
+   *  when classify-moment surfaces a new question text directly without
+   *  passing through interviewer_speaking. */
+  private archiveCurrentQuestionAndStart(text: string, summary: string) {
+    const store = useStore.getState();
+    store.setCurrentQuestionId(null);
+    const q: Question = {
+      id: rand("q"),
+      text,
+      askedAtSeconds: store.live.elapsedSeconds,
+      comments: [],
+    };
+    store.addQuestion(q);
+    store.setMomentState({ state: "question_finalized", summary });
+    this.answerBuffer = this.pendingAnswerBuffer;
+    this.pendingAnswerBuffer = "";
+    this.pendingCommentaryFor = null;
+    if (this.shouldTriggerComment(q.id)) {
+      void this.generateComment(q);
     }
   }
 

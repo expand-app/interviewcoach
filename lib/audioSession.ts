@@ -21,8 +21,10 @@ export interface AudioSessionCallbacks {
   /**
    * `speaker` is Deepgram's diarization label (0, 1, 2, ...).
    * undefined when diarization can't assign a speaker (interim results, music).
+   * `duration` is the length of audio this segment covers, in seconds, from
+   * Deepgram's per-Results `duration` field.
    */
-  onFinalTranscript: (text: string, speaker?: number) => void;
+  onFinalTranscript: (text: string, speaker?: number, duration?: number) => void;
   onInterimTranscript: (text: string) => void;
   onAudioReady: (audioUrl: string, duration: number) => void;
   onError: (msg: string) => void;
@@ -46,6 +48,8 @@ interface DeepgramMessage {
   channel?: { alternatives: DeepgramAlternative[] };
   is_final?: boolean;
   speech_final?: boolean;
+  /** Length of audio in this segment, in seconds. */
+  duration?: number;
 }
 
 const DEEPGRAM_QUERY = new URLSearchParams({
@@ -184,7 +188,12 @@ export class AudioSession {
     if (msg.is_final) {
       // Pick the dominant speaker across the words in this final segment.
       const speaker = pickDominantSpeaker(alt.words);
-      this.callbacks.onFinalTranscript(transcript, speaker);
+      // Prefer Deepgram's segment duration; fall back to word timings if missing.
+      const duration =
+        typeof msg.duration === "number"
+          ? msg.duration
+          : computeWordsDuration(alt.words);
+      this.callbacks.onFinalTranscript(transcript, speaker, duration);
       // Clear interim view.
       this.callbacks.onInterimTranscript("");
     } else {
@@ -267,6 +276,19 @@ export class AudioSession {
     const url = URL.createObjectURL(blob);
     this.callbacks.onAudioReady(url, duration);
   }
+}
+
+/** Sum (last_word.end - first_word.start) as a fallback when Deepgram's
+ *  per-segment `duration` field isn't on the message. */
+function computeWordsDuration(
+  words: Array<{ start: number; end: number }> | undefined
+): number | undefined {
+  if (!words || words.length === 0) return undefined;
+  const first = words[0]?.start;
+  const last = words[words.length - 1]?.end;
+  if (typeof first !== "number" || typeof last !== "number") return undefined;
+  const d = last - first;
+  return d > 0 ? d : undefined;
 }
 
 /**

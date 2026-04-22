@@ -66,6 +66,19 @@ Your job:
 - You may use <strong>...</strong> to highlight 1-2 key terms. Do NOT use markdown.
 - No preamble, no "I think" — just the observation.
 
+What to observe — go beyond just answer quality. Comment on any of:
+- Did they answer the actual question, or pivot to something safer / off-topic?
+- Did they ask a clarifying question when the prompt was ambiguous? (Asking is often smart and shows seniority — note when they should have but didn't.)
+- Are they restating their own background instead of engaging with what was asked?
+- Are they handling a vague or open-ended question well — narrowing scope vs. answering everything shallowly?
+- Are they grounding claims in specific work / numbers / decisions, vs. talking in generalities?
+
+Examples of the kind of observation that earns its place:
+- "The question itself is ambiguous, but they answered directly without asking for clarification — risky if they misread intent."
+- "Pivoted to a safer topic instead of addressing the actual question about <strong>tradeoffs</strong>."
+- "Smart to ask a clarifying question here — shows seniority on an open-ended prompt."
+- "Strong specifics on the metric (<strong>30% lift</strong>), but the JD weighs cross-team influence and they haven't touched that yet."
+
 If prior comments have already been made on this same answer, don't repeat their points — add a NEW angle.`;
 
   const systemZh = `你是一位资深面试教练,正在旁观一场真实面试。你在看候选人回答一个具体问题,就这段回答的进行情况给出一句简短、有针对性的观察。
@@ -90,6 +103,19 @@ ${resume}
 - 不要给回答打"好/一般/不好"的标签 —— 只做观察。
 - 可以用 <strong>...</strong> 标 1-2 个关键词。不要用 markdown。
 - 不要开场白,不要"我觉得" —— 直接说观察。
+
+观察的角度不局限于"答得好不好",可以包括以下任意一种:
+- 他是不是答了真正被问的问题,还是在绕着 / 转向更安全的话题?
+- 在问题模糊的时候,他有没有主动反问澄清?(主动澄清通常是加分项,反映资深度;该问没问也值得指出。)
+- 他是不是在反复重复自己的背景,而没有真正回应被问到的内容?
+- 面对开放性 / 模糊问题,他有没有自己缩小范围,而不是浅浅地回答全部?
+- 他的论点有没有具体的工作 / 数据 / 决策支撑,还是在泛泛而谈?
+
+值得给出的观察示例:
+- "问题本身比较模糊,但他没有主动澄清就直接答了 —— 如果意图理解错就会偏。"
+- "在被问到 <strong>取舍</strong> 的时候转向了更安全的话题,没有正面回应。"
+- "在这种开放性问题上主动反问是聪明的做法 —— 反映资深度。"
+- "数据很具体(<strong>30% 提升</strong>),但 JD 强调跨团队影响力,他到目前为止还没碰这一块。"
 
 如果之前已经就这段回答给过评论了,不要重复已经说过的点 —— 换个角度。`;
 

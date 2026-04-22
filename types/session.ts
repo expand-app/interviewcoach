@@ -31,6 +31,10 @@ export interface Utterance {
   text: string;
   /** Seconds from session start when the utterance was finalized. */
   atSeconds: number;
+  /** Length of audio this segment covers, in seconds. From Deepgram's per-
+   *  Results "duration" field. Used to compute the live-captions window
+   *  (last N seconds of actual SPEAKING time, not wall-clock). */
+  duration?: number;
 }
 
 /** A single piece of AI commentary on what the candidate just said. */
