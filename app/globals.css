@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  font-size: 16px;
+}
+
+body {
+  @apply font-sans text-ink bg-paper;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Notion-style thin scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 5px;
+  border: 2px solid var(--scrollbar-track, #ffffff);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Keyframes used across components */
+@keyframes appear {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+@keyframes bounce-dot {
+  0%, 60%, 100% { transform: translateY(0);    opacity: 0.4; }
+  30%           { transform: translateY(-4px); opacity: 1;   }
+}
+
+.animate-appear     { animation: appear .25s ease; }
+.animate-pulse-dot  { animation: pulse-dot 1.4s infinite; }
+.animate-bounce-dot { animation: bounce-dot 1.2s infinite; }
+
+/* Small utility for embedded HTML (bold, em) inside translated text */
+.prose-live strong { font-weight: 600; }
+.prose-live em     { font-style: italic; }
