@@ -7,6 +7,7 @@ import type {
   LiveState,
   Utterance,
   MomentState,
+  DisplayedComment,
 } from "@/types/session";
 
 /** How many recent utterances to keep in the live transcript ribbon. */
@@ -44,6 +45,13 @@ interface StoreState {
   liveSpeakerRoles: Record<number, "interviewer" | "candidate">;
   /** Current "moment" — drives the top bar's three-state display. */
   liveMomentState: MomentState;
+  /** The single commentary currently shown in the live pane, with its
+   *  minimum-display window. null between comments. */
+  liveDisplayedComment: DisplayedComment | null;
+  /** True when the candidate has started speaking under the current
+   *  question and no commentary is yet displayed — drives the
+   *  "AI is observing…" dots indicator. */
+  liveAnswerInProgress: boolean;
 
   startLive: (jd: string, resume: string) => void;
   addQuestion: (q: Question) => void;
@@ -53,6 +61,8 @@ interface StoreState {
    *  overwritten — once a speaker's role is decided, it sticks. */
   mergeSpeakerRoles: (roles: Record<number, "interviewer" | "candidate">) => void;
   setMomentState: (m: MomentState) => void;
+  setDisplayedComment: (d: DisplayedComment | null) => void;
+  setAnswerInProgress: (v: boolean) => void;
   /** End the live session, snapshot it into past sessions with the given title. */
   endLive: (title: string, audioUrl?: string) => Session;
   /** Wipe live state (after End & Save, or a hard reset). */
@@ -103,6 +113,8 @@ export const useStore = create<StoreState>((set, get) => ({
   liveUtterances: [],
   liveSpeakerRoles: {},
   liveMomentState: emptyMoment,
+  liveDisplayedComment: null,
+  liveAnswerInProgress: false,
 
   startLive: (jd, resume) =>
     set({
@@ -112,6 +124,8 @@ export const useStore = create<StoreState>((set, get) => ({
       liveUtterances: [],
       liveSpeakerRoles: {},
       liveMomentState: emptyMoment,
+      liveDisplayedComment: null,
+      liveAnswerInProgress: false,
       live: { status: "recording", elapsedSeconds: 0, currentQuestionId: null },
     }),
 
@@ -155,6 +169,10 @@ export const useStore = create<StoreState>((set, get) => ({
 
   setMomentState: (m) => set({ liveMomentState: m }),
 
+  setDisplayedComment: (d) => set({ liveDisplayedComment: d }),
+
+  setAnswerInProgress: (v) => set({ liveAnswerInProgress: v }),
+
   endLive: (title, audioUrl) => {
     const s = get();
     const session: Session = {
@@ -177,6 +195,8 @@ export const useStore = create<StoreState>((set, get) => ({
       liveUtterances: [],
       liveSpeakerRoles: {},
       liveMomentState: emptyMoment,
+      liveDisplayedComment: null,
+      liveAnswerInProgress: false,
       live: emptyLive,
     }));
     return session;
@@ -190,6 +210,8 @@ export const useStore = create<StoreState>((set, get) => ({
       liveUtterances: [],
       liveSpeakerRoles: {},
       liveMomentState: emptyMoment,
+      liveDisplayedComment: null,
+      liveAnswerInProgress: false,
       live: emptyLive,
     }),
 }));

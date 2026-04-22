@@ -54,6 +54,25 @@ export interface Question {
   askedAtSeconds: number;
   /** Newest-first ordering is a UI concern; we store chronological. */
   comments: Comment[];
+  /** If this question is a follow-up that drills into a parent main question,
+   *  the parent's id. undefined for top-level (main) questions. Follow-ups
+   *  archive together with their main when a new_topic question arrives. */
+  parentQuestionId?: string;
+}
+
+/** Tracking for the single piece of commentary currently shown in the live
+ *  pane. New commentary that arrives while the displayed one is still in its
+ *  minimum-display window is DROPPED — no queue. */
+export interface DisplayedComment {
+  /** Matches a Comment.id under one of the live questions. */
+  id: string;
+  /** Which question this comment belongs to (so we can stop showing it when
+   *  the question changes). */
+  questionId: string;
+  /** ms timestamp when the comment finished streaming and entered display. */
+  displayedAt: number;
+  /** Minimum ms this comment must remain on screen before being replaced. */
+  minMs: number;
 }
 
 export interface Session {

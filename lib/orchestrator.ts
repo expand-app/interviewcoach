@@ -7,7 +7,8 @@ import type { Comment, MomentStateKind, Question } from "@/types/session";
  *   1. Runs an AudioSession for transcription + recording
  *   2. Identifies speakers (via /api/identify-speakers, cached per-session)
  *   3. Drives the moment state machine (via /api/classify-moment)
- *   4. Manages question creation and answer-buffer carry-over across states
+ *   4. Manages question hierarchy (main + follow-ups), answer-buffer carry-
+ *      over, and commentary timing/display-slot enforcement
  *   5. Triggers commentary generation at natural pauses
  *
  * There's exactly one orchestrator at a time, stored on the window for
@@ -17,6 +18,9 @@ import type { Comment, MomentStateKind, Question } from "@/types/session";
 // Tunable thresholds
 const COMMENT_TRIGGER_CHARS = 220;
 const COMMENT_MIN_GAP_MS    = 8000;
+const COMMENT_MIN_DISPLAY_MS = 4000;   // floor — even a 1-word comment shows this long
+const COMMENT_MAX_DISPLAY_MS = 30000;  // ceiling — a very long comment can still be replaced
+const COMMENT_BUFFER_MS     = 1500;    // padding on top of computed reading time
 
 // Identification thresholds
 const IDENTIFY_MIN_DISTINCT_SPEAKERS = 2;
@@ -25,31 +29,45 @@ const IDENTIFY_CONTEXT_CAP           = 12;
 
 // Moment classification timing
 const CLASSIFY_DEBOUNCE_MS = 500;
-const CLASSIFY_SILENCE_MS  = 2000;
+const CLASSIFY_SILENCE_MS  = 3000;
 const CLASSIFY_CONTEXT_CAP = 12;
+
+type QuestionRelation = "new_topic" | "follow_up" | null;
 
 function rand(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now()}`;
 }
 
+/** Reading time for a piece of commentary text. Mixed Chinese + English uses
+ *  the slower of the two rates so neither side gets cut off. */
+function computeMinDisplayMs(text: string): number {
+  if (!text) return COMMENT_MIN_DISPLAY_MS;
+  const cjk = (text.match(/[一-鿿]/g) || []).length;
+  const englishWords = text.split(/\s+/).filter((w) => /[a-zA-Z]/.test(w)).length;
+  const cjkSec = cjk / 4;        // 4 chars/sec
+  const enSec = englishWords / 2; // 2 words/sec
+  const readingMs = Math.max(cjkSec, enSec) * 1000;
+  return Math.min(
+    COMMENT_MAX_DISPLAY_MS,
+    Math.max(COMMENT_MIN_DISPLAY_MS, readingMs + COMMENT_BUFFER_MS)
+  );
+}
+
 export class LiveOrchestrator {
   private audio: AudioSession | null = null;
-  /** Text accumulated under the current finalized question, awaiting commentary. */
+  /** Text accumulated under the current question, awaiting commentary. */
   private answerBuffer = "";
-  /** Candidate text accumulated while the interviewer is mid-question; carried
-   *  over to answerBuffer when the question finalizes so the start of the
-   *  candidate's response isn't lost from commentary input. */
+  /** Candidate text accumulated while interviewer is mid-question; carries
+   *  over to answerBuffer when a new question finalizes so the start of
+   *  the candidate's answer survives the transition. */
   private pendingAnswerBuffer = "";
   private pendingCommentaryFor: string | null = null;
   private lastCommentAt: Map<string, number> = new Map();
   private recentTranscript = "";
 
-  /** Speaker identification (Deepgram speaker # → role). Lives in the store
-   *  so the UI can re-derive labels. We keep the in-flight gate locally. */
   private knownDgSpeakers = new Set<number>();
   private identifyInFlight = false;
 
-  /** Moment classification timing/gating. */
   private lastDgSpeaker: number | undefined;
   private lastTranscriptAt = 0;
   private classifyDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -65,6 +83,8 @@ export class LiveOrchestrator {
     this.classifyInFlight = false;
     this.answerBuffer = "";
     this.pendingAnswerBuffer = "";
+    this.pendingCommentaryFor = null;
+    this.lastCommentAt.clear();
 
     this.audio = new AudioSession({
       onInterimTranscript: (text) => {
@@ -116,7 +136,6 @@ export class LiveOrchestrator {
 
     this.recentTranscript = (this.recentTranscript + " " + clean).slice(-1200);
 
-    // 1) Persist the raw utterance immediately for the live captions UI.
     {
       const state = useStore.getState();
       state.addUtterance({
@@ -128,7 +147,6 @@ export class LiveOrchestrator {
       });
     }
 
-    // 2) Trigger speaker identification at the right moments.
     if (dgSpeaker !== undefined) {
       const isNewDgSpeaker = !this.knownDgSpeakers.has(dgSpeaker);
       this.knownDgSpeakers.add(dgSpeaker);
@@ -153,9 +171,6 @@ export class LiveOrchestrator {
       }
     }
 
-    // 3) Drive the moment state machine.
-    //    - Reset silence timer (2s of nothing → trigger classify).
-    //    - On speaker switch, schedule a debounced classify.
     this.lastTranscriptAt = Date.now();
     this.armSilenceTimer();
     if (dgSpeaker !== undefined && dgSpeaker !== this.lastDgSpeaker) {
@@ -163,7 +178,6 @@ export class LiveOrchestrator {
       this.scheduleClassifyMoment();
     }
 
-    // 4) Per-state buffering of CANDIDATE text.
     const role =
       dgSpeaker !== undefined
         ? useStore.getState().liveSpeakerRoles[dgSpeaker]
@@ -172,20 +186,18 @@ export class LiveOrchestrator {
 
     const momentState = useStore.getState().liveMomentState.state;
     if (momentState === "question_finalized") {
-      const { liveQuestions, live } = useStore.getState();
+      const { liveQuestions, live, setAnswerInProgress } = useStore.getState();
       if (!live.currentQuestionId) return;
       this.answerBuffer += (this.answerBuffer ? " " : "") + clean;
+      setAnswerInProgress(true);
       if (this.shouldTriggerComment(live.currentQuestionId)) {
         const currentQ = liveQuestions.find((q) => q.id === live.currentQuestionId);
         if (currentQ) void this.generateComment(currentQ);
       }
     } else if (momentState === "interviewer_speaking") {
-      // Carry-over: stash candidate text so the start of their answer survives
-      // the transition into question_finalized.
       this.pendingAnswerBuffer +=
         (this.pendingAnswerBuffer ? " " : "") + clean;
     }
-    // chitchat / idle → drop candidate text (no question to attach it to).
   }
 
   // ----- moment state machine -----
@@ -213,16 +225,22 @@ export class LiveOrchestrator {
       const sample = this.buildClassifySample();
       if (sample.length === 0) return;
 
-      const currentState = useStore.getState().liveMomentState.state;
+      const store = useStore.getState();
+      const currentState = store.liveMomentState.state;
       const msSinceLastTranscript = this.lastTranscriptAt
         ? Date.now() - this.lastTranscriptAt
         : 0;
 
-      const currentQuestionText = (() => {
-        const s = useStore.getState();
-        const q = s.liveQuestions.find((x) => x.id === s.live.currentQuestionId);
-        return q?.text ?? "";
-      })();
+      // Compute current main + follow-up texts to send to Haiku.
+      const currentSubQ = store.liveQuestions.find(
+        (q) => q.id === store.live.currentQuestionId
+      );
+      const currentMainQ = currentSubQ?.parentQuestionId
+        ? store.liveQuestions.find((q) => q.id === currentSubQ.parentQuestionId)
+        : currentSubQ;
+      const currentMainQuestionText = currentMainQ?.text ?? "";
+      const currentFollowUpText =
+        currentSubQ && currentSubQ !== currentMainQ ? currentSubQ.text : "";
 
       const resp = await fetch("/api/classify-moment", {
         method: "POST",
@@ -231,7 +249,8 @@ export class LiveOrchestrator {
           utterances: sample,
           currentState,
           msSinceLastTranscript,
-          currentQuestionText,
+          currentMainQuestionText,
+          currentFollowUpText,
         }),
       });
       if (!resp.ok) return;
@@ -239,7 +258,7 @@ export class LiveOrchestrator {
         state?: MomentStateKind;
         summary?: string;
         question?: string;
-        isNewQuestion?: boolean;
+        questionRelation?: QuestionRelation;
       };
       if (!data.state) return;
 
@@ -247,7 +266,7 @@ export class LiveOrchestrator {
         data.state,
         data.summary || "",
         data.question || "",
-        Boolean(data.isNewQuestion)
+        data.questionRelation ?? null
       );
     } catch {
       /* best-effort; the next trigger will retry */
@@ -256,55 +275,87 @@ export class LiveOrchestrator {
     }
   }
 
+  /**
+   * Apply a classify-moment result. Most of the complexity lives in deciding
+   * whether a finalized question should:
+   *   (a) replace the current main (new_topic),
+   *   (b) attach as a follow-up under the current main (follow_up), or
+   *   (c) no-op (same question being re-emphasized).
+   *
+   * And whether an interviewer_speaking transition should:
+   *   (a) keep the current main but flag we're hearing a new topic forming
+   *       (archive immediately so the bar shifts to "asking"),
+   *   (b) treat as a follow-up being asked (keep main, show "asking follow-up" sub-state — handled in UI), or
+   *   (c) ignore (chitchat / candidate clarification noise — keep showing).
+   */
   private applyMoment(
     next: MomentStateKind,
     summary: string,
     questionText: string,
-    isNewQuestion: boolean
+    rel: QuestionRelation
   ) {
     const store = useStore.getState();
     const prev = store.liveMomentState.state;
-    const currentQ = store.liveQuestions.find(
+    const currentSubQ = store.liveQuestions.find(
       (q) => q.id === store.live.currentQuestionId
     );
+    const currentMainQ = currentSubQ?.parentQuestionId
+      ? store.liveQuestions.find((q) => q.id === currentSubQ.parentQuestionId)
+      : currentSubQ;
+    const currentFollowUpQ =
+      currentSubQ && currentSubQ !== currentMainQ ? currentSubQ : undefined;
 
-    // ----- Anchoring rule -----
-    // Once a question is finalized, the displayed state SHOULD NOT change
-    // unless we have strong evidence a new TOPICAL question is being asked.
-    // Follow-ups, candidate clarifications, side-chitchat, interviewer
-    // self-corrections all keep Current Question pinned.
-    if (prev === "question_finalized") {
+    // Anchored mode — once a main question is locked, be conservative.
+    if (currentMainQ) {
       if (next === "question_finalized") {
-        // Same state — only act if Haiku surfaced a NEW question text.
-        const sameQuestion =
-          !questionText ||
-          (currentQ && questionText.trim() === currentQ.text.trim());
-        if (sameQuestion) return; // no-op
-        // Different question text → archive old, create new.
-        this.archiveCurrentQuestionAndStart(questionText, summary);
+        // Same as current main or current follow-up → no-op.
+        const txt = (questionText || "").trim();
+        if (
+          !txt ||
+          txt === currentMainQ.text.trim() ||
+          (currentFollowUpQ && txt === currentFollowUpQ.text.trim())
+        ) {
+          // Just refresh state/summary in case display is stale (e.g. came
+          // back from chitchat).
+          store.setMomentState({ state: "question_finalized", summary });
+          return;
+        }
+        if (rel === "follow_up") {
+          // Attach as a sub-question under the existing main.
+          this.addFollowUpAndStart(currentMainQ.id, txt, summary);
+          return;
+        }
+        // Treat anything else as a new main topic — archive and start fresh.
+        this.archiveCurrentMainAndStartNew(txt, summary);
         return;
       }
-      if (next === "interviewer_speaking" && isNewQuestion) {
-        // Interviewer is starting a new topical question. Archive Q1, move
-        // display to interviewer_speaking. Q2 will finalize on a later tick.
+      if (next === "interviewer_speaking" && rel === "new_topic") {
+        // Interviewer pivoting to a new topic — archive immediately so the bar
+        // visibly shifts to "Interviewer is asking…" for the new main.
         store.setCurrentQuestionId(null);
         store.setMomentState({ state: "interviewer_speaking", summary });
+        store.setDisplayedComment(null);
+        store.setAnswerInProgress(false);
         this.answerBuffer = "";
         this.pendingAnswerBuffer = "";
         this.pendingCommentaryFor = null;
         return;
       }
-      // Anything else (chitchat, follow-up interviewer_speaking, etc.) —
-      // keep showing Current Question, don't update state.
+      // Anything else (interviewer follow-up speaking, chitchat, candidate
+      // off-topic) — keep showing Current Question + the latest follow-up.
+      // We DO refresh the moment summary so the UI can show a follow-up
+      // "asking" state if it wants. But we don't change the locked-in
+      // question(s) themselves.
+      if (next === "interviewer_speaking" && rel === "follow_up") {
+        store.setMomentState({ state: "interviewer_speaking", summary });
+      }
       return;
     }
 
-    // ----- Pre-finalization transitions (chitchat / interviewer / first Q) -----
+    // Pre-anchored — no current main yet. Free to transition normally.
     store.setMomentState({ state: next, summary });
 
     if (next === "question_finalized") {
-      // First question of the session, OR finalizing after interviewer_speaking
-      // / chitchat. Create the Question, carry over candidate text.
       const text = questionText || summary;
       if (text) {
         const q: Question = {
@@ -317,22 +368,43 @@ export class LiveOrchestrator {
         this.answerBuffer = this.pendingAnswerBuffer;
         this.pendingAnswerBuffer = "";
         this.pendingCommentaryFor = null;
+        store.setAnswerInProgress(this.answerBuffer.length > 0);
         if (this.shouldTriggerComment(q.id)) {
           void this.generateComment(q);
         }
       }
     } else if (next === "interviewer_speaking" || next === "chitchat") {
-      // Reset pending buffer so chitchat / inter-speaker text doesn't leak
-      // into the next question's answer.
       this.pendingAnswerBuffer = "";
     }
   }
 
-  /** Archive the current question and create a new one in its place. Used
-   *  when classify-moment surfaces a new question text directly without
-   *  passing through interviewer_speaking. */
-  private archiveCurrentQuestionAndStart(text: string, summary: string) {
+  private addFollowUpAndStart(parentId: string, text: string, summary: string) {
     const store = useStore.getState();
+    const q: Question = {
+      id: rand("q"),
+      text,
+      askedAtSeconds: store.live.elapsedSeconds,
+      comments: [],
+      parentQuestionId: parentId,
+    };
+    store.addQuestion(q);
+    store.setMomentState({ state: "question_finalized", summary });
+    // Carry over any candidate text accumulated while interviewer was asking
+    // this follow-up.
+    this.answerBuffer = this.pendingAnswerBuffer;
+    this.pendingAnswerBuffer = "";
+    this.pendingCommentaryFor = null;
+    store.setDisplayedComment(null); // fresh display slot for the new sub-Q
+    store.setAnswerInProgress(this.answerBuffer.length > 0);
+    if (this.shouldTriggerComment(q.id)) {
+      void this.generateComment(q);
+    }
+  }
+
+  private archiveCurrentMainAndStartNew(text: string, summary: string) {
+    const store = useStore.getState();
+    // Archive: just clear currentQuestionId — old questions stay in the array
+    // and the UI's "Earlier in this interview" filter picks them up.
     store.setCurrentQuestionId(null);
     const q: Question = {
       id: rand("q"),
@@ -342,26 +414,22 @@ export class LiveOrchestrator {
     };
     store.addQuestion(q);
     store.setMomentState({ state: "question_finalized", summary });
+    store.setDisplayedComment(null);
     this.answerBuffer = this.pendingAnswerBuffer;
     this.pendingAnswerBuffer = "";
     this.pendingCommentaryFor = null;
+    store.setAnswerInProgress(this.answerBuffer.length > 0);
     if (this.shouldTriggerComment(q.id)) {
       void this.generateComment(q);
     }
   }
 
-  /**
-   * Recent utterances tagged with their resolved role label (or "Speaker N"
-   * placeholder for unidentified speakers). Cap CLASSIFY_CONTEXT_CAP, in
-   * chronological order so Haiku sees turn-taking.
-   */
   private buildClassifySample(): Array<{ speaker: string; text: string }> {
     const store = useStore.getState();
     const all = store.liveUtterances;
     const roles = store.liveSpeakerRoles;
     if (all.length === 0) return [];
 
-    // Build stable 1-indexed speaker numbers in first-heard order.
     const indexBySpeaker = new Map<number, number>();
     let nextIdx = 1;
     for (const u of all) {
@@ -447,11 +515,24 @@ export class LiveOrchestrator {
 
   // ----- commentary -----
 
+  /**
+   * Decide whether commentary can fire right now. Combined gate:
+   *   - Not already generating
+   *   - Enough new answer text (COMMENT_TRIGGER_CHARS)
+   *   - Hard cooldown since last commentary on this question (COMMENT_MIN_GAP_MS)
+   *   - Currently displayed comment has finished its minimum-display window
+   */
   private shouldTriggerComment(questionId: string): boolean {
     if (this.pendingCommentaryFor) return false;
     if (this.answerBuffer.length < COMMENT_TRIGGER_CHARS) return false;
     const last = this.lastCommentAt.get(questionId) ?? 0;
     if (Date.now() - last < COMMENT_MIN_GAP_MS) return false;
+
+    const displayed = useStore.getState().liveDisplayedComment;
+    if (displayed) {
+      const elapsed = Date.now() - displayed.displayedAt;
+      if (elapsed < displayed.minMs) return false;
+    }
     return true;
   }
 
@@ -515,6 +596,17 @@ export class LiveOrchestrator {
         }
       }
 
+      // Streaming finished. Claim the display slot now (so the min-display
+      // window starts AFTER streaming, not at the start) and clear the
+      // "answer in progress" dots indicator.
+      const minMs = computeMinDisplayMs(accumulated);
+      useStore.getState().setDisplayedComment({
+        id: commentId,
+        questionId: currentQ.id,
+        displayedAt: Date.now(),
+        minMs,
+      });
+      useStore.getState().setAnswerInProgress(false);
       this.lastCommentAt.set(currentQ.id, Date.now());
     } catch (e) {
       const msg = e instanceof Error ? e.message : "unknown";

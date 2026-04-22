@@ -25,27 +25,29 @@ type MomentStateKind =
   | "interviewer_speaking"
   | "question_finalized";
 
+type QuestionRelation = "new_topic" | "follow_up" | null;
+
 interface ClassifyBody {
-  /** Recent utterances tagged with their speaker label (resolved or placeholder). */
   utterances: Array<{ speaker: string; text: string }>;
-  /** What we're currently displaying — helps avoid bouncing. */
   currentState: "idle" | MomentStateKind;
-  /** Milliseconds since the last finalized utterance. Used to detect silence. */
   msSinceLastTranscript: number;
-  /** The text of the currently-displayed Current Question, if any.
-   *  Used to decide whether new interviewer speech is a follow-up or a NEW topic. */
-  currentQuestionText?: string;
+  /** The currently displayed MAIN question (top of the bar). May be empty. */
+  currentMainQuestionText?: string;
+  /** The currently displayed follow-up sub-question, if any. */
+  currentFollowUpText?: string;
 }
 
 /**
- * The conversation state machine. Decides which of three moments the live
- * conversation is in and provides a one-line summary for the top bar.
+ * The conversation state machine. Decides the moment + the relation between
+ * any newly-detected question and the current main question.
  *
- * CRUCIAL: when a question has already been finalized (currentQuestionText
- * is non-empty), we are very conservative about transitioning away from
- * QUESTION_FINALIZED. Follow-ups, candidate clarifications, and side-
- * chitchat all keep the existing question pinned. Only a clear NEW topical
- * question fires isNewQuestion=true (or returns a different question text).
+ * Stricter finalization than before:
+ *   - Silence threshold raised to 3s
+ *   - Candidate substantive-answer threshold lowered to 20 chars
+ *   - Filler / transition words ("so...", "uh let me think", "and also...")
+ *     do NOT count as the interviewer being done
+ *   - Haiku must verify the accumulated interviewer text has a complete
+ *     question structure before allowing question_finalized
  */
 export async function POST(req: Request) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -63,58 +65,65 @@ export async function POST(req: Request) {
       state: "chitchat",
       summary: "",
       question: "",
-      isNewQuestion: false,
+      questionRelation: null,
     });
   }
   const currentState = body.currentState || "idle";
   const msSinceLastTranscript = Number(body.msSinceLastTranscript) || 0;
-  const currentQuestionText = (body.currentQuestionText || "").trim();
+  const currentMain = (body.currentMainQuestionText || "").trim();
+  const currentFollowUp = (body.currentFollowUpText || "").trim();
 
   const client = new Anthropic({ apiKey });
 
-  const system = `You are the state machine for a live interview assistant. You read recent transcript turns and decide the current "moment" of the conversation.
+  const system = `You are the state machine for a live interview assistant. You read recent transcript turns and decide the current "moment" of the conversation, plus how any new question relates to the current one.
 
-States:
-- "chitchat": small talk — greetings, intros, audio test ("can you hear me?"), screen sharing chatter. Long candidate self-introductions in response to "tell me about yourself" are NOT chitchat — they're an answer.
-- "interviewer_speaking": the interviewer is mid-question — started but not finished, OR may continue (recent silence is short, the question feels incomplete, restarts like "um, so what I mean is...").
-- "question_finalized": the interviewer has asked a complete, coherent question AND one of:
-    (a) msSinceLastTranscript >= 2000 — silence ≥ 2s, OR
-    (b) the candidate has substantively started answering (>= 30 chars of first-person speech in the most recent turn).
+== STATES ==
+- "chitchat": small talk — greetings, intros, audio test ("can you hear me?"), screen sharing chatter. NOT this if the candidate is delivering a substantive self-introduction in response to a "tell me about yourself" prompt.
+- "interviewer_speaking": the interviewer is mid-question. Started but not finished. Any of these signal NOT YET DONE:
+    • silence < 3 seconds
+    • the latest interviewer utterance ends with "so", "and", "um", "uh", "let me think", "actually", "wait", or any other transition word
+    • the accumulated interviewer text doesn't yet form a complete question (no clear interrogative or imperative request for information)
+    • restarts or self-corrections ("so what I mean is...")
+- "question_finalized": all of the following are true:
+    1. msSinceLastTranscript >= 3000 OR the candidate has substantively started answering (>= 20 chars of first-person speech in the most recent turn), AND
+    2. the accumulated interviewer text forms a complete, coherent question (interrogative or clear imperative ask), AND
+    3. the question does NOT trail off into a transition word.
 
-Compound questions ("Can you tell me about X, and also Y?") count as a single question still being formed until the interviewer clearly stops.
+Compound questions ("Can you tell me about X, and also Y?") count as ONE question still being formed until the interviewer clearly stops.
 
-== ANCHORING — most important rule ==
-If currentQuestionText is non-empty (a question is already locked in), be VERY conservative about transitioning. Specifically:
+== ANCHORING (most important rule) ==
+If currentMainQuestionText is non-empty, be VERY conservative about disrupting it:
 
-1. If the latest interviewer turn is a FOLLOW-UP on the same topic — clarification ("by X I mean Y"), drilling deeper ("can you give a specific example?", "what was the architecture?"), or a sub-question that explores the same story — STAY in "question_finalized" with the SAME question text. Set isNewQuestion=false.
+1. Interviewer follow-up on the same topic — clarification ("by X I mean Y"), drilling deeper ("can you give a specific example?", "what was the architecture?"), or a sub-question on the same story → questionRelation = "follow_up". This does NOT archive the main question.
+2. Candidate clarifying back, going off-topic, or chatting → DON'T transition. Stay in question_finalized, questionRelation = null.
+3. ONLY when the interviewer pivots to a clearly DIFFERENT topic / story / area set questionRelation = "new_topic":
+   - Q1 was about Project A → interviewer asks about Project B → new_topic
+   - Q1 was about technical decisions → interviewer asks about team management → new_topic
+   - Q1 was about background → interviewer asks "let's do a case study" → new_topic
+4. If a follow-up has finalized (currentFollowUpText non-empty) and the interviewer drills further into the SAME sub-area, that's still "follow_up" (replacing the previous follow-up).
 
-2. If the candidate is asking for clarification, going off-topic, or chatting — STAY in "question_finalized". Set isNewQuestion=false.
-
-3. ONLY transition out of question_finalized when the interviewer pivots to a clearly DIFFERENT topic, story, or area:
-   - Q1 was about Project A → interviewer asks about Project B → NEW. isNewQuestion=true.
-   - Q1 was about technical decisions → interviewer asks about team management → NEW. isNewQuestion=true.
-   - Q1 was about background → interviewer asks "let's do a case study" → NEW. isNewQuestion=true.
-
-When isNewQuestion=true and the new question is also complete, return state="question_finalized" with the new question text. Otherwise return state="interviewer_speaking" with isNewQuestion=true to flag the topic shift while the new question is still being asked.
-
-== OUTPUT ==
-JSON only, no prose:
+== OUTPUT (JSON only, no prose) ==
 {
   "state": "chitchat" | "interviewer_speaking" | "question_finalized",
   "summary": "<one short human-readable line for the UI top bar>",
   "question": "<cleaned question text — only when state=question_finalized, otherwise empty>",
-  "isNewQuestion": true | false
+  "questionRelation": "new_topic" | "follow_up" | null
 }
 
+questionRelation guidance:
+- When currentMainQuestionText is empty: this is the very first question, set questionRelation = "new_topic" (or null — both treated as new main).
+- When state is question_finalized + the new question text is identical/near-identical to currentMainQuestionText OR currentFollowUpText: questionRelation = null (it's the same question, no-op).
+- When state is interviewer_speaking and you can already tell it's a topic shift, set questionRelation = "new_topic" so the orchestrator can move display state proactively. Otherwise null or "follow_up".
+
 Summary writing style:
-- chitchat: "Greeting and audio check", "Just chatting about the weather"
-- interviewer_speaking: short topic phrase, e.g. "asking about the recommendation model goal", "setting up a case study about Stripe checkout"
+- chitchat: "Greeting and audio check"
+- interviewer_speaking: short topic phrase, e.g. "asking about the recommendation model goal"
 - question_finalized: omit or echo the question
 
 The "question" field, when present:
 - Clean filler ("so uh", "okay so", "alright")
 - Preserve the interviewer's wording — don't paraphrase
-- Combine compound clauses into one coherent question if asked together`;
+- Combine compound clauses into one coherent question`;
 
   const formatted = utterances
     .map((u) => `[${u.speaker}]: ${u.text}`)
@@ -126,10 +135,11 @@ ${formatted}
 """
 
 Current displayed state: ${currentState}
-${currentQuestionText ? `Current locked-in question: """${currentQuestionText}"""` : "Current locked-in question: (none)"}
+${currentMain ? `Current MAIN question: """${currentMain}"""` : "Current MAIN question: (none)"}
+${currentFollowUp ? `Current FOLLOW-UP question: """${currentFollowUp}"""` : "Current FOLLOW-UP: (none)"}
 Milliseconds since last transcript: ${msSinceLastTranscript}
 
-Decide the moment. Apply the anchoring rule strictly if there is a locked-in question.`;
+Decide the moment. Be strict about finalization (3s silence or substantive 20-char answer + complete question structure). Apply the anchoring rule strictly when there is a locked-in question.`;
 
   try {
     const resp = await client.messages.create({
@@ -149,7 +159,7 @@ Decide the moment. Apply the anchoring rule strictly if there is a locked-in que
       state?: string;
       summary?: string;
       question?: string;
-      isNewQuestion?: boolean;
+      questionRelation?: string;
     } = {};
     try {
       parsed = JSON.parse(text);
@@ -169,22 +179,25 @@ Decide the moment. Apply the anchoring rule strictly if there is a locked-in que
     const summary = (parsed.summary || "").trim();
     const question =
       state === "question_finalized" ? (parsed.question || "").trim() : "";
-    const isNewQuestion = Boolean(parsed.isNewQuestion);
+    const rel = parsed.questionRelation;
+    const questionRelation: QuestionRelation =
+      rel === "new_topic" || rel === "follow_up" ? rel : null;
 
     void logClassification({
       kind: "classify-moment",
       currentState,
-      currentQuestionText,
+      currentMain,
+      currentFollowUp,
       msSinceLastTranscript,
       utteranceCount: utterances.length,
       state,
       summary,
       question,
-      isNewQuestion,
+      questionRelation,
       raw: text,
     });
 
-    return NextResponse.json({ state, summary, question, isNewQuestion });
+    return NextResponse.json({ state, summary, question, questionRelation });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Unknown error";
     return NextResponse.json(
@@ -193,7 +206,7 @@ Decide the moment. Apply the anchoring rule strictly if there is a locked-in que
         state: "chitchat",
         summary: "",
         question: "",
-        isNewQuestion: false,
+        questionRelation: null,
       },
       { status: 500 }
     );

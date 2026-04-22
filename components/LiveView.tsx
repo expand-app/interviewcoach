@@ -5,11 +5,10 @@ import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
 import type { Comment, MomentStateKind, Question, Speaker, Utterance } from "@/types/session";
 
-const COMMENTARY_HEIGHT_PX = 380;
+const COMMENTARY_HEIGHT_PX = 140;  // single-comment fixed pane
 const CAPTIONS_HEIGHT_PX   = 160;
 /** Window of SPEAKING-time (sum of utterance durations) shown in captions. */
 const CAPTIONS_WINDOW_S    = 10;
-/** Fallback when an utterance has no duration field (e.g. legacy data). */
 const DEFAULT_UTTERANCE_S  = 2;
 
 export function LiveView() {
@@ -19,8 +18,9 @@ export function LiveView() {
   const utterances = useStore((s) => s.liveUtterances);
   const speakerRoles = useStore((s) => s.liveSpeakerRoles);
   const moment = useStore((s) => s.liveMomentState);
+  const displayedComment = useStore((s) => s.liveDisplayedComment);
+  const answerInProgress = useStore((s) => s.liveAnswerInProgress);
 
-  // Live interim transcript via window event (noisy state, kept out of store).
   const [interim, setInterim] = useState("");
   useEffect(() => {
     const handler = (e: Event) => setInterim((e as CustomEvent).detail as string);
@@ -28,8 +28,37 @@ export function LiveView() {
     return () => window.removeEventListener("ic:interim", handler);
   }, []);
 
-  const currentQ = questions.find((q) => q.id === live.currentQuestionId);
-  const earlierQs = questions.filter((q) => q.id !== live.currentQuestionId);
+  // Resolve the current main + follow-up Qs from the flat list.
+  const currentSubQ = questions.find((q) => q.id === live.currentQuestionId);
+  const currentMainQ = currentSubQ?.parentQuestionId
+    ? questions.find((q) => q.id === currentSubQ.parentQuestionId)
+    : currentSubQ;
+  const currentFollowUpQ =
+    currentSubQ && currentSubQ !== currentMainQ ? currentSubQ : undefined;
+
+  // The Q that "owns" the live commentary slot is whichever sub-Q is current.
+  const commentaryOwnerQ = currentSubQ;
+
+  // Earlier-in-interview: every question that is NOT in the current main's
+  // tree. Group by main.
+  const archivedMains = useMemo(() => {
+    const currentMainId = currentMainQ?.id;
+    return questions.filter(
+      (q) => !q.parentQuestionId && q.id !== currentMainId
+    );
+  }, [questions, currentMainQ]);
+
+  const followUpsByParent = useMemo(() => {
+    const map = new Map<string, Question[]>();
+    for (const q of questions) {
+      if (!q.parentQuestionId) continue;
+      const list = map.get(q.parentQuestionId) ?? [];
+      list.push(q);
+      map.set(q.parentQuestionId, list);
+    }
+    return map;
+  }, [questions]);
+
   const hasStarted = live.status !== "idle" || questions.length > 0;
 
   if (!hasStarted) {
@@ -52,11 +81,12 @@ export function LiveView() {
     <>
       <PageTitle />
 
-      {/* (1) Current Question area — always present, three text states. */}
+      {/* (1) Current Question — always present; stable once finalized. */}
       <CurrentQuestionBar
         state={moment.state}
         summary={moment.summary}
-        currentQuestion={currentQ}
+        mainQuestion={currentMainQ}
+        followUp={currentFollowUpQ}
         labels={{
           finalized: t("Current Question · Interviewer", "当前问题 · 面试官"),
           waitingForFirst: t(
@@ -67,21 +97,26 @@ export function LiveView() {
             "Interviewer is asking…",
             "面试官正在提问…"
           ),
+          followUp: t("Follow-up", "追问"),
+          interviewerAskingFollowUp: t(
+            "Interviewer is asking a follow-up…",
+            "面试官正在追问…"
+          ),
         }}
       />
 
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-20 max-[900px]:px-5">
 
-          {/* (2) Live Commentary box — fixed height, terminal-tail behavior,
-                only the CURRENT question's commentary. */}
+          {/* (2) Live Commentary — fixed-height single-comment pane. */}
           <CommentarySection
             state={moment.state}
-            currentQuestion={currentQ}
-            isRecording={live.status === "recording"}
+            currentQuestion={commentaryOwnerQ}
+            displayed={displayedComment}
+            answerInProgress={answerInProgress}
             labels={{
-              heading: t("LIVE COMMENTARY · on this answer", "实时评论 · 针对本题回答"),
-              listening: t("listening…", "正在听…"),
+              heading: t("LIVE COMMENTARY", "实时评论"),
+              observing: t("AI is observing…", "AI 正在观察…"),
               waitingFirstQ: t(
                 "No commentary yet — waiting for the first question.",
                 "暂无评论 — 等待第一个问题。"
@@ -97,7 +132,7 @@ export function LiveView() {
             }}
           />
 
-          {/* (3) Live Captions — last 10s of speaking time, fixed height. */}
+          {/* (3) Live Captions — newest at top, fixed height, no scrollbar. */}
           {(utterances.length > 0 || interim) && (
             <LiveCaptions
               utterances={utterances}
@@ -105,7 +140,7 @@ export function LiveView() {
               isRecording={live.status === "recording"}
               speakerRoles={speakerRoles}
               labels={{
-                heading: t("Live Captions · last 10s", "实时字幕 · 最近 10 秒"),
+                heading: t("LIVE CAPTIONS", "实时字幕"),
                 live: t("LIVE", "直播中"),
                 interviewer: t("Interviewer", "面试官"),
                 candidate: t("Candidate", "候选人"),
@@ -114,21 +149,26 @@ export function LiveView() {
             />
           )}
 
-          {/* (4) Earlier in this interview — collapsible archive. */}
-          {earlierQs.length > 0 && (
+          {/* (4) Earlier in this interview — archived mains, with follow-ups. */}
+          {archivedMains.length > 0 && (
             <>
               <div className="mt-7 mb-3 text-[11px] text-ink-lighter font-semibold tracking-wide uppercase">
                 {t("Earlier in this interview", "本场之前的问题")}
               </div>
-              {earlierQs
+              {archivedMains
                 .slice()
                 .reverse()
-                .map((qa, idx) => (
-                  <QABlock
-                    key={qa.id}
-                    q={qa}
-                    num={earlierQs.length - idx}
+                .map((main, idx) => (
+                  <ArchivedMainBlock
+                    key={main.id}
+                    main={main}
+                    followUps={followUpsByParent.get(main.id) ?? []}
+                    num={archivedMains.length - idx}
                     defaultOpen={idx === 0}
+                    labels={{
+                      followUp: t("Follow-up", "追问"),
+                      noCommentary: t("No commentary.", "暂无评论。"),
+                    }}
                   />
                 ))}
             </>
@@ -150,76 +190,109 @@ function PageTitle() {
 }
 
 /**
- * The Current Question bar — always present, three visual states:
- *   A. No question yet (chitchat / idle / interviewer_speaking before first Q)
- *      → "Waiting for the interview question…" gray + bouncing dots
- *   B. Interviewer is mid-question (interviewer_speaking, no current Q)
- *      → "Interviewer is asking…" + AI summary, gray + bouncing dots
- *   C. Question finalized
- *      → cleaned question text in black + red LIVE dot. Stays here until a
- *        clearly NEW topical question is detected.
+ * Top bar — always present, layered display:
+ *
+ *   No main Q yet:
+ *     - state=interviewer_speaking → "Interviewer is asking…" + summary
+ *     - else → "Waiting for the interview question…"
+ *
+ *   Main Q locked in:
+ *     - Big main Q text on top
+ *     - If follow-up Q exists → indented "Follow-up: <text>" below
+ *     - Else if state=interviewer_speaking → indented
+ *       "Interviewer is asking a follow-up…" + summary below
+ *     - Else nothing extra (just the main Q)
  */
 function CurrentQuestionBar({
   state,
   summary,
-  currentQuestion,
+  mainQuestion,
+  followUp,
   labels,
 }: {
   state: MomentStateKind;
   summary: string;
-  currentQuestion: Question | undefined;
+  mainQuestion: Question | undefined;
+  followUp: Question | undefined;
   labels: {
     finalized: string;
     waitingForFirst: string;
     interviewerAsking: string;
+    followUp: string;
+    interviewerAskingFollowUp: string;
   };
 }) {
-  // C — finalized
-  if (state === "question_finalized" && currentQuestion) {
-    return (
-      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
-        <div className="border-y border-rule py-3.5 relative">
-          <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
-            {labels.finalized}
-          </div>
-          <div className="font-serif text-[19px] leading-snug text-ink font-medium">
-            {currentQuestion.text}
+  // Pre-anchored: no main Q yet.
+  if (!mainQuestion) {
+    if (state === "interviewer_speaking") {
+      return (
+        <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
+          <div className="border-y border-rule py-3.5">
+            <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
+              <BouncingDots />
+              {labels.interviewerAsking}
+            </div>
+            <div className="font-serif text-[17px] leading-snug text-ink-light italic">
+              {summary || ""}
+            </div>
           </div>
         </div>
-      </div>
-    );
-  }
-
-  // B — interviewer is asking (no Q locked in yet)
-  if (state === "interviewer_speaking") {
+      );
+    }
     return (
       <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
         <div className="border-y border-rule py-3.5">
           <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
             <BouncingDots />
-            {labels.interviewerAsking}
+            {labels.waitingForFirst}
           </div>
-          <div className="font-serif text-[17px] leading-snug text-ink-light italic">
-            {summary || ""}
-          </div>
+          {summary && (
+            <div className="text-[13.5px] leading-snug text-ink-light italic">
+              {summary}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
-  // A — chitchat / idle (also covers the case where state === "question_finalized"
-  //     but currentQuestion is somehow undefined — falls back to A safely)
+  // Main Q is locked in.
+  const showAskingFollowUp =
+    !followUp && state === "interviewer_speaking";
+
   return (
     <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
       <div className="border-y border-rule py-3.5">
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-          <BouncingDots />
-          {labels.waitingForFirst}
+        <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
+          <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
+          {labels.finalized}
         </div>
-        {summary && (
-          <div className="text-[13.5px] leading-snug text-ink-light italic">
-            {summary}
+        <div className="font-serif text-[19px] leading-snug text-ink font-medium">
+          {mainQuestion.text}
+        </div>
+
+        {followUp && (
+          <div className="mt-2 pl-5 border-l-2 border-rule">
+            <div className="text-[10.5px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
+              {labels.followUp}
+            </div>
+            <div className="font-serif text-[15.5px] leading-snug text-ink-light">
+              {followUp.text}
+            </div>
+          </div>
+        )}
+
+        {showAskingFollowUp && (
+          <div className="mt-2 pl-5 border-l-2 border-rule">
+            <div className="text-[10.5px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5 inline-flex items-center gap-1.5">
+              <BouncingDots />
+              {labels.interviewerAskingFollowUp}
+            </div>
+            {summary && (
+              <div className="text-[13.5px] leading-snug text-ink-light italic">
+                {summary}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -238,69 +311,103 @@ function BouncingDots() {
 }
 
 /**
- * Fixed-height commentary box. Newest comment pinned at the bottom; older
- * comments scroll off the top and are clipped (no scrollbar). Only the
- * CURRENT question's comments render here — when a new question arrives,
- * the previous question's comments archive into "Earlier in this interview"
- * and this box resets.
+ * Single-comment commentary pane (fixed height, no scrollbar).
+ *
+ *   - Shows the displayed comment text (live-streamed via patchCommentText
+ *     into the underlying Question.comments[], looked up by id here).
+ *   - Once displayed, the orchestrator enforces a min-display window before
+ *     allowing the slot to be reclaimed by a new comment. Newer commentary
+ *     that arrives during that window is dropped — no queue.
+ *   - When the slot is empty, shows one of three placeholder copies:
+ *       no current Q → "No commentary yet — waiting for the first question."
+ *       current Q + candidate has spoken → animated "AI is observing…"
+ *       current Q + candidate hasn't spoken → "Waiting for candidate's answer…"
  */
 function CommentarySection({
   state,
   currentQuestion,
-  isRecording,
+  displayed,
+  answerInProgress,
   labels,
 }: {
   state: MomentStateKind;
   currentQuestion: Question | undefined;
-  isRecording: boolean;
+  displayed: { id: string; questionId: string; displayedAt: number; minMs: number } | null;
+  answerInProgress: boolean;
   labels: {
     heading: string;
-    listening: string;
+    observing: string;
     waitingFirstQ: string;
     waitingAnswer: string;
     waitingNextQ: string;
   };
 }) {
-  const comments = currentQuestion?.comments ?? [];
+  // Re-render when the displayed comment's min-window expires so the
+  // "AI is observing…" indicator can appear.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!displayed) return;
+    const remaining = displayed.displayedAt + displayed.minMs - Date.now();
+    if (remaining <= 0) return;
+    const id = setTimeout(() => setTick((n) => n + 1), remaining + 50);
+    return () => clearTimeout(id);
+  }, [displayed]);
 
-  // Empty-state copy
-  let emptyText: string | null = null;
-  if (!currentQuestion) {
-    emptyText =
-      state === "interviewer_speaking" ? labels.waitingNextQ : labels.waitingFirstQ;
-  } else if (comments.length === 0) {
-    emptyText = labels.waitingAnswer;
+  // Resolve which comment text to show.
+  const displayedComment = useMemo(() => {
+    if (!displayed) return null;
+    if (!currentQuestion || displayed.questionId !== currentQuestion.id) return null;
+    return currentQuestion.comments.find((c) => c.id === displayed.id) ?? null;
+  }, [displayed, currentQuestion]);
+
+  // Is the displayed comment still within its min-display window? If so we
+  // keep showing it even if the orchestrator's "current displayed" pointer
+  // has been cleared (defensive — normally those move in lockstep).
+  const isShowing = !!displayedComment;
+
+  // Empty-state branch
+  let empty: { kind: "none" | "first" | "answer" | "next"; text: string } | null = null;
+  if (!isShowing) {
+    if (!currentQuestion) {
+      if (state === "interviewer_speaking") {
+        empty = { kind: "next", text: labels.waitingNextQ };
+      } else {
+        empty = { kind: "first", text: labels.waitingFirstQ };
+      }
+    } else if (answerInProgress) {
+      empty = { kind: "none", text: "" }; // dots — no text
+    } else {
+      empty = { kind: "answer", text: labels.waitingAnswer };
+    }
   }
 
   return (
     <div className="mb-6">
-      <div className="text-[11px] text-ink-lighter tracking-wide font-medium mb-2 inline-flex items-center gap-2">
+      <div className="text-[11px] text-ink-lighter tracking-wide font-medium mb-2">
         {labels.heading}
-        {isRecording && currentQuestion && (
-          <span className="inline-flex items-center gap-1 text-accent normal-case">
+      </div>
+
+      <div
+        className="border border-rule rounded-md bg-paper overflow-hidden flex"
+        style={{ height: COMMENTARY_HEIGHT_PX }}
+      >
+        {isShowing && displayedComment ? (
+          <div
+            className="px-4 py-3 m-auto w-full text-[15px] leading-relaxed text-ink prose-live animate-appear"
+            dangerouslySetInnerHTML={{ __html: displayedComment.text || "…" }}
+          />
+        ) : empty?.kind === "none" ? (
+          <div className="m-auto inline-flex items-center gap-2 text-ink-lighter italic text-sm">
             <span className="inline-flex gap-[3px]">
               <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot" />
               <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot [animation-delay:.15s]" />
               <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot [animation-delay:.3s]" />
             </span>
-            <span className="text-[10.5px] italic">{labels.listening}</span>
-          </span>
-        )}
-      </div>
-
-      <div
-        className="border border-rule rounded-md bg-paper overflow-hidden flex flex-col justify-end"
-        style={{ height: COMMENTARY_HEIGHT_PX }}
-      >
-        {emptyText ? (
-          <div className="m-auto px-6 text-sm text-ink-lighter italic text-center">
-            {emptyText}
+            {labels.observing}
           </div>
         ) : (
-          <div className="px-4 py-3 flex flex-col gap-0">
-            {comments.map((c, i) => (
-              <CommentRow key={c.id} comment={c} isLast={i === comments.length - 1} />
-            ))}
+          <div className="m-auto px-6 text-sm text-ink-lighter italic text-center">
+            {empty?.text}
           </div>
         )}
       </div>
@@ -308,25 +415,14 @@ function CommentarySection({
   );
 }
 
-function CommentRow({ comment, isLast }: { comment: Comment; isLast: boolean }) {
-  return (
-    <div
-      className={`text-[15px] leading-relaxed text-ink prose-live animate-appear py-2.5 ${
-        isLast ? "" : "border-b border-dashed border-rule"
-      }`}
-      dangerouslySetInnerHTML={{ __html: comment.text || "…" }}
-    />
-  );
-}
-
 /**
  * Tencent-Meeting / Teams style live caption pane.
  *
- * Window: shows utterances whose total `duration` (Deepgram per-segment
- * speaking time) sums to >= CAPTIONS_WINDOW_S, walking back from the
- * latest. Silence doesn't consume budget, so a quiet stretch keeps the
- * caption pane populated. Fixed height, no scrollbar — overflow upward is
- * clipped, content pinned to bottom.
+ *   - Newest at TOP. New utterances push older content downward; overflow
+ *     trims from the bottom (oldest clipped off).
+ *   - Window: utterances whose summed `duration` (Deepgram per-segment
+ *     speaking time) sums to ≥ CAPTIONS_WINDOW_S, walking back from the
+ *     latest. Silence doesn't consume budget.
  */
 function LiveCaptions({
   utterances,
@@ -347,7 +443,6 @@ function LiveCaptions({
     speakerPrefix: string;
   };
 }) {
-  // Stable 1-indexed speaker number per Deepgram label, in first-heard order.
   const speakerIndex = useMemo(() => {
     const map = new Map<number, number>();
     let next = 1;
@@ -358,7 +453,6 @@ function LiveCaptions({
     return map;
   }, [utterances]);
 
-  // Take the tail of utterances whose summed duration >= CAPTIONS_WINDOW_S.
   const visibleUtterances = useMemo(() => {
     let sum = 0;
     const out: Utterance[] = [];
@@ -371,7 +465,7 @@ function LiveCaptions({
     return out;
   }, [utterances]);
 
-  // Group consecutive same-speaker utterances into paragraphs.
+  // Group consecutive same-speaker utterances; reverse so newest is first.
   const paragraphs = useMemo(() => {
     const out: Array<{ key: string; dgSpeaker: number | undefined; text: string }> = [];
     for (const u of visibleUtterances) {
@@ -382,7 +476,7 @@ function LiveCaptions({
         out.push({ key: u.id, dgSpeaker: u.dgSpeaker, text: u.text });
       }
     }
-    return out;
+    return out.reverse();
   }, [visibleUtterances]);
 
   const resolveLabel = (dg: number | undefined): { name: string; role: Speaker } => {
@@ -401,6 +495,10 @@ function LiveCaptions({
       ? "text-ink"
       : "text-ink-lighter";
 
+  // Interim text appends to the NEWEST paragraph (which is now index 0 since
+  // we reversed).
+  const newestIndex = 0;
+
   return (
     <div className="border border-rule rounded-md bg-paper-subtle overflow-hidden">
       <div className="px-4 pt-2.5 pb-1.5 border-b border-rule flex items-center gap-2">
@@ -415,7 +513,7 @@ function LiveCaptions({
         )}
       </div>
       <div
-        className="px-4 py-3 overflow-hidden flex flex-col justify-end"
+        className="px-4 py-3 overflow-hidden"
         style={{ height: CAPTIONS_HEIGHT_PX }}
       >
         {paragraphs.map((p, i) => {
@@ -426,7 +524,7 @@ function LiveCaptions({
                 {name}:
               </span>
               <span className="text-ink">{p.text}</span>
-              {i === paragraphs.length - 1 && interim && (
+              {i === newestIndex && interim && (
                 <span className="text-ink-lighter/70 italic"> {interim}</span>
               )}
             </p>
@@ -445,14 +543,18 @@ function LiveCaptions({
   );
 }
 
-function QABlock({
-  q,
+function ArchivedMainBlock({
+  main,
+  followUps,
   num,
   defaultOpen = false,
+  labels,
 }: {
-  q: { id: string; text: string; comments: { id: string; text: string }[] };
+  main: Question;
+  followUps: Question[];
   num: number;
   defaultOpen?: boolean;
+  labels: { followUp: string; noCommentary: string };
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const pad = num.toString().padStart(2, "0");
@@ -475,25 +577,49 @@ function QABlock({
         </div>
         <div className="flex-1 min-w-0">
           <div className="font-serif text-base font-medium leading-snug text-ink hover:text-accent transition-colors">
-            {q.text}
+            {main.text}
           </div>
         </div>
       </button>
       {open && (
         <div className="pl-14 pt-2 pr-1">
-          {q.comments.length === 0 ? (
-            <p className="text-sm text-ink-lighter italic">No commentary.</p>
-          ) : (
-            [...q.comments].reverse().map((c) => (
-              <p
-                key={c.id}
-                className="text-[14.5px] leading-relaxed text-ink mb-2.5 prose-live"
-                dangerouslySetInnerHTML={{ __html: c.text || "…" }}
-              />
-            ))
-          )}
+          <CommentList comments={main.comments} emptyText={labels.noCommentary} />
+          {followUps.map((fu) => (
+            <div key={fu.id} className="mt-3 border-l-2 border-rule pl-3">
+              <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
+                {labels.followUp}
+              </div>
+              <div className="font-serif text-[15px] leading-snug text-ink-light mb-1.5">
+                {fu.text}
+              </div>
+              <CommentList comments={fu.comments} emptyText={labels.noCommentary} />
+            </div>
+          ))}
         </div>
       )}
     </div>
+  );
+}
+
+function CommentList({
+  comments,
+  emptyText,
+}: {
+  comments: Comment[];
+  emptyText: string;
+}) {
+  if (comments.length === 0) {
+    return <p className="text-sm text-ink-lighter italic">{emptyText}</p>;
+  }
+  return (
+    <>
+      {[...comments].reverse().map((c) => (
+        <p
+          key={c.id}
+          className="text-[14.5px] leading-relaxed text-ink mb-2.5 prose-live"
+          dangerouslySetInnerHTML={{ __html: c.text || "…" }}
+        />
+      ))}
+    </>
   );
 }
