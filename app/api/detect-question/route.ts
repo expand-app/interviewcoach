@@ -30,13 +30,12 @@ interface DetectBody {
 /**
  * Returns { isQuestion: boolean, question?: string }.
  *
- * Claude Haiku is used here because it's fast and cheap — we call this on
- * every finalized utterance, and we don't want to pay Sonnet rates for a
- * boolean classification.
+ * Pure question-detection now — caller should only invoke this when it has
+ * already determined that the speaker is the INTERVIEWER (via the separate
+ * /api/identify-speakers route). Speaker classification has been removed
+ * from this endpoint to avoid double-work.
  *
- * "question" in the response is the normalized question text (trimmed,
- * cleaned up), useful because Deepgram sometimes returns fragments like
- * "so uh tell me about yourself".
+ * Claude Haiku is used here because it's fast and cheap.
  */
 export async function POST(req: Request) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -47,37 +46,34 @@ export async function POST(req: Request) {
   const body = (await req.json()) as DetectBody;
   const { utterance, recentContext = "" } = body;
   if (!utterance?.trim()) {
-    return NextResponse.json({ isQuestion: false });
+    return NextResponse.json({ isQuestion: false, question: "" });
   }
 
   const client = new Anthropic({ apiKey });
 
-  const system = `You are a classifier inside a live interview assistant. The mic picks up BOTH the interviewer and the candidate. For each utterance you must decide (a) who is speaking and (b) whether it is the interviewer asking a NEW question.
+  const system = `You are a classifier inside a live interview assistant. The utterance below is from the INTERVIEWER. Your only job is to decide whether it is a NEW interview question.
 
 Rules:
 - Return JSON only, no prose.
-- Format: {"speaker": "interviewer"|"candidate"|"unknown", "isQuestion": true|false, "question": "cleaned up question text"}
+- Format: {"isQuestion": true|false, "question": "cleaned up question text"}
 - If isQuestion is false, omit "question" or set it to "".
 
-Speaker cues:
-- INTERVIEWER: asks questions, gives prompts ("tell me about...", "walk me through..."), short acknowledgements between candidate turns ("got it", "uh huh", "interesting"), references the role/company in second person ("what would you do at our company", "in this role you would...").
-- CANDIDATE: first-person narration about own experience ("I led a team of...", "at my last job we..."), explaining decisions/tradeoffs, telling stories. Long monologues are almost always the candidate.
-- If a single utterance clearly mixes both (rare — usually a transcription artifact), pick whichever dominates.
-- If genuinely ambiguous (e.g. "okay" alone, "yeah", a short fragment), use "unknown".
-- Use the recent context to disambiguate — if the prior turns were the candidate telling a story, a new "so um, what about X?" is probably the interviewer interrupting.
+What counts as a NEW question:
+- Solicits new information, opinion, or a story from the candidate. Examples: "tell me about...", "walk me through...", "how would you...", "why did you...", "what's an example of...".
 
-Question cues (only relevant when speaker is interviewer):
-- An utterance is a question if it solicits new information, opinion, or a story. Requests like "tell me about...", "walk me through...", "how would you..." all count.
-- Follow-up probes like "why?", "can you expand?", "what else?" are NOT new questions — they continue the current one.
-- If speaker is candidate or unknown, isQuestion MUST be false.
-- Clean up filler ("so uh", "okay so") when you return the question.`;
+What does NOT count as a new question (return false):
+- Follow-up probes on the current question: "why?", "can you expand?", "what else?", "and then what happened?".
+- Acknowledgements / fillers: "got it", "interesting", "uh huh", "ok".
+- Stage-setting that isn't a question: "so for this part I'm going to give you a case study".
+
+When isQuestion is true, "question" should be the cleaned-up version with filler removed ("so uh", "okay so", "alright"). Preserve the interviewer's wording otherwise — don't paraphrase.`;
 
   const user = `Recent context (what came just before — may be empty):
 """
 ${recentContext.slice(-400)}
 """
 
-Latest utterance:
+Latest interviewer utterance:
 """
 ${utterance}
 """`;
@@ -96,8 +92,7 @@ ${utterance}
       .join("")
       .trim();
 
-    // Try to parse as strict JSON, falling back to extracting the first {...}.
-    let parsed: { speaker?: string; isQuestion?: boolean; question?: string } = {};
+    let parsed: { isQuestion?: boolean; question?: string } = {};
     try {
       parsed = JSON.parse(text);
     } catch {
@@ -107,26 +102,21 @@ ${utterance}
       }
     }
 
-    const speaker =
-      parsed.speaker === "interviewer" || parsed.speaker === "candidate"
-        ? parsed.speaker
-        : "unknown";
-    // Hard guard: only the interviewer can be asking a new question.
-    const isQuestion = speaker === "interviewer" && Boolean(parsed.isQuestion);
+    const isQuestion = Boolean(parsed.isQuestion);
     const question = isQuestion ? parsed.question?.trim() || "" : "";
 
     void logClassification({
+      kind: "detect-question",
       utterance,
       recentContext: recentContext.slice(-300),
-      speaker,
       isQuestion,
       question,
       raw: text,
     });
 
-    return NextResponse.json({ speaker, isQuestion, question });
+    return NextResponse.json({ isQuestion, question });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Unknown error";
-    return NextResponse.json({ error: msg, isQuestion: false }, { status: 500 });
+    return NextResponse.json({ error: msg, isQuestion: false, question: "" }, { status: 500 });
   }
 }

@@ -36,13 +36,19 @@ interface StoreState {
   liveQuestions: Question[];
   liveJd: string;
   liveResume: string;
-  /** Rolling window of finalized utterances with speaker labels (newest last). */
+  /** Rolling window of finalized utterances (newest last). */
   liveUtterances: Utterance[];
+  /** Map of Deepgram speaker number → resolved role. Set as Haiku identifies
+   *  speakers; once set, sticks for the rest of the session. */
+  liveSpeakerRoles: Record<number, "interviewer" | "candidate">;
 
   startLive: (jd: string, resume: string) => void;
   addQuestion: (q: Question) => void;
   addCommentToQuestion: (questionId: string, c: Comment) => void;
   addUtterance: (u: Utterance) => void;
+  /** Merge new identifications into the role map. Existing entries are NOT
+   *  overwritten — once a speaker's role is decided, it sticks. */
+  mergeSpeakerRoles: (roles: Record<number, "interviewer" | "candidate">) => void;
   /** End the live session, snapshot it into past sessions with the given title. */
   endLive: (title: string, audioUrl?: string) => Session;
   /** Wipe live state (after End & Save, or a hard reset). */
@@ -89,6 +95,7 @@ export const useStore = create<StoreState>((set, get) => ({
   liveJd: "",
   liveResume: "",
   liveUtterances: [],
+  liveSpeakerRoles: {},
 
   startLive: (jd, resume) =>
     set({
@@ -96,6 +103,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveResume: resume,
       liveQuestions: [],
       liveUtterances: [],
+      liveSpeakerRoles: {},
       live: { status: "recording", elapsedSeconds: 0, currentQuestionId: null },
     }),
 
@@ -123,6 +131,20 @@ export const useStore = create<StoreState>((set, get) => ({
       };
     }),
 
+  mergeSpeakerRoles: (roles) =>
+    set((s) => {
+      const next = { ...s.liveSpeakerRoles };
+      let changed = false;
+      for (const [k, v] of Object.entries(roles)) {
+        const n = Number(k);
+        if (!Number.isFinite(n)) continue;
+        if (next[n]) continue; // never overwrite an existing assignment
+        next[n] = v;
+        changed = true;
+      }
+      return changed ? { liveSpeakerRoles: next } : {};
+    }),
+
   endLive: (title, audioUrl) => {
     const s = get();
     const session: Session = {
@@ -143,6 +165,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveJd: "",
       liveResume: "",
       liveUtterances: [],
+      liveSpeakerRoles: {},
       live: emptyLive,
     }));
     return session;
@@ -154,6 +177,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveJd: "",
       liveResume: "",
       liveUtterances: [],
+      liveSpeakerRoles: {},
       live: emptyLive,
     }),
 }));

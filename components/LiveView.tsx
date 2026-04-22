@@ -10,6 +10,7 @@ export function LiveView() {
   const questions = useStore((s) => s.liveQuestions);
   const live = useStore((s) => s.live);
   const utterances = useStore((s) => s.liveUtterances);
+  const speakerRoles = useStore((s) => s.liveSpeakerRoles);
 
   // Subscribe to the interim transcript via window events — keeps the event
   // bus out of the Zustand store (this state is noisy and doesn't need to
@@ -101,12 +102,13 @@ export function LiveView() {
               utterances={utterances}
               interim={interim}
               isRecording={live.status === "recording"}
+              speakerRoles={speakerRoles}
               labels={{
                 heading: t("Live Captions", "实时字幕"),
                 live: t("LIVE", "直播中"),
                 interviewer: t("Interviewer", "面试官"),
                 candidate: t("Candidate", "候选人"),
-                unknown: t("Speaker", "发言者"),
+                speakerPrefix: t("Speaker", "发言者"),
               }}
             />
           )}
@@ -175,48 +177,72 @@ export function LiveView() {
 /**
  * Tencent-Meeting / Teams style live caption pane.
  *
- * - Consecutive utterances from the same speaker are merged into one paragraph
- * - Speaker label (Interviewer / Candidate / Speaker) appears once at the
- *   start of each paragraph and changes only when the speaker changes
- * - Interim (not-yet-final) text is appended to the LAST paragraph in muted
- *   italic, then replaced by the styled final text once Deepgram finalizes
- * - Auto-scrolls to the bottom on update; if the user scrolls up to read
- *   history, we stop force-scrolling until they scroll back near the bottom
+ * - Each utterance carries its raw Deepgram speaker number; the role
+ *   (interviewer / candidate) is derived at render time from speakerRoles,
+ *   so when Haiku finishes identifying speakers the historical paragraphs
+ *   re-label automatically (no second pass over the data).
+ * - Consecutive utterances from the same speaker number merge into one
+ *   paragraph (grouping is by raw speaker, not derived role — so the same
+ *   visual paragraphing holds even before identification completes).
+ * - Until a speaker is identified, the label shows "Speaker 1", "Speaker 2"
+ *   (1-indexed). After identification, it switches to "Interviewer" /
+ *   "Candidate" with the appropriate color.
+ * - Interim text appends to the LAST paragraph in muted italic, then gets
+ *   replaced by styled final text when Deepgram finalizes.
+ * - Sticky-bottom auto-scroll with read-up tolerance.
  */
 function LiveCaptions({
   utterances,
   interim,
   isRecording,
+  speakerRoles,
   labels,
 }: {
   utterances: Utterance[];
   interim: string;
   isRecording: boolean;
+  speakerRoles: Record<number, "interviewer" | "candidate">;
   labels: {
     heading: string;
     live: string;
     interviewer: string;
     candidate: string;
-    unknown: string;
+    speakerPrefix: string;
   };
 }) {
-  // Merge consecutive same-speaker utterances into paragraphs.
+  // Stable 1-indexed speaker number per Deepgram label, in the order we
+  // first heard each speaker. So Speaker 1 is whoever spoke first, Speaker 2
+  // is the next new voice, etc. This is independent of role.
+  const speakerIndex = useMemo(() => {
+    const map = new Map<number, number>();
+    let next = 1;
+    for (const u of utterances) {
+      if (u.dgSpeaker === undefined) continue;
+      if (!map.has(u.dgSpeaker)) {
+        map.set(u.dgSpeaker, next++);
+      }
+    }
+    return map;
+  }, [utterances]);
+
+  // Group consecutive same-speaker utterances into paragraphs (by raw
+  // dgSpeaker, not derived role).
   const paragraphs = useMemo(() => {
-    const out: Array<{ key: string; speaker: Speaker; text: string }> = [];
+    const out: Array<{ key: string; dgSpeaker: number | undefined; text: string }> = [];
     for (const u of utterances) {
       const last = out[out.length - 1];
-      if (last && last.speaker === u.speaker) {
+      if (last && last.dgSpeaker === u.dgSpeaker) {
         last.text += " " + u.text;
       } else {
-        out.push({ key: u.id, speaker: u.speaker, text: u.text });
+        out.push({ key: u.id, dgSpeaker: u.dgSpeaker, text: u.text });
       }
     }
     return out;
   }, [utterances]);
 
   // Auto-scroll to bottom when new content arrives, but only if the user is
-  // already near the bottom. This lets them scroll up to re-read without
-  // being yanked back down on the next utterance.
+  // already near the bottom — lets them scroll up to re-read without being
+  // yanked back down on the next utterance.
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const onScroll = () => {
@@ -229,12 +255,21 @@ function LiveCaptions({
     if (!stickRef.current) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [paragraphs, interim]);
+  }, [paragraphs, interim, speakerRoles]);
 
-  const speakerName = (s: Speaker) =>
-    s === "interviewer" ? labels.interviewer : s === "candidate" ? labels.candidate : labels.unknown;
-  const speakerColor = (s: Speaker) =>
-    s === "interviewer" ? "text-accent" : s === "candidate" ? "text-ink" : "text-ink-lighter";
+  const resolveLabel = (dg: number | undefined): { name: string; role: Speaker } => {
+    if (dg === undefined) {
+      return { name: labels.speakerPrefix, role: "unknown" };
+    }
+    const role = speakerRoles[dg];
+    if (role === "interviewer") return { name: labels.interviewer, role: "interviewer" };
+    if (role === "candidate") return { name: labels.candidate, role: "candidate" };
+    const idx = speakerIndex.get(dg) ?? dg + 1;
+    return { name: `${labels.speakerPrefix} ${idx}`, role: "unknown" };
+  };
+
+  const colorFor = (role: Speaker) =>
+    role === "interviewer" ? "text-accent" : role === "candidate" ? "text-ink" : "text-ink-lighter";
 
   return (
     <div className="mb-6 border border-rule rounded-md bg-paper-subtle overflow-hidden">
@@ -254,21 +289,24 @@ function LiveCaptions({
         onScroll={onScroll}
         className="px-4 py-3 max-h-80 overflow-y-auto"
       >
-        {paragraphs.map((p, i) => (
-          <p key={p.key} className="mb-3 last:mb-0 text-[14.5px] leading-relaxed">
-            <span className={`font-semibold mr-1.5 ${speakerColor(p.speaker)}`}>
-              {speakerName(p.speaker)}:
-            </span>
-            <span className="text-ink">{p.text}</span>
-            {i === paragraphs.length - 1 && interim && (
-              <span className="text-ink-lighter/70 italic"> {interim}</span>
-            )}
-          </p>
-        ))}
+        {paragraphs.map((p, i) => {
+          const { name, role } = resolveLabel(p.dgSpeaker);
+          return (
+            <p key={p.key} className="mb-3 last:mb-0 text-[14.5px] leading-relaxed">
+              <span className={`font-semibold mr-1.5 ${colorFor(role)}`}>
+                {name}:
+              </span>
+              <span className="text-ink">{p.text}</span>
+              {i === paragraphs.length - 1 && interim && (
+                <span className="text-ink-lighter/70 italic"> {interim}</span>
+              )}
+            </p>
+          );
+        })}
         {paragraphs.length === 0 && interim && (
           <p className="mb-0 text-[14.5px] leading-relaxed">
             <span className="font-semibold mr-1.5 text-ink-lighter">
-              {labels.unknown}:
+              {labels.speakerPrefix}:
             </span>
             <span className="text-ink-lighter/70 italic">{interim}</span>
           </p>

@@ -17,6 +17,11 @@ import type { Comment, Question } from "@/types/session";
 const COMMENT_TRIGGER_CHARS = 220;   // ~40-60 spoken words of new answer text
 const COMMENT_MIN_GAP_MS   = 8000;   // don't spam — min 8s between comments on same Q
 
+// Identification thresholds
+const IDENTIFY_MIN_DISTINCT_SPEAKERS = 2;
+const IDENTIFY_MIN_TOTAL_UTTERANCES  = 3;
+const IDENTIFY_CONTEXT_CAP           = 12; // utterances sent to Haiku, balanced
+
 function rand(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now()}`;
 }
@@ -27,12 +32,15 @@ export class LiveOrchestrator {
   private pendingCommentaryFor: string | null = null;  // question id we're generating for
   private lastCommentAt: Map<string, number> = new Map();
   private recentTranscript = "";
-  /** Deepgram speaker number → role, learned from the LLM on first hearing. */
-  private speakerRoles: Map<number, "interviewer" | "candidate"> = new Map();
+  /** All Deepgram speaker numbers we've heard so far (used for identify trigger). */
+  private knownDgSpeakers = new Set<number>();
+  /** Set when an identify-speakers request is in flight. */
+  private identifyInFlight = false;
 
   async start() {
     if (this.audio) return;
-    this.speakerRoles.clear();
+    this.knownDgSpeakers.clear();
+    this.identifyInFlight = false;
 
     this.audio = new AudioSession({
       onInterimTranscript: (text) => {
@@ -79,74 +87,85 @@ export class LiveOrchestrator {
 
     this.recentTranscript = (this.recentTranscript + " " + clean).slice(-1200);
 
-    // Resolve the speaker's role.
-    //   - If Deepgram tagged the speaker AND we've already classified that
-    //     speaker number once, reuse the cached role (no LLM call needed for
-    //     candidates; only ask whether interviewer is asking a new question).
-    //   - Otherwise call the LLM classifier and cache the result.
-    let speaker: "interviewer" | "candidate" | "unknown";
-    let isQuestion = false;
-    let question = "";
-
-    const cached = dgSpeaker !== undefined ? this.speakerRoles.get(dgSpeaker) : undefined;
-    if (cached === "candidate") {
-      speaker = "candidate";
-      // No LLM call — candidates never trigger new questions.
-    } else if (cached === "interviewer") {
-      speaker = "interviewer";
-      // Still need to know if this specific utterance is a new question.
-      const result = await this.classify(clean);
-      isQuestion = result.isQuestion;
-      question = result.question;
-    } else {
-      // Unknown speaker (or first time hearing this Deepgram speaker number).
-      const result = await this.classify(clean);
-      speaker = result.speaker;
-      isQuestion = result.isQuestion;
-      question = result.question;
-      if (dgSpeaker !== undefined && (speaker === "interviewer" || speaker === "candidate")) {
-        this.speakerRoles.set(dgSpeaker, speaker);
-      }
-    }
-
-    // Log every finalized utterance for the live transcript ribbon.
+    // 1) Persist the raw utterance immediately. UI shows it under a placeholder
+    //    label like "Speaker 1" until identification resolves.
     {
       const state = useStore.getState();
       state.addUtterance({
         id: rand("u"),
-        speaker,
-        text: isQuestion && question ? question : clean,
+        dgSpeaker,
+        text: clean,
         atSeconds: state.live.elapsedSeconds,
       });
     }
 
-    if (isQuestion && question) {
-      this.onNewQuestion(question);
-      return;
+    // 2) Trigger speaker identification at the right moments.
+    //    - First time: ≥2 distinct speakers seen AND ≥3 total utterances
+    //    - Subsequent: a brand-new Deepgram speaker number appears AND we
+    //      already have an identity map for at least one other speaker
+    if (dgSpeaker !== undefined) {
+      const isNewDgSpeaker = !this.knownDgSpeakers.has(dgSpeaker);
+      this.knownDgSpeakers.add(dgSpeaker);
+
+      const state = useStore.getState();
+      const totalUtterances = state.liveUtterances.length;
+      const identified = state.liveSpeakerRoles;
+      const distinctSpeakers = this.knownDgSpeakers.size;
+
+      const haveAnyIdentified = Object.keys(identified).length > 0;
+      const isUnidentified = identified[dgSpeaker] === undefined;
+
+      const firstRun =
+        !haveAnyIdentified &&
+        distinctSpeakers >= IDENTIFY_MIN_DISTINCT_SPEAKERS &&
+        totalUtterances >= IDENTIFY_MIN_TOTAL_UTTERANCES;
+      const newSpeakerRun =
+        haveAnyIdentified && isNewDgSpeaker && isUnidentified;
+
+      if ((firstRun || newSpeakerRun) && !this.identifyInFlight) {
+        void this.runIdentifySpeakers();
+      }
     }
 
-    // Interviewer non-question utterances ("got it", "uh huh", role chatter)
-    // are not part of the candidate's answer — drop them.
-    if (speaker === "interviewer") return;
+    // 3) Question detection — only if we know this speaker is the interviewer.
+    //    Until identity is resolved we deliberately don't guess; per design,
+    //    the very first interview question may show in captions but not in
+    //    the Question feed.
+    const role =
+      dgSpeaker !== undefined
+        ? useStore.getState().liveSpeakerRoles[dgSpeaker]
+        : undefined;
 
-    // Candidate or unknown → treat as part of the current answer.
+    if (role === "interviewer") {
+      const { isQuestion, question } = await this.detectQuestion(clean);
+      if (isQuestion && question) {
+        this.onNewQuestion(question);
+      }
+      return; // Interviewer chatter (non-question) is not part of any answer.
+    }
+
+    // 4) Only accumulate to the answer buffer when we're confident the
+    //    speaker is the candidate. "unknown" speakers (not yet identified by
+    //    Haiku) might turn out to be another interviewer, so we don't risk
+    //    polluting the buffer with their text.
+    if (role !== "candidate") return;
+
     const { liveQuestions, live } = useStore.getState();
-    if (!live.currentQuestionId) {
-      // No question detected yet — we drop these utterances rather than guess.
-      return;
-    }
+    if (!live.currentQuestionId) return;
 
     this.answerBuffer += (this.answerBuffer ? " " : "") + clean;
 
-    // Should we trigger a commentary?
     if (this.shouldTriggerComment(live.currentQuestionId)) {
       const currentQ = liveQuestions.find((q) => q.id === live.currentQuestionId);
       if (currentQ) void this.generateComment(currentQ);
     }
   }
 
-  private async classify(utterance: string): Promise<{
-    speaker: "interviewer" | "candidate" | "unknown";
+  /**
+   * Pure question detection. Caller must have already determined the speaker
+   * is the interviewer — this endpoint no longer does speaker classification.
+   */
+  private async detectQuestion(utterance: string): Promise<{
     isQuestion: boolean;
     question: string;
   }> {
@@ -159,20 +178,88 @@ export class LiveOrchestrator {
           recentContext: this.recentTranscript,
         }),
       });
-      if (!resp.ok) return { speaker: "unknown", isQuestion: false, question: "" };
+      if (!resp.ok) return { isQuestion: false, question: "" };
       const data = (await resp.json()) as {
-        speaker?: "interviewer" | "candidate" | "unknown";
         isQuestion: boolean;
         question?: string;
       };
       return {
-        speaker: data.speaker ?? "unknown",
-        isQuestion: data.isQuestion,
+        isQuestion: Boolean(data.isQuestion),
         question: data.question || "",
       };
     } catch {
-      return { speaker: "unknown", isQuestion: false, question: "" };
+      return { isQuestion: false, question: "" };
     }
+  }
+
+  /**
+   * Sample recent utterances (balanced across speakers) and ask Haiku to
+   * classify each Deepgram speaker number as interviewer or candidate.
+   * Results merge into the store, where the UI re-derives labels.
+   */
+  private async runIdentifySpeakers() {
+    this.identifyInFlight = true;
+    try {
+      const sample = this.buildIdentifySample();
+      if (sample.length === 0) return;
+
+      const resp = await fetch("/api/identify-speakers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ utterances: sample }),
+      });
+      if (!resp.ok) return;
+      const data = (await resp.json()) as {
+        roles?: Record<string, "interviewer" | "candidate">;
+      };
+      if (!data.roles) return;
+
+      // Normalize keys to numbers for the store.
+      const numKeyed: Record<number, "interviewer" | "candidate"> = {};
+      for (const [k, v] of Object.entries(data.roles)) {
+        const n = Number(k);
+        if (Number.isFinite(n)) numKeyed[n] = v;
+      }
+      useStore.getState().mergeSpeakerRoles(numKeyed);
+    } catch {
+      /* best-effort; we'll retry on the next trigger */
+    } finally {
+      this.identifyInFlight = false;
+    }
+  }
+
+  /**
+   * Build a balanced sample of recent utterances for identification. Cap is
+   * IDENTIFY_CONTEXT_CAP total; share equally across speakers, taking each
+   * speaker's most recent utterances. Returned in original chronological
+   * order so Haiku sees turn-taking.
+   */
+  private buildIdentifySample(): Array<{ speaker: number; text: string }> {
+    const all = useStore.getState().liveUtterances;
+    const tagged = all.filter(
+      (u): u is typeof u & { dgSpeaker: number } => typeof u.dgSpeaker === "number"
+    );
+    if (tagged.length === 0) return [];
+
+    const bySpeaker = new Map<number, typeof tagged>();
+    for (const u of tagged) {
+      const list = bySpeaker.get(u.dgSpeaker) ?? [];
+      list.push(u);
+      bySpeaker.set(u.dgSpeaker, list);
+    }
+
+    const numSpeakers = bySpeaker.size;
+    const sharePerSpeaker = Math.max(1, Math.floor(IDENTIFY_CONTEXT_CAP / numSpeakers));
+
+    const picked = new Set<string>();
+    for (const list of bySpeaker.values()) {
+      const tail = list.slice(-sharePerSpeaker);
+      for (const u of tail) picked.add(u.id);
+    }
+
+    return tagged
+      .filter((u) => picked.has(u.id))
+      .map((u) => ({ speaker: u.dgSpeaker, text: u.text }));
   }
 
   private onNewQuestion(text: string) {

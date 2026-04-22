@@ -6,10 +6,14 @@ export type CommentLanguage = "en" | "zh";
 
 export type Speaker = "interviewer" | "candidate" | "unknown";
 
-/** A finalized chunk of transcript with its detected speaker. */
+/** A finalized chunk of transcript. The role (interviewer/candidate) is
+ *  NOT stored — it's derived at render time from the session's speaker-role
+ *  map, so identity changes (after Haiku identification) automatically
+ *  re-label all historical utterances. */
 export interface Utterance {
   id: string;
-  speaker: Speaker;
+  /** Deepgram speaker number (0, 1, 2, ...). undefined if diarization couldn't assign. */
+  dgSpeaker?: number;
   text: string;
   /** Seconds from session start when the utterance was finalized. */
   atSeconds: number;
