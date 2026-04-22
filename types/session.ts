@@ -6,6 +6,20 @@ export type CommentLanguage = "en" | "zh";
 
 export type Speaker = "interviewer" | "candidate" | "unknown";
 
+/** State of the current moment — what's happening in the room right now.
+ *  Drives the top bar in the live view. */
+export type MomentStateKind =
+  | "idle"                  // session just started, nothing classified yet
+  | "chitchat"              // small talk, intros, audio check
+  | "interviewer_speaking"  // interviewer is mid-question, not yet finalized
+  | "question_finalized";   // a complete question is ready; commentary can flow
+
+export interface MomentState {
+  state: MomentStateKind;
+  /** One-line human-readable summary, shown in the top bar. */
+  summary: string;
+}
+
 /** A finalized chunk of transcript. The role (interviewer/candidate) is
  *  NOT stored — it's derived at render time from the session's speaker-role
  *  map, so identity changes (after Haiku identification) automatically

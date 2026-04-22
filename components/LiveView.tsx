@@ -11,6 +11,7 @@ export function LiveView() {
   const live = useStore((s) => s.live);
   const utterances = useStore((s) => s.liveUtterances);
   const speakerRoles = useStore((s) => s.liveSpeakerRoles);
+  const moment = useStore((s) => s.liveMomentState);
 
   // Subscribe to the interim transcript via window events — keeps the event
   // bus out of the Zustand store (this state is noisy and doesn't need to
@@ -58,41 +59,21 @@ export function LiveView() {
         </div>
       </div>
 
-      {/* Sticky current question bar */}
-      {currentQ ? (
-        <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
-          <div className="border-y border-rule py-3.5 relative">
-            <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
-              {t("Current Question · Interviewer", "当前问题 · 面试官")}
-            </div>
-            <div className="font-serif text-[19px] leading-snug text-ink font-medium">
-              {currentQ.text}
-            </div>
-          </div>
-        </div>
-      ) : (
-        /* No question detected yet — show a gentle "waiting" hint in place of the bar */
-        <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
-          <div className="border-y border-rule py-3.5">
-            <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-              <span className="inline-flex gap-[3px]">
-                <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot" />
-                <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.15s]" />
-                <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.3s]" />
-              </span>
-              {t("Waiting for the first question", "正在等待第一个问题")}
-            </div>
-            <div className="text-sm text-ink-light italic leading-snug">
-              {interim ||
-                t(
-                  "Listening to the conversation…",
-                  "正在聆听对话…"
-                )}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Sticky moment bar — three states (chitchat / interviewer_speaking /
+          question_finalized) plus an idle bootstrap. */}
+      <MomentBar
+        state={moment.state}
+        summary={moment.summary}
+        currentQuestion={currentQ}
+        interim={interim}
+        labels={{
+          finalized: t("Current Question · Interviewer", "当前问题 · 面试官"),
+          chitchat: t("Chit-chatting", "闲聊中"),
+          interviewerSpeaking: t("Interviewer is speaking", "面试官正在说话"),
+          listening: t("Listening to the conversation…", "正在聆听对话…"),
+        }}
+      />
+
 
       {/* Scrollable feed */}
       <div className="flex-1 overflow-y-auto">
@@ -113,7 +94,7 @@ export function LiveView() {
             />
           )}
 
-          {currentQ && (
+          {currentQ && moment.state === "question_finalized" && (
             <div className="pb-6 pt-1">
               <div className="text-[11px] text-ink-lighter tracking-wide font-medium mb-2">
                 {t(
@@ -171,6 +152,100 @@ export function LiveView() {
         </div>
       </div>
     </>
+  );
+}
+
+/**
+ * The sticky bar above the scrollable feed. Renders one of four layouts
+ * based on the moment state — idle (waiting for first transcript), chitchat,
+ * interviewer-speaking (mid-question), or question-finalized.
+ */
+function MomentBar({
+  state,
+  summary,
+  currentQuestion,
+  interim,
+  labels,
+}: {
+  state: import("@/types/session").MomentStateKind;
+  summary: string;
+  currentQuestion: { text: string } | undefined;
+  interim: string;
+  labels: {
+    finalized: string;
+    chitchat: string;
+    interviewerSpeaking: string;
+    listening: string;
+  };
+}) {
+  // Layout 1 — finalized question (existing red-dot look)
+  if (state === "question_finalized" && currentQuestion) {
+    return (
+      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
+        <div className="border-y border-rule py-3.5 relative">
+          <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
+            {labels.finalized}
+          </div>
+          <div className="font-serif text-[19px] leading-snug text-ink font-medium">
+            {currentQuestion.text}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Layout 2 — chitchat
+  if (state === "chitchat") {
+    return (
+      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
+        <div className="border-y border-rule py-3.5 bg-paper-subtle/60">
+          <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
+            <span>💬</span>
+            {labels.chitchat}
+          </div>
+          <div className="text-[15px] leading-snug text-ink-light">
+            {summary || labels.listening}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Layout 3 — interviewer speaking (mid-question)
+  if (state === "interviewer_speaking") {
+    return (
+      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
+        <div className="border-y border-rule py-3.5 bg-accent-bg/60">
+          <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
+            <span>🎙️</span>
+            {labels.interviewerSpeaking}
+          </div>
+          <div className="text-[15px] leading-snug text-ink">
+            {summary || labels.listening}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Layout 4 — idle bootstrap (no classify result yet)
+  return (
+    <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
+      <div className="border-y border-rule py-3.5">
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
+          <span className="inline-flex gap-[3px]">
+            <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot" />
+            <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.15s]" />
+            <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.3s]" />
+          </span>
+          {labels.listening}
+        </div>
+        <div className="text-sm text-ink-light italic leading-snug">
+          {interim || ""}
+        </div>
+      </div>
+    </div>
   );
 }
 

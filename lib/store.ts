@@ -6,6 +6,7 @@ import type {
   Session,
   LiveState,
   Utterance,
+  MomentState,
 } from "@/types/session";
 
 /** How many recent utterances to keep in the live transcript ribbon. */
@@ -41,6 +42,8 @@ interface StoreState {
   /** Map of Deepgram speaker number → resolved role. Set as Haiku identifies
    *  speakers; once set, sticks for the rest of the session. */
   liveSpeakerRoles: Record<number, "interviewer" | "candidate">;
+  /** Current "moment" — drives the top bar's three-state display. */
+  liveMomentState: MomentState;
 
   startLive: (jd: string, resume: string) => void;
   addQuestion: (q: Question) => void;
@@ -49,6 +52,7 @@ interface StoreState {
   /** Merge new identifications into the role map. Existing entries are NOT
    *  overwritten — once a speaker's role is decided, it sticks. */
   mergeSpeakerRoles: (roles: Record<number, "interviewer" | "candidate">) => void;
+  setMomentState: (m: MomentState) => void;
   /** End the live session, snapshot it into past sessions with the given title. */
   endLive: (title: string, audioUrl?: string) => Session;
   /** Wipe live state (after End & Save, or a hard reset). */
@@ -60,6 +64,8 @@ const emptyLive: LiveState = {
   elapsedSeconds: 0,
   currentQuestionId: null,
 };
+
+const emptyMoment: MomentState = { state: "idle", summary: "" };
 
 export const useStore = create<StoreState>((set, get) => ({
   commentLang: "en",
@@ -96,6 +102,7 @@ export const useStore = create<StoreState>((set, get) => ({
   liveResume: "",
   liveUtterances: [],
   liveSpeakerRoles: {},
+  liveMomentState: emptyMoment,
 
   startLive: (jd, resume) =>
     set({
@@ -104,6 +111,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveQuestions: [],
       liveUtterances: [],
       liveSpeakerRoles: {},
+      liveMomentState: emptyMoment,
       live: { status: "recording", elapsedSeconds: 0, currentQuestionId: null },
     }),
 
@@ -145,6 +153,8 @@ export const useStore = create<StoreState>((set, get) => ({
       return changed ? { liveSpeakerRoles: next } : {};
     }),
 
+  setMomentState: (m) => set({ liveMomentState: m }),
+
   endLive: (title, audioUrl) => {
     const s = get();
     const session: Session = {
@@ -166,6 +176,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveResume: "",
       liveUtterances: [],
       liveSpeakerRoles: {},
+      liveMomentState: emptyMoment,
       live: emptyLive,
     }));
     return session;
@@ -178,6 +189,7 @@ export const useStore = create<StoreState>((set, get) => ({
       liveResume: "",
       liveUtterances: [],
       liveSpeakerRoles: {},
+      liveMomentState: emptyMoment,
       live: emptyLive,
     }),
 }));

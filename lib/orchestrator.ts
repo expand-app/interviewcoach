@@ -1,26 +1,32 @@
 import { AudioSession } from "./audioSession";
 import { useStore } from "./store";
-import type { Comment, Question } from "@/types/session";
+import type { Comment, MomentStateKind, Question } from "@/types/session";
 
 /**
  * The orchestrator owns an in-progress interview session. It:
  *   1. Runs an AudioSession for transcription + recording
- *   2. Feeds each finalized utterance into the question detector
- *   3. Accumulates answer text under the current question
- *   4. Triggers commentary generation at natural pauses
+ *   2. Identifies speakers (via /api/identify-speakers, cached per-session)
+ *   3. Drives the moment state machine (via /api/classify-moment)
+ *   4. Manages question creation and answer-buffer carry-over across states
+ *   5. Triggers commentary generation at natural pauses
  *
  * There's exactly one orchestrator at a time, stored on the window for
  * debuggability and to survive React re-renders without a provider.
  */
 
 // Tunable thresholds
-const COMMENT_TRIGGER_CHARS = 220;   // ~40-60 spoken words of new answer text
-const COMMENT_MIN_GAP_MS   = 8000;   // don't spam — min 8s between comments on same Q
+const COMMENT_TRIGGER_CHARS = 220;
+const COMMENT_MIN_GAP_MS    = 8000;
 
 // Identification thresholds
 const IDENTIFY_MIN_DISTINCT_SPEAKERS = 2;
 const IDENTIFY_MIN_TOTAL_UTTERANCES  = 3;
-const IDENTIFY_CONTEXT_CAP           = 12; // utterances sent to Haiku, balanced
+const IDENTIFY_CONTEXT_CAP           = 12;
+
+// Moment classification timing
+const CLASSIFY_DEBOUNCE_MS = 500;
+const CLASSIFY_SILENCE_MS  = 2000;
+const CLASSIFY_CONTEXT_CAP = 12;
 
 function rand(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now()}`;
@@ -28,30 +34,44 @@ function rand(prefix: string) {
 
 export class LiveOrchestrator {
   private audio: AudioSession | null = null;
-  private answerBuffer = "";                // text accumulated since last comment
-  private pendingCommentaryFor: string | null = null;  // question id we're generating for
+  /** Text accumulated under the current finalized question, awaiting commentary. */
+  private answerBuffer = "";
+  /** Candidate text accumulated while the interviewer is mid-question; carried
+   *  over to answerBuffer when the question finalizes so the start of the
+   *  candidate's response isn't lost from commentary input. */
+  private pendingAnswerBuffer = "";
+  private pendingCommentaryFor: string | null = null;
   private lastCommentAt: Map<string, number> = new Map();
   private recentTranscript = "";
-  /** All Deepgram speaker numbers we've heard so far (used for identify trigger). */
+
+  /** Speaker identification (Deepgram speaker # → role). Lives in the store
+   *  so the UI can re-derive labels. We keep the in-flight gate locally. */
   private knownDgSpeakers = new Set<number>();
-  /** Set when an identify-speakers request is in flight. */
   private identifyInFlight = false;
+
+  /** Moment classification timing/gating. */
+  private lastDgSpeaker: number | undefined;
+  private lastTranscriptAt = 0;
+  private classifyDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private classifyInFlight = false;
 
   async start() {
     if (this.audio) return;
     this.knownDgSpeakers.clear();
     this.identifyInFlight = false;
+    this.lastDgSpeaker = undefined;
+    this.lastTranscriptAt = 0;
+    this.classifyInFlight = false;
+    this.answerBuffer = "";
+    this.pendingAnswerBuffer = "";
 
     this.audio = new AudioSession({
       onInterimTranscript: (text) => {
-        // Surface live caption by publishing to window; UI can subscribe if desired.
-        window.dispatchEvent(
-          new CustomEvent("ic:interim", { detail: text })
-        );
+        window.dispatchEvent(new CustomEvent("ic:interim", { detail: text }));
       },
       onFinalTranscript: (text, speaker) => this.onUtterance(text, speaker),
-      onAudioReady: (audioUrl, _duration) => {
-        // Stash on window for the End & Save flow to pick up.
+      onAudioReady: (audioUrl) => {
         (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = audioUrl;
       },
       onError: (msg) => {
@@ -74,6 +94,14 @@ export class LiveOrchestrator {
   }
 
   async stop() {
+    if (this.classifyDebounceTimer) {
+      clearTimeout(this.classifyDebounceTimer);
+      this.classifyDebounceTimer = null;
+    }
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
     if (!this.audio) return;
     await this.audio.stop();
     this.audio = null;
@@ -87,8 +115,7 @@ export class LiveOrchestrator {
 
     this.recentTranscript = (this.recentTranscript + " " + clean).slice(-1200);
 
-    // 1) Persist the raw utterance immediately. UI shows it under a placeholder
-    //    label like "Speaker 1" until identification resolves.
+    // 1) Persist the raw utterance immediately for the live captions UI.
     {
       const state = useStore.getState();
       state.addUtterance({
@@ -100,9 +127,6 @@ export class LiveOrchestrator {
     }
 
     // 2) Trigger speaker identification at the right moments.
-    //    - First time: ≥2 distinct speakers seen AND ≥3 total utterances
-    //    - Subsequent: a brand-new Deepgram speaker number appears AND we
-    //      already have an identity map for at least one other speaker
     if (dgSpeaker !== undefined) {
       const isNewDgSpeaker = !this.knownDgSpeakers.has(dgSpeaker);
       this.knownDgSpeakers.add(dgSpeaker);
@@ -127,76 +151,185 @@ export class LiveOrchestrator {
       }
     }
 
-    // 3) Question detection — only if we know this speaker is the interviewer.
-    //    Until identity is resolved we deliberately don't guess; per design,
-    //    the very first interview question may show in captions but not in
-    //    the Question feed.
+    // 3) Drive the moment state machine.
+    //    - Reset silence timer (2s of nothing → trigger classify).
+    //    - On speaker switch, schedule a debounced classify.
+    this.lastTranscriptAt = Date.now();
+    this.armSilenceTimer();
+    if (dgSpeaker !== undefined && dgSpeaker !== this.lastDgSpeaker) {
+      this.lastDgSpeaker = dgSpeaker;
+      this.scheduleClassifyMoment();
+    }
+
+    // 4) Per-state buffering of CANDIDATE text.
     const role =
       dgSpeaker !== undefined
         ? useStore.getState().liveSpeakerRoles[dgSpeaker]
         : undefined;
-
-    if (role === "interviewer") {
-      const { isQuestion, question } = await this.detectQuestion(clean);
-      if (isQuestion && question) {
-        this.onNewQuestion(question);
-      }
-      return; // Interviewer chatter (non-question) is not part of any answer.
-    }
-
-    // 4) Only accumulate to the answer buffer when we're confident the
-    //    speaker is the candidate. "unknown" speakers (not yet identified by
-    //    Haiku) might turn out to be another interviewer, so we don't risk
-    //    polluting the buffer with their text.
     if (role !== "candidate") return;
 
-    const { liveQuestions, live } = useStore.getState();
-    if (!live.currentQuestionId) return;
-
-    this.answerBuffer += (this.answerBuffer ? " " : "") + clean;
-
-    if (this.shouldTriggerComment(live.currentQuestionId)) {
-      const currentQ = liveQuestions.find((q) => q.id === live.currentQuestionId);
-      if (currentQ) void this.generateComment(currentQ);
+    const momentState = useStore.getState().liveMomentState.state;
+    if (momentState === "question_finalized") {
+      const { liveQuestions, live } = useStore.getState();
+      if (!live.currentQuestionId) return;
+      this.answerBuffer += (this.answerBuffer ? " " : "") + clean;
+      if (this.shouldTriggerComment(live.currentQuestionId)) {
+        const currentQ = liveQuestions.find((q) => q.id === live.currentQuestionId);
+        if (currentQ) void this.generateComment(currentQ);
+      }
+    } else if (momentState === "interviewer_speaking") {
+      // Carry-over: stash candidate text so the start of their answer survives
+      // the transition into question_finalized.
+      this.pendingAnswerBuffer +=
+        (this.pendingAnswerBuffer ? " " : "") + clean;
     }
+    // chitchat / idle → drop candidate text (no question to attach it to).
   }
 
-  /**
-   * Pure question detection. Caller must have already determined the speaker
-   * is the interviewer — this endpoint no longer does speaker classification.
-   */
-  private async detectQuestion(utterance: string): Promise<{
-    isQuestion: boolean;
-    question: string;
-  }> {
+  // ----- moment state machine -----
+
+  private scheduleClassifyMoment() {
+    if (this.classifyDebounceTimer) clearTimeout(this.classifyDebounceTimer);
+    this.classifyDebounceTimer = setTimeout(() => {
+      this.classifyDebounceTimer = null;
+      void this.runClassifyMoment();
+    }, CLASSIFY_DEBOUNCE_MS);
+  }
+
+  private armSilenceTimer() {
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    this.silenceTimer = setTimeout(() => {
+      this.silenceTimer = null;
+      void this.runClassifyMoment();
+    }, CLASSIFY_SILENCE_MS);
+  }
+
+  private async runClassifyMoment() {
+    if (this.classifyInFlight) return;
+    this.classifyInFlight = true;
     try {
-      const resp = await fetch("/api/detect-question", {
+      const sample = this.buildClassifySample();
+      if (sample.length === 0) return;
+
+      const currentState = useStore.getState().liveMomentState.state;
+      const msSinceLastTranscript = this.lastTranscriptAt
+        ? Date.now() - this.lastTranscriptAt
+        : 0;
+
+      const resp = await fetch("/api/classify-moment", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          utterance,
-          recentContext: this.recentTranscript,
+          utterances: sample,
+          currentState,
+          msSinceLastTranscript,
         }),
       });
-      if (!resp.ok) return { isQuestion: false, question: "" };
+      if (!resp.ok) return;
       const data = (await resp.json()) as {
-        isQuestion: boolean;
+        state?: MomentStateKind;
+        summary?: string;
         question?: string;
       };
-      return {
-        isQuestion: Boolean(data.isQuestion),
-        question: data.question || "",
-      };
+      if (!data.state) return;
+
+      this.applyMoment(data.state, data.summary || "", data.question || "");
     } catch {
-      return { isQuestion: false, question: "" };
+      /* best-effort; the next trigger will retry */
+    } finally {
+      this.classifyInFlight = false;
+    }
+  }
+
+  private applyMoment(
+    next: MomentStateKind,
+    summary: string,
+    questionText: string
+  ) {
+    const store = useStore.getState();
+    const prev = store.liveMomentState.state;
+
+    // Always update the displayed state + summary (even if state didn't change,
+    // the summary may have been refined as the interviewer kept talking).
+    store.setMomentState({ state: next, summary });
+
+    if (next === "question_finalized" && prev !== "question_finalized") {
+      // New question: create the Question, carry over any candidate text the
+      // candidate has spoken since the interviewer started this question.
+      const text = questionText || summary;
+      if (text) {
+        const q: Question = {
+          id: rand("q"),
+          text,
+          askedAtSeconds: store.live.elapsedSeconds,
+          comments: [],
+        };
+        store.addQuestion(q);
+        this.answerBuffer = this.pendingAnswerBuffer;
+        this.pendingAnswerBuffer = "";
+        this.pendingCommentaryFor = null;
+        // If the carried-over text already exceeds the trigger, fire commentary
+        // immediately for a snappy first reaction.
+        if (this.shouldTriggerComment(q.id)) {
+          void this.generateComment(q);
+        }
+      }
+    } else if (next !== "question_finalized" && prev === "question_finalized") {
+      // Leaving question_finalized — the just-completed question falls into
+      // "Earlier in this interview" by clearing currentQuestionId.
+      store.setCurrentQuestionId(null);
+      this.answerBuffer = "";
+      this.pendingCommentaryFor = null;
+      // Reset pending buffer for the NEW question that's beginning.
+      this.pendingAnswerBuffer = "";
+    } else if (next === "interviewer_speaking" && prev !== "interviewer_speaking") {
+      // Entering interviewer_speaking from chitchat or idle — start a fresh
+      // pending buffer so candidate text from prior chitchat doesn't leak in.
+      this.pendingAnswerBuffer = "";
+    } else if (next === "chitchat") {
+      // Chitchat — nothing the candidate says is part of any answer.
+      this.pendingAnswerBuffer = "";
     }
   }
 
   /**
-   * Sample recent utterances (balanced across speakers) and ask Haiku to
-   * classify each Deepgram speaker number as interviewer or candidate.
-   * Results merge into the store, where the UI re-derives labels.
+   * Recent utterances tagged with their resolved role label (or "Speaker N"
+   * placeholder for unidentified speakers). Cap CLASSIFY_CONTEXT_CAP, in
+   * chronological order so Haiku sees turn-taking.
    */
+  private buildClassifySample(): Array<{ speaker: string; text: string }> {
+    const store = useStore.getState();
+    const all = store.liveUtterances;
+    const roles = store.liveSpeakerRoles;
+    if (all.length === 0) return [];
+
+    // Build stable 1-indexed speaker numbers in first-heard order.
+    const indexBySpeaker = new Map<number, number>();
+    let nextIdx = 1;
+    for (const u of all) {
+      if (u.dgSpeaker === undefined) continue;
+      if (!indexBySpeaker.has(u.dgSpeaker)) {
+        indexBySpeaker.set(u.dgSpeaker, nextIdx++);
+      }
+    }
+
+    const tail = all.slice(-CLASSIFY_CONTEXT_CAP);
+    return tail.map((u) => {
+      let label: string;
+      if (u.dgSpeaker === undefined) {
+        label = "Speaker";
+      } else {
+        const role = roles[u.dgSpeaker];
+        if (role === "interviewer") label = "Interviewer";
+        else if (role === "candidate") label = "Candidate";
+        else label = `Speaker ${indexBySpeaker.get(u.dgSpeaker)}`;
+      }
+      return { speaker: label, text: u.text };
+    });
+  }
+
+  // ----- speaker identification -----
+
   private async runIdentifySpeakers() {
     this.identifyInFlight = true;
     try {
@@ -214,7 +347,6 @@ export class LiveOrchestrator {
       };
       if (!data.roles) return;
 
-      // Normalize keys to numbers for the store.
       const numKeyed: Record<number, "interviewer" | "candidate"> = {};
       for (const [k, v] of Object.entries(data.roles)) {
         const n = Number(k);
@@ -222,18 +354,12 @@ export class LiveOrchestrator {
       }
       useStore.getState().mergeSpeakerRoles(numKeyed);
     } catch {
-      /* best-effort; we'll retry on the next trigger */
+      /* best-effort; will retry on the next trigger */
     } finally {
       this.identifyInFlight = false;
     }
   }
 
-  /**
-   * Build a balanced sample of recent utterances for identification. Cap is
-   * IDENTIFY_CONTEXT_CAP total; share equally across speakers, taking each
-   * speaker's most recent utterances. Returned in original chronological
-   * order so Haiku sees turn-taking.
-   */
   private buildIdentifySample(): Array<{ speaker: number; text: string }> {
     const all = useStore.getState().liveUtterances;
     const tagged = all.filter(
@@ -253,8 +379,7 @@ export class LiveOrchestrator {
 
     const picked = new Set<string>();
     for (const list of bySpeaker.values()) {
-      const tail = list.slice(-sharePerSpeaker);
-      for (const u of tail) picked.add(u.id);
+      for (const u of list.slice(-sharePerSpeaker)) picked.add(u.id);
     }
 
     return tagged
@@ -262,19 +387,7 @@ export class LiveOrchestrator {
       .map((u) => ({ speaker: u.dgSpeaker, text: u.text }));
   }
 
-  private onNewQuestion(text: string) {
-    const { live, addQuestion } = useStore.getState();
-    const q: Question = {
-      id: rand("q"),
-      text,
-      askedAtSeconds: live.elapsedSeconds,
-      comments: [],
-    };
-    addQuestion(q);
-    // New question resets the answer buffer.
-    this.answerBuffer = "";
-    this.pendingCommentaryFor = null;
-  }
+  // ----- commentary -----
 
   private shouldTriggerComment(questionId: string): boolean {
     if (this.pendingCommentaryFor) return false;
@@ -292,7 +405,6 @@ export class LiveOrchestrator {
     const { liveJd, liveResume, commentLang, addCommentToQuestion, live } =
       useStore.getState();
 
-    // We append the comment progressively as SSE deltas arrive.
     const commentId = rand("c");
     const emptyComment: Comment = {
       id: commentId,
@@ -355,8 +467,6 @@ export class LiveOrchestrator {
   }
 
   private patchCommentText(qid: string, cid: string, text: string) {
-    // We reach directly into the store to mutate one comment; adding a
-    // dedicated setter would be cleaner but this stays close to Zustand.
     useStore.setState((s) => ({
       liveQuestions: s.liveQuestions.map((q) =>
         q.id !== qid
@@ -377,13 +487,11 @@ export class LiveOrchestrator {
     if (!live.currentQuestionId) return;
     const currentQ = liveQuestions.find((q) => q.id === live.currentQuestionId);
     if (!currentQ) return;
-    // Use buffer if present, otherwise the last ~500 chars of recent transcript.
     if (!this.answerBuffer) this.answerBuffer = this.recentTranscript.slice(-500);
     await this.generateComment(currentQ);
   }
 }
 
-// Singleton accessor
 let singleton: LiveOrchestrator | null = null;
 export function getOrchestrator(): LiveOrchestrator {
   if (!singleton) singleton = new LiveOrchestrator();
