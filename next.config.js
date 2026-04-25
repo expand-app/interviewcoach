@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  devIndicators: false,
   // Disable webpack's persistent file cache in dev. On Windows the .next/
   // cache/webpack/*.pack.gz files routinely fail to rename atomically when
   // the dev server is busy (ENOENT errors followed by a hung compile). The

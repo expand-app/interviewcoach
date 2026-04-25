@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import { getAnthropicClient } from "@/lib/anthropic-client";
 
 export const runtime = "nodejs";
 
@@ -36,20 +37,26 @@ export async function POST(req: Request) {
     return NextResponse.json({ roles: {} });
   }
 
-  const client = new Anthropic({ apiKey });
+  const client = getAnthropicClient();
 
   const system = `You identify the role of each speaker in a recorded interview.
 
 You receive a list of utterances tagged with a raw speaker number (0, 1, 2, ...) from a diarization system. The speaker numbers are arbitrary — they do NOT tell you who the interviewer or candidate is. You must judge by SEMANTICS (what each speaker says).
 
 Roles:
-- Interviewer: asks questions ("tell me about...", "walk me through...", "how would you...", "why did you..."), gives short prompts and acknowledgements ("got it", "interesting", "uh huh"), drives the conversation pace, references the role/company in the second person ("at our company", "in this role").
-- Candidate: tells stories about their own experience in first-person ("I led a team of...", "at my last job...", "what I did was..."), explains decisions and tradeoffs, gives long answers in response to prompts.
+- Interviewer: asks questions ("tell me about...", "walk me through...", "how would you...", "why did you..."), gives short prompts and acknowledgements ("got it", "interesting", "uh huh"), drives the conversation pace, references the role/company in the second person ("at our company", "in this role"). EARLY in the call interviewers often DESCRIBE the team / the role / what the candidate would be working on — this is "selling" talk, and it sounds a lot like a candidate describing their work. The cue is perspective: the interviewer says "we'll have opportunity", "our team is building", "you'll be working on" — first-person-plural-company or second-person-addressing-candidate. Candidates describing their own work say "I built", "at my last job", "my team did".
+- Candidate: tells stories about their OWN experience in first-person ("I led a team of...", "at my last job...", "what I did was..."), explains decisions and tradeoffs, gives long answers in response to prompts. Candidates ALSO ask clarifying questions back ("what's your main focus?", "how is the team structured?", "what does a typical day look like?") — these are NOT interviewer questions, they're the candidate probing during pleasantries or at end-of-call. Don't mislabel a candidate's clarifying question as interviewer content.
+
+COMMON TRAPS (easy to mislabel):
+- Interviewer spending the first few minutes describing the team / automation work / ML opportunities → sounds like the candidate talking about their current work. Check perspective: "we", "our team", "you'll be" vs. "I", "my team", "we did".
+- Candidate asking "what's your focus?" / "what are the growth opportunities?" → sounds like an interviewer question. But it's the candidate probing — they're interviewing the company too.
+- Short backchannels ("yeah", "right", "ok") from either role look identical — don't anchor on them. Look at the SUBSTANTIVE turns.
 
 CRITICAL:
-- Do not assume the first speaker is the interviewer. Many interviews start with the candidate introducing themselves. Judge by content, not order.
+- Do not assume the first speaker is the interviewer. Many interviews start with the candidate introducing themselves, or the interviewer pitching the role before asking anything.
 - If a speaker hasn't said enough to tell (only a couple words, or only ambiguous fragments like "yeah" / "okay"), OMIT that speaker number from your response. Do not guess.
 - A panel interview can have multiple speakers all classified as "Interviewer". A single candidate is most common.
+- When in doubt between "interviewer describing the role" and "candidate describing their work", look at pronouns: "we/our/you'll" → interviewer; "I/my/we did at X" → candidate. If still ambiguous after checking pronouns, OMIT rather than guess.
 
 Return JSON only, no prose. Format:
 {"0": "Interviewer", "1": "Candidate", "2": "Interviewer"}

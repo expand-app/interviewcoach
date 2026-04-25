@@ -1,15 +1,33 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
-import type { Comment, MomentStateKind, Question, Speaker, Utterance } from "@/types/session";
+import type { Comment, MomentStateKind, Question, Utterance } from "@/types/session";
 
-const COMMENTARY_HEIGHT_PX = 140;  // single-comment fixed pane
-const CAPTIONS_HEIGHT_PX   = 160;
-/** Window of SPEAKING-time (sum of utterance durations) shown in captions. */
-const CAPTIONS_WINDOW_S    = 10;
-const DEFAULT_UTTERANCE_S  = 2;
+/**
+ * The three top sections (Interview Phase, Live Commentary, Live Captions)
+ * are laid out as a SINGLE 16:9 landscape block — the same aspect ratio
+ * as a horizontal video frame, because the user also renders this block
+ * inside an actual video. All three heights are fixed so content is
+ * deterministic (prompts are tuned to fit these heights).
+ *
+ * At max-w-[920px] the 16:9 frame is 517.5px tall. We use:
+ *   Phase:     90 px
+ *   Commentary: 232 px  (heading 28 + pane 204)
+ *   Captions:   195 px  (heading 32 + lane 80 + divider 1 + lane 80 + border 2)
+ *   ─────────────
+ *   Total:     517 px   ≈ 16:9 at 920 px width
+ */
+const PHASE_HEIGHT_PX = 90;
+const COMMENTARY_TOTAL_HEIGHT_PX = 232;
+const COMMENTARY_HEADING_HEIGHT_PX = 28;
+const COMMENTARY_PANE_HEIGHT_PX =
+  COMMENTARY_TOTAL_HEIGHT_PX - COMMENTARY_HEADING_HEIGHT_PX; // 204
+const CAPTIONS_TOTAL_HEIGHT_PX = 195;
+const CAPTIONS_HEADING_HEIGHT_PX = 32;
+/** Each speaker's caption lane. */
+const CAPTIONS_LANE_HEIGHT_PX = 80;
 
 export function LiveView() {
   const t = useTranslations();
@@ -19,7 +37,11 @@ export function LiveView() {
   const speakerRoles = useStore((s) => s.liveSpeakerRoles);
   const moment = useStore((s) => s.liveMomentState);
   const displayedComment = useStore((s) => s.liveDisplayedComment);
-  const answerInProgress = useStore((s) => s.liveAnswerInProgress);
+  const listeningHint = useStore((s) => s.liveListeningHint);
+  const warmupCommentary = useStore((s) => s.liveWarmupCommentary);
+  const timeline = useStore((s) => s.liveTimeline);
+  const playbackTime = useStore((s) => s.livePlaybackTime);
+  const isUploadMode = useStore((s) => s.liveIsUploadMode);
 
   const [interim, setInterim] = useState("");
   useEffect(() => {
@@ -28,16 +50,267 @@ export function LiveView() {
     return () => window.removeEventListener("ic:interim", handler);
   }, []);
 
-  // Resolve the current main + follow-up Qs from the flat list.
-  const currentSubQ = questions.find((q) => q.id === live.currentQuestionId);
-  const currentMainQ = currentSubQ?.parentQuestionId
-    ? questions.find((q) => q.id === currentSubQ.parentQuestionId)
-    : currentSubQ;
-  const currentFollowUpQ =
-    currentSubQ && currentSubQ !== currentMainQ ? currentSubQ : undefined;
+  // Upload-mode playback: PlaybackSession emits "ic:playback-started"
+  // carrying the HTMLAudioElement in event.detail when it begins. We
+  // hold a ref so the LivePlayerStrip can render a scrubber bound to
+  // the same audio element the session is driving — seeking in the UI
+  // advances the session naturally (PlaybackSession listens to its own
+  // audio element's timeupdate event, so UI seeks trigger utterance
+  // flushes automatically).
+  const [playbackAudio, setPlaybackAudio] = useState<HTMLAudioElement | null>(
+    null
+  );
+  useEffect(() => {
+    const onStart = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail instanceof HTMLAudioElement) setPlaybackAudio(detail);
+    };
+    const onStop = () => setPlaybackAudio(null);
+    window.addEventListener("ic:playback-started", onStart);
+    window.addEventListener("ic:playback-stopped", onStop);
+    return () => {
+      window.removeEventListener("ic:playback-started", onStart);
+      window.removeEventListener("ic:playback-stopped", onStop);
+    };
+  }, []);
 
-  // The Q that "owns" the live commentary slot is whichever sub-Q is current.
-  const commentaryOwnerQ = currentSubQ;
+  // ReviewPanel dispatches `ic:seek-to` with a seconds number when the
+  // user clicks an entry. We own the audio element here, so we do the
+  // actual seek — keeps ReviewPanel decoupled from the playback source.
+  useEffect(() => {
+    if (!playbackAudio) return;
+    const handler = (e: Event) => {
+      const sec = (e as CustomEvent).detail;
+      if (typeof sec !== "number" || !isFinite(sec)) return;
+      playbackAudio.currentTime = Math.max(0, sec);
+    };
+    window.addEventListener("ic:seek-to", handler);
+    return () => window.removeEventListener("ic:seek-to", handler);
+  }, [playbackAudio]);
+
+  // === Timeline-driven resolution (upload + preanalyze) ===
+  // When a timeline is present, every piece of derived state — phase,
+  // current lead/probe, displayed commentary, listening hint — is a
+  // lookup against `playbackTime` rather than store-accumulated state.
+  // This is what makes seeking correct: scrubbing just moves the time
+  // forward or back, and everything re-renders from the same snapshot.
+  const timelineView = useMemo(() => {
+    if (!timeline) return null;
+    // Universal 5-second display lag. Without this, everything reveals
+    // the instant its timestamp is crossed — the UI feels psychic,
+    // showing the question as soon as the interviewer starts asking.
+    // Lag = "I heard it, I understood it, now I'm showing it."
+    const DISPLAY_LAG_SEC = 5;
+    const t = Math.max(0, playbackTime - DISPLAY_LAG_SEC);
+
+    // Phase at time t = latest phase segment whose fromSec <= t
+    const phaseSeg = [...timeline.phases]
+      .reverse()
+      .find((p) => p.fromSec <= t);
+
+    /** For a question asked at `askedAtSec`, compute the time at which
+     *  it should REVEAL in the UI. Reveal is at the END of the asking
+     *  turn, not the beginning — otherwise users see the question
+     *  materialize while the interviewer is still articulating it.
+     *  Heuristic: find the next phase after askedAtSec whose kind is
+     *  candidate_answering with matching questionId — that's when the
+     *  interviewer has handed off. Fallback to askedAtSec + 10s if no
+     *  such phase exists (covers extraction gaps). */
+    const questionRevealAt = (q: {
+      id: string;
+      askedAtSec: number;
+    }): number => {
+      const nextAnswerPhase = timeline.phases.find(
+        (p) =>
+          p.fromSec > q.askedAtSec &&
+          p.kind === "candidate_answering" &&
+          p.questionId === q.id
+      );
+      if (nextAnswerPhase) return nextAnswerPhase.fromSec;
+      // Fallback: assume ~10s interviewer speech + hand-off.
+      return q.askedAtSec + 10;
+    };
+
+    // Latest LEAD question whose reveal-time <= t
+    const leadsSorted = timeline.questions
+      .filter((q) => !q.parentId)
+      .slice()
+      .sort((a, b) => a.askedAtSec - b.askedAtSec);
+    const lead = leadsSorted
+      .slice()
+      .reverse()
+      .find((q) => questionRevealAt(q) <= t);
+
+    // Latest PROBE question (parent = lead) whose reveal-time <= t
+    const probe = lead
+      ? timeline.questions
+          .filter((q) => q.parentId === lead.id)
+          .slice()
+          .sort((a, b) => a.askedAtSec - b.askedAtSec)
+          .filter((q) => questionRevealAt(q) <= t)
+          .pop()
+      : undefined;
+
+    // Per-commentary "reveal time": the playback moment when we
+    // actually want to surface the comment, which is NOT `atSec`
+    // directly. atSec is the moment the model observed; we wait until
+    // the next natural beat — a ≥ 2.5s silence, or a speaker change —
+    // so the UI never pops a comment onto the screen while the
+    // candidate is still mid-thought. Capped at atSec + 20s so a
+    // non-stop monologue doesn't suppress the comment forever.
+    const PAUSE_MIN_SEC = 2.5;
+    const MAX_WAIT_SEC = 20;
+    const sortedUtterances = [...utterances].sort(
+      (a, b) => a.atSeconds - b.atSeconds
+    );
+    const computeRevealAt = (atSec: number): number => {
+      const maxWait = atSec + MAX_WAIT_SEC;
+      // Find the first utterance whose END is >= atSec.
+      let i = 0;
+      while (i < sortedUtterances.length) {
+        const u = sortedUtterances[i];
+        const uEnd = u.atSeconds + (u.duration ?? 1.5);
+        if (uEnd >= atSec) break;
+        i++;
+      }
+      for (; i < sortedUtterances.length; i++) {
+        const u = sortedUtterances[i];
+        const uEnd = u.atSeconds + (u.duration ?? 1.5);
+        if (uEnd > maxWait) break;
+        const next = sortedUtterances[i + 1];
+        if (!next) {
+          // End of recording counts as a natural break.
+          return Math.max(atSec, uEnd);
+        }
+        const gap = next.atSeconds - uEnd;
+        const uRole =
+          u.dgSpeaker !== undefined ? speakerRoles[u.dgSpeaker] : undefined;
+        const nextRole =
+          next.dgSpeaker !== undefined
+            ? speakerRoles[next.dgSpeaker]
+            : undefined;
+        const pauseBreak = gap >= PAUSE_MIN_SEC;
+        const speakerBreak = uRole && nextRole && uRole !== nextRole;
+        if (pauseBreak || speakerBreak) {
+          return Math.max(atSec, uEnd);
+        }
+      }
+      // Non-stop speech: give up and force-reveal at the cap.
+      return maxWait;
+    };
+
+    // Merged commentary stream: commentary + listening hints flattened
+    // into a single chronological list. We show whichever is most
+    // recent regardless of source, because the UI has already unified
+    // them under a single "Live Commentary" label.
+    type MergedEntry = {
+      atSec: number;
+      revealAtSec: number;
+      text: string;
+      questionId?: string;
+      id: string;
+    };
+    const merged: MergedEntry[] = [
+      ...timeline.commentary.map((c) => ({
+        atSec: c.atSec,
+        revealAtSec: computeRevealAt(c.atSec),
+        text: c.text,
+        questionId: c.questionId,
+        id: c.id,
+      })),
+      ...timeline.listeningHints.map((h) => ({
+        atSec: h.atSec,
+        revealAtSec: computeRevealAt(h.atSec),
+        text: h.text,
+        id: h.id,
+      })),
+    ].sort((a, b) => a.revealAtSec - b.revealAtSec);
+
+    // Current displayed entry. Pick the latest whose revealAtSec <= t
+    // (i.e. the next natural beat after the model's atSec has already
+    // passed). Then EXPIRE if the conversation has clearly moved on:
+    //   - If the next entry's reveal is within 60s, keep showing (handoff).
+    //   - Else, after 45s of playback-time age, consider it stale.
+    //   - For question-anchored entries: also expire when the current
+    //     Lead has advanced past that entry's parent question.
+    const COMMENT_MAX_AGE_SEC = 45;
+    let candidateIdx = -1;
+    for (let i = merged.length - 1; i >= 0; i--) {
+      if (merged[i].revealAtSec <= t) {
+        candidateIdx = i;
+        break;
+      }
+    }
+    const candidate = candidateIdx >= 0 ? merged[candidateIdx] : undefined;
+    let lastComment: MergedEntry | undefined = candidate;
+    if (candidate) {
+      const next = merged[candidateIdx + 1];
+      const nextGap = next
+        ? next.revealAtSec - candidate.revealAtSec
+        : Infinity;
+      const age = t - candidate.revealAtSec;
+      if (nextGap > 60 && age > COMMENT_MAX_AGE_SEC) {
+        lastComment = undefined;
+      }
+      // Only apply topic-change expiry to question-anchored entries.
+      // Free-standing listening hints (no questionId) are about the
+      // interviewer's moment, not a question answer, and don't need
+      // lead-tracking expiry.
+      if (lastComment && lead && candidate.questionId) {
+        const commentQ = timeline.questions.find(
+          (q) => q.id === candidate.questionId
+        );
+        const commentLeadId = commentQ?.parentId ?? commentQ?.id;
+        if (commentLeadId && commentLeadId !== lead.id) {
+          lastComment = undefined;
+        }
+      }
+    }
+
+    // `lastHint` kept for backwards-compat but no longer used for display —
+    // listening hints are in the merged stream now. Set to undefined.
+    const lastHint = undefined;
+
+    return { phaseSeg, lead, probe, lastComment, lastHint };
+  }, [timeline, playbackTime, utterances, speakerRoles]);
+
+  // Resolve the current main + follow-up Qs.
+  // Timeline mode: derive from timelineView (reflects playback position).
+  // Live mode: derive from the store-tracked currentQuestionId.
+  const currentMainQ = timelineView
+    ? timelineView.lead
+      ? questions.find((q) => q.id === timelineView.lead!.id)
+      : undefined
+    : (() => {
+        const currentSubQ = questions.find(
+          (q) => q.id === live.currentQuestionId
+        );
+        return currentSubQ?.parentQuestionId
+          ? questions.find((q) => q.id === currentSubQ.parentQuestionId)
+          : currentSubQ;
+      })();
+
+  const currentFollowUpQ = timelineView
+    ? timelineView.probe
+      ? questions.find((q) => q.id === timelineView.probe!.id)
+      : undefined
+    : (() => {
+        const currentSubQ = questions.find(
+          (q) => q.id === live.currentQuestionId
+        );
+        return currentSubQ && currentSubQ !== currentMainQ
+          ? currentSubQ
+          : undefined;
+      })();
+
+  // The Q that "owns" the live commentary slot — in timeline mode this
+  // is whichever Q the current commentary belongs to (falls back to the
+  // current lead/probe). In live mode, whichever sub-Q is current.
+  const commentaryOwnerQ = timelineView
+    ? timelineView.lastComment
+      ? questions.find((q) => q.id === timelineView.lastComment!.questionId)
+      : currentFollowUpQ ?? currentMainQ
+    : questions.find((q) => q.id === live.currentQuestionId);
 
   // Earlier-in-interview: every question that is NOT in the current main's
   // tree. Group by main.
@@ -77,68 +350,178 @@ export function LiveView() {
     );
   }
 
+  // Map timeline phase → MomentStateKind so existing subcomponents can
+  // render without knowing about timeline mode. When no timeline,
+  // straight-through from store moment.state.
+  const phaseToMomentState = (p?: { kind: string }): MomentStateKind => {
+    switch (p?.kind) {
+      case "chitchat":
+      case "between_questions":
+        return "chitchat";
+      case "interviewer_asking_first":
+      case "interviewer_probing":
+        return "interviewer_speaking";
+      case "candidate_answering":
+        return "question_finalized";
+      default:
+        return "idle";
+    }
+  };
+  const effectiveState = timelineView
+    ? phaseToMomentState(timelineView.phaseSeg)
+    : moment.state;
+
+  // Synthetic displayed-comment pointer in timeline mode. The text lives
+  // on commentaryOwnerQ.comments (we seeded timeline commentary into
+  // liveQuestions during preAnalyze), so the existing lookup in
+  // CommentarySection still works.
+  const effectiveDisplayed = timelineView
+    ? timelineView.lastComment
+      ? {
+          id: timelineView.lastComment.id,
+          questionId: timelineView.lastComment.questionId,
+          displayedAt: Date.now(),
+          minMs: 0,
+        }
+      : null
+    : displayedComment;
+
+  // Timeline mode folds listening hints into the merged-stream overrideText
+  // (handled below in the CommentarySection overrideText prop), so the
+  // effective live-mode hint is empty in timeline mode.
+  const effectiveListeningHint = timelineView ? "" : listeningHint;
+
+  // Live-mode role-confirmation gate. Upload mode skips this because
+  // preIdentify seeds both roles confidently before playback begins,
+  // so rolesConfirmed is always true for upload sessions. Live mic
+  // sessions sit in the "identifying" state until the user has tagged
+  // AT LEAST ONE speaker via the identity prompt — once one role is
+  // known, the orchestrator auto-assigns the other role to the next
+  // new speaker who shows up (there are only two sides in an
+  // interview), so there's no reason to keep blocking the normal UI
+  // while waiting for the second person to speak. The identity prompt
+  // still appears for any additional unrecognized speakers.
+  const rolesConfirmed =
+    isUploadMode ||
+    Object.values(speakerRoles).some(
+      (r) => r === "interviewer" || r === "candidate"
+    );
+  const hasUtterances = utterances.length > 0;
+
   return (
     <>
       <PageTitle />
 
-      {/* (1) Current Question — always present; stable once finalized. */}
-      <CurrentQuestionBar
-        state={moment.state}
-        summary={moment.summary}
-        mainQuestion={currentMainQ}
-        followUp={currentFollowUpQ}
-        labels={{
-          finalized: t("Current Question · Interviewer", "当前问题 · 面试官"),
-          waitingForFirst: t(
-            "Waiting for the interview question…",
-            "正在等待面试问题…"
-          ),
-          interviewerAsking: t(
-            "Interviewer is asking…",
-            "面试官正在提问…"
-          ),
-          followUp: t("Follow-up", "追问"),
-          interviewerAskingFollowUp: t(
-            "Interviewer is asking a follow-up…",
-            "面试官正在追问…"
-          ),
-        }}
-      />
+      {/* Uploaded-recording playback controls. Only mounts when an upload
+          session is actively driving playback. The scrubber works on the
+          same HTMLAudioElement the PlaybackSession listens to, so seeks
+          naturally flush utterances forward. Seeking backwards is a pure
+          listen-along; we don't re-emit already-processed utterances. */}
+      {playbackAudio && <LivePlayerStrip audio={playbackAudio} />}
 
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-20 max-[900px]:px-5">
 
-          {/* (2) Live Commentary — fixed-height single-comment pane. */}
-          <CommentarySection
-            state={moment.state}
-            currentQuestion={commentaryOwnerQ}
-            displayed={displayedComment}
-            answerInProgress={answerInProgress}
-            labels={{
-              heading: t("LIVE COMMENTARY", "实时评论"),
-              observing: t("AI is observing…", "AI 正在观察…"),
-              waitingFirstQ: t(
-                "No commentary yet — waiting for the first question.",
-                "暂无评论 — 等待第一个问题。"
-              ),
-              waitingAnswer: t(
-                "Waiting for candidate's answer…",
-                "等待候选人回答…"
-              ),
-              waitingNextQ: t(
-                "Waiting for the next question to finalize…",
-                "等待下一个问题定稿…"
-              ),
+          {/* ===== 16:9 LANDSCAPE VIDEO FRAME =====
+              Three stacked sections with deterministic heights summing
+              to ~517 px at 920 px width (16:9). Commentary prompts are
+              tuned to fit the 204 px pane without overflowing. Internal
+              overflow-y-auto is a defensive fallback. */}
+          <div
+            className="border border-rule rounded-md overflow-hidden bg-paper flex flex-col mb-6"
+            style={{
+              height:
+                PHASE_HEIGHT_PX +
+                COMMENTARY_TOTAL_HEIGHT_PX +
+                CAPTIONS_TOTAL_HEIGHT_PX,
             }}
-          />
+          >
+            {/* (1) Current Question — fixed-height top bar. */}
+            <CurrentQuestionBar
+              state={effectiveState}
+              summary={moment.summary}
+              mainQuestion={rolesConfirmed ? currentMainQ : undefined}
+              followUp={rolesConfirmed ? currentFollowUpQ : undefined}
+              rolesConfirmed={rolesConfirmed}
+              hasUtterances={hasUtterances}
+              // One-time-warmup constraint: the session is still in
+              // warm-up ONLY before any Lead has ever locked. After the
+              // first Lead commits, `!mainQuestion` means "between
+              // questions" (interviewer pivoting), not warm-up. The
+              // top bar reflects this distinction so it doesn't regress
+              // to "WARM-UP" labels mid-interview.
+              hasEverHadLead={
+                currentMainQ !== undefined || archivedMains.length > 0
+              }
+              timelinePhaseKind={timelineView?.phaseSeg?.kind}
+              candidateAskingText={
+                timelineView?.phaseSeg?.kind === "candidate_asking"
+                  ? deriveCandidateAskingText(
+                      utterances,
+                      speakerRoles,
+                      playbackTime
+                    )
+                  : undefined
+              }
+              labels={{
+                leadHeader: t("Lead Question", "主问题"),
+                warmupHeader: t(
+                  "Warm-up · Interviewer Introduction",
+                  "热身 · 面试官介绍"
+                ),
+                betweenQuestionsHeader: t(
+                  "Between Questions · Interviewer Transitioning",
+                  "问题间隙 · 面试官切换话题"
+                ),
+                candidateAskingHeader: t(
+                  "Candidate Q&A",
+                  "候选人提问环节"
+                ),
+                waitingForFirst: t(
+                  "Waiting for the interview to begin…",
+                  "正在等待面试开始…"
+                ),
+                awaitingIdentity: t(
+                  "Awaiting speaker identity confirmation — tag the speaker in the prompt above.",
+                  "等待确认说话人身份 — 请在上方提示中标记。"
+                ),
+                probeHeader: t("Probe Question", "追问"),
+                interviewerAskingFollowUp: t(
+                  "Interviewer is asking a probe question…",
+                  "面试官正在追问…"
+                ),
+              }}
+            />
 
-          {/* (3) Live Captions — newest at top, fixed height, no scrollbar. */}
-          {(utterances.length > 0 || interim) && (
+            {/* (2) Live Commentary — fixed pane, content tuned to fit.
+                Parent gates content props on rolesConfirmed: until the
+                user tags at least one speaker, everything renders as the
+                unified idle "AI is observing…" placeholder inside. */}
+            <CommentarySection
+              state={effectiveState}
+              currentQuestion={rolesConfirmed ? commentaryOwnerQ : undefined}
+              displayed={rolesConfirmed ? effectiveDisplayed : null}
+              listeningHint={rolesConfirmed ? effectiveListeningHint : ""}
+              warmupCommentary={rolesConfirmed ? warmupCommentary : ""}
+              overrideText={
+                // Timeline mode: the merged stream may surface a
+                // listening hint with no questionId, which the live-mode
+                // lookup path can't resolve. Pass the text directly.
+                timelineView ? timelineView.lastComment?.text ?? null : null
+              }
+              labels={{
+                heading: t("LIVE COMMENTARY", "实时评论"),
+                observing: t("AI is observing…", "AI 正在观察…"),
+              }}
+            />
+
+            {/* (3) Live Captions — two speaker lanes stacked, fixed. */}
             <LiveCaptions
               utterances={utterances}
               interim={interim}
               isRecording={live.status === "recording"}
               speakerRoles={speakerRoles}
+              maxTimeSec={isUploadMode ? playbackTime : undefined}
               labels={{
                 heading: t("LIVE CAPTIONS", "实时字幕"),
                 live: t("LIVE", "直播中"),
@@ -147,9 +530,11 @@ export function LiveView() {
                 speakerPrefix: t("Speaker", "发言者"),
               }}
             />
-          )}
+          </div>
 
-          {/* (4) Earlier in this interview — archived mains, with follow-ups. */}
+          {/* Earlier in this interview — archived mains, with follow-ups.
+              Lives OUTSIDE the 16:9 video frame — a normal scrolling
+              list below the block. */}
           {archivedMains.length > 0 && (
             <>
               <div className="mt-7 mb-3 text-[11px] text-ink-lighter font-semibold tracking-wide uppercase">
@@ -166,7 +551,7 @@ export function LiveView() {
                     num={archivedMains.length - idx}
                     defaultOpen={idx === 0}
                     labels={{
-                      followUp: t("Follow-up", "追问"),
+                      followUp: t("Probe Question", "追问"),
                       noCommentary: t("No commentary.", "暂无评论。"),
                     }}
                   />
@@ -180,122 +565,289 @@ export function LiveView() {
 }
 
 function PageTitle() {
+  // liveTitle is populated after /api/session-title returns — it derives a
+  // role-and-company heading from the JD. Until then we show the generic
+  // fallback, so the heading never blanks out.
+  const liveTitle = useStore((s) => s.liveTitle);
   return (
     <div className="mx-auto w-full max-w-[920px] px-24 pt-10 pb-5 max-[900px]:px-5 max-[900px]:pt-6 max-[900px]:pb-3 shrink-0">
       <div className="text-4xl font-bold tracking-tight leading-tight text-ink max-[900px]:text-[28px]">
-        Live Interview Session
+        {liveTitle || "Live Interview Session"}
       </div>
     </div>
   );
 }
 
+/** For the "Candidate Q&A" phase, derive the question the candidate is
+ *  currently asking the interviewer. We use the candidate's most recent
+ *  run of utterances whose end time ≤ playbackTime (or simply their last
+ *  run in live mode) and trim it to the last question-shaped sentence.
+ *  No AI call — just a read of the transcript.
+ */
+function deriveCandidateAskingText(
+  utterances: Utterance[],
+  speakerRoles: Record<number, "interviewer" | "candidate">,
+  currentTime: number
+): string {
+  // Candidate's dg-speaker number.
+  let candidateDg: number | undefined;
+  for (const [k, v] of Object.entries(speakerRoles)) {
+    if (v === "candidate") {
+      candidateDg = Number(k);
+      break;
+    }
+  }
+  if (candidateDg === undefined) return "";
+
+  // Visible utterances up to currentTime (ignore clamp when no timeline).
+  const visible = utterances.filter(
+    (u) =>
+      u.atSeconds <= currentTime &&
+      (u.atSeconds + (u.duration ?? 0)) <= currentTime + 0.5
+  );
+  if (visible.length === 0) return "";
+
+  // Walk back to the candidate's most recent contiguous run.
+  let endIdx = -1;
+  for (let i = visible.length - 1; i >= 0; i--) {
+    if (visible[i].dgSpeaker === candidateDg) {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx === -1) return "";
+  let startIdx = endIdx;
+  while (
+    startIdx > 0 &&
+    visible[startIdx - 1].dgSpeaker === candidateDg
+  ) {
+    startIdx--;
+  }
+  const runText = visible
+    .slice(startIdx, endIdx + 1)
+    .map((u) => u.text)
+    .join(" ")
+    .trim();
+  if (!runText) return "";
+
+  // Keep only the final sentence (that's the question). Split on `? `,
+  // `. `, `! ` and take the last non-empty chunk. If a `?` exists, prefer
+  // the substring that ends in the last `?`.
+  const lastQMark = Math.max(
+    runText.lastIndexOf("?"),
+    runText.lastIndexOf("？")
+  );
+  if (lastQMark > 0) {
+    // Find the start of this question — scan back to a terminator.
+    let qStart = 0;
+    for (let i = lastQMark - 1; i >= 0; i--) {
+      const ch = runText[i];
+      if (ch === "." || ch === "?" || ch === "!" || ch === "。" || ch === "？" || ch === "！") {
+        qStart = i + 1;
+        break;
+      }
+    }
+    return runText.slice(qStart, lastQMark + 1).trim();
+  }
+  // No question mark yet — just show the last ~180 chars so the user sees
+  // the current thrust.
+  return runText.length > 180 ? "…" + runText.slice(-180) : runText;
+}
+
 /**
- * Top bar — always present, layered display:
+ * Top bar. Shows which of FOUR phases the interview is currently in:
  *
- *   No main Q yet:
- *     - state=interviewer_speaking → "Interviewer is asking…" + summary
- *     - else → "Waiting for the interview question…"
+ *   1. Warm-up / Interviewer Introduction — no Lead has EVER locked yet.
+ *      Row 1: "WARM-UP · INTERVIEWER INTRODUCTION"
+ *      Row 2: interim summary (what the interviewer is building toward)
+ *   2. Between Questions — at least one Lead has locked, current one
+ *      has been archived, new one hasn't locked yet. Interviewer is
+ *      transitioning between topics.
+ *      Row 1: "BETWEEN QUESTIONS · INTERVIEWER TRANSITIONING"
+ *      Row 2: interim summary
+ *   3. Question (面试中) — a Lead is currently active.
+ *      Row 1: "LEAD QUESTION" + question text
+ *      Row 2: "PROBE QUESTION" + probe text (only if a probe is active)
+ *   4. Candidate Q&A (候选人提问环节) — reverse Q&A tail, end of interview.
+ *      Row 1: "CANDIDATE Q&A"
+ *      Row 2: candidate's current question
  *
- *   Main Q locked in:
- *     - Big main Q text on top
- *     - If follow-up Q exists → indented "Follow-up: <text>" below
- *     - Else if state=interviewer_speaking → indented
- *       "Interviewer is asking a follow-up…" + summary below
- *     - Else nothing extra (just the main Q)
+ * Warm-up vs Between-Questions distinction enforces a one-time warm-up:
+ * once the first Lead has locked, we never regress to "WARM-UP" even if
+ * the current Lead is briefly archived during a topic pivot.
+ *
+ * Live mode (no timeline) infers the phase from momentState + Lead
+ * history. Upload mode uses the timeline's phase.kind directly (so
+ * "candidate_asking" only fires when the model has extracted the
+ * reverse-Q&A phase, typically at the end of the recording).
  */
 function CurrentQuestionBar({
   state,
   summary,
   mainQuestion,
   followUp,
+  rolesConfirmed,
+  hasUtterances,
+  hasEverHadLead,
+  timelinePhaseKind,
+  candidateAskingText,
   labels,
 }: {
   state: MomentStateKind;
   summary: string;
   mainQuestion: Question | undefined;
   followUp: Question | undefined;
+  rolesConfirmed: boolean;
+  hasUtterances: boolean;
+  /** True once ANY Lead has been locked in this session (including
+   *  Leads that have since been archived). Controls warm-up vs
+   *  between-questions labeling when mainQuestion is undefined. */
+  hasEverHadLead: boolean;
+  /** Upload-mode only: the kind of the phase segment at the current
+   *  playback time. When this is "candidate_asking" we render the
+   *  Candidate Q&A layout regardless of mainQuestion state. */
+  timelinePhaseKind?: string;
+  /** Upload-mode only: text to show in Row 2 of Candidate Q&A phase. */
+  candidateAskingText?: string;
   labels: {
-    finalized: string;
+    leadHeader: string;
+    warmupHeader: string;
+    betweenQuestionsHeader: string;
+    candidateAskingHeader: string;
     waitingForFirst: string;
-    interviewerAsking: string;
-    followUp: string;
+    awaitingIdentity: string;
+    probeHeader: string;
     interviewerAskingFollowUp: string;
   };
 }) {
-  // Pre-anchored: no main Q yet.
-  if (!mainQuestion) {
-    if (state === "interviewer_speaking") {
-      return (
-        <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
-          <div className="border-y border-rule py-3.5">
-            <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-              <BouncingDots />
-              {labels.interviewerAsking}
-            </div>
-            <div className="font-serif text-[17px] leading-snug text-ink-light italic">
-              {summary || ""}
-            </div>
-          </div>
-        </div>
-      );
-    }
+  // Pre-confirmation: roles not identified yet → neutral placeholder.
+  if (!rolesConfirmed && hasUtterances) {
     return (
-      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
-        <div className="border-y border-rule py-3.5">
-          <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-            <BouncingDots />
-            {labels.waitingForFirst}
-          </div>
-          {summary && (
-            <div className="text-[13.5px] leading-snug text-ink-light italic">
-              {summary}
-            </div>
-          )}
+      <BarShell>
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider animate-pulse-dot">
+          {labels.awaitingIdentity}
         </div>
-      </div>
+      </BarShell>
     );
   }
 
-  // Main Q is locked in.
-  const showAskingFollowUp =
-    !followUp && state === "interviewer_speaking";
-
-  return (
-    <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0">
-      <div className="border-y border-rule py-3.5">
-        <div className="text-[11px] font-semibold text-accent uppercase tracking-wider mb-1.5 inline-flex items-center gap-1.5">
-          <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
-          {labels.finalized}
+  // Pre-start (no utterances yet): silent shell so the bar still has
+  // vertical space but doesn't show a stale phase label.
+  if (!hasUtterances && !mainQuestion && !summary) {
+    return (
+      <BarShell>
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider">
+          {labels.waitingForFirst}
         </div>
-        <div className="font-serif text-[19px] leading-snug text-ink font-medium">
+      </BarShell>
+    );
+  }
+
+  // Candidate Q&A phase — only renders in upload mode (timeline-driven)
+  // when the model has classified the current segment as candidate_asking.
+  if (timelinePhaseKind === "candidate_asking") {
+    return (
+      <BarShell>
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
+          {labels.candidateAskingHeader}
+        </div>
+        <div className="font-serif text-[17px] leading-snug text-ink font-medium line-clamp-2">
+          {candidateAskingText && candidateAskingText.trim().length > 0
+            ? candidateAskingText
+            : "…"}
+        </div>
+      </BarShell>
+    );
+  }
+
+  const showAskingFollowUp =
+    !followUp && state === "interviewer_speaking" && !!mainQuestion;
+
+  // Question phase (Lead locked). Typography is constrained so the bar
+  // stays at exactly 90 px:
+  //   - Lead alone: up to 2 lines at 17 px serif.
+  //   - Lead + Probe: lead clamps to 1 line, probe clamps to 1 line.
+  //   - Lead + "interviewer asking probe" status: lead clamps to 1 line.
+  const leadIsTight = !!followUp || showAskingFollowUp;
+  if (mainQuestion) {
+    return (
+      <BarShell>
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
+          {labels.leadHeader}
+        </div>
+        <div
+          className={`font-serif text-[17px] leading-snug text-ink font-medium ${
+            leadIsTight ? "line-clamp-1" : "line-clamp-2"
+          }`}
+        >
           {mainQuestion.text}
         </div>
 
         {followUp && (
-          <div className="mt-2 pl-5 border-l-2 border-rule">
-            <div className="text-[10.5px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
-              {labels.followUp}
+          <div className="mt-1 pl-3 border-l-2 border-rule">
+            <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider">
+              {labels.probeHeader}
             </div>
-            <div className="font-serif text-[15.5px] leading-snug text-ink-light">
+            <div className="font-serif text-[13.5px] leading-snug text-ink-light line-clamp-1">
               {followUp.text}
             </div>
           </div>
         )}
 
         {showAskingFollowUp && (
-          <div className="mt-2 pl-5 border-l-2 border-rule">
-            <div className="text-[10.5px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5 inline-flex items-center gap-1.5">
+          <div className="mt-1 pl-3 border-l-2 border-rule">
+            <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider inline-flex items-center gap-1.5">
               <BouncingDots />
               {labels.interviewerAskingFollowUp}
             </div>
             {summary && (
-              <div className="text-[13.5px] leading-snug text-ink-light italic">
+              <div className="text-[12.5px] leading-snug text-ink-light italic line-clamp-1">
                 {summary}
               </div>
             )}
           </div>
         )}
+      </BarShell>
+    );
+  }
+
+  // No Lead currently locked. Two sub-cases:
+  //   - hasEverHadLead === false → still in initial warm-up
+  //   - hasEverHadLead === true  → between Qs (interviewer transitioning)
+  // Visually the same layout, just different header copy.
+  const headerText = hasEverHadLead
+    ? labels.betweenQuestionsHeader
+    : labels.warmupHeader;
+  return (
+    <BarShell>
+      <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
+        {headerText}
       </div>
+      {summary ? (
+        <div className="font-serif text-[15px] leading-snug text-ink-light italic line-clamp-2">
+          {summary}
+        </div>
+      ) : (
+        <div className="text-[13px] text-ink-lighter italic">—</div>
+      )}
+    </BarShell>
+  );
+}
+
+/** Thin wrapper for the Interview Phase section: a fixed-height strip
+ *  inside the 16:9 frame. The outer 16:9 container already provides the
+ *  border around the block, so this section just contributes a bottom
+ *  divider line between itself and the Commentary pane. Content is
+ *  vertically centered and overflow-hidden — prompts are tuned to fit;
+ *  defensive clipping keeps the frame rigid if a probe question comes in
+ *  unusually long. */
+function BarShell({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      className="border-b border-rule px-5 flex flex-col justify-center overflow-hidden shrink-0"
+      style={{ height: PHASE_HEIGHT_PX }}
+    >
+      {children}
     </div>
   );
 }
@@ -327,19 +879,38 @@ function CommentarySection({
   state,
   currentQuestion,
   displayed,
-  answerInProgress,
+  listeningHint,
+  warmupCommentary,
+  overrideText,
   labels,
 }: {
   state: MomentStateKind;
   currentQuestion: Question | undefined;
-  displayed: { id: string; questionId: string; displayedAt: number; minMs: number } | null;
-  answerInProgress: boolean;
+  /** questionId may be undefined for timeline-synthesized entries that
+   *  correspond to free-standing listening hints (no anchoring question).
+   *  In that case the comment text flows through the `overrideText` prop
+   *  and the displayed.id → currentQuestion.comments lookup is skipped.
+   *  Parent nullifies this when roles aren't confirmed yet — so nothing
+   *  here has to re-check that gate. */
+  displayed: { id: string; questionId?: string; displayedAt: number; minMs: number } | null;
+  listeningHint: string;
+  /** Warm-up coaching commentary streamed in while candidate is speaking
+   *  before any Lead Question is locked. Takes the commentary pane when
+   *  a Q-A commentary isn't active AND no listening hint is streaming. */
+  warmupCommentary: string;
+  /** Timeline-mode override: when set, render this text directly and
+   *  skip the `displayed.id` → `currentQuestion.comments` lookup. Needed
+   *  because timeline entries from the merged commentary+hints stream
+   *  may not correspond to any question (free-standing listening hints
+   *  have no questionId, so the lookup path fails). Live mode doesn't
+   *  pass this. */
+  overrideText?: string | null;
   labels: {
     heading: string;
+    /** Single unified idle placeholder, e.g. "AI is observing…". Used in
+     *  every empty state — role-identification, warm-up, between-Qs,
+     *  waiting-for-answer, candidate-mid-answer. */
     observing: string;
-    waitingFirstQ: string;
-    waitingAnswer: string;
-    waitingNextQ: string;
   };
 }) {
   // Re-render when the displayed comment's min-window expires so the
@@ -353,50 +924,136 @@ function CommentarySection({
     return () => clearTimeout(id);
   }, [displayed]);
 
+  // Listening-hint staleness: track when the hint text last changed. If
+  // ≥ LISTENING_HINT_STALE_MS passes with no updates, the interviewer's
+  // thought has ended (they paused / handed off) — we suppress the hint
+  // and fall through to the "AI is observing…" empty state. The
+  // orchestrator streams tokens into `listeningHint` live, so while the
+  // interviewer is actively monologuing the timestamp keeps refreshing
+  // and the hint stays on screen. This also handles the case where the
+  // interviewer completes a thought without an explicit phase change —
+  // e.g. trails off before the classifier fires.
+  const LISTENING_HINT_STALE_MS = 6000;
+  const [hintChangedAt, setHintChangedAt] = useState<number>(0);
+  const lastHintRef = useRef<string>("");
+  useEffect(() => {
+    if (listeningHint !== lastHintRef.current) {
+      lastHintRef.current = listeningHint;
+      setHintChangedAt(Date.now());
+    }
+  }, [listeningHint]);
+  // Schedule a re-render exactly when the staleness threshold elapses,
+  // so the hint visibly clears even if no other state changes nudge us.
+  useEffect(() => {
+    if (!listeningHint || listeningHint.trim().length === 0) return;
+    if (hintChangedAt === 0) return;
+    const age = Date.now() - hintChangedAt;
+    const remaining = LISTENING_HINT_STALE_MS - age;
+    if (remaining <= 0) return;
+    const id = setTimeout(() => setTick((n) => n + 1), remaining + 50);
+    return () => clearTimeout(id);
+  }, [listeningHint, hintChangedAt]);
+  const listeningHintFresh =
+    listeningHint.trim().length > 0 &&
+    hintChangedAt > 0 &&
+    Date.now() - hintChangedAt < LISTENING_HINT_STALE_MS;
+
   // Resolve which comment text to show.
+  //   - Timeline mode: use overrideText directly (fast path).
+  //   - Live mode: look up displayed.id in currentQuestion.comments.
   const displayedComment = useMemo(() => {
+    if (typeof overrideText === "string" && overrideText.trim().length > 0) {
+      return { id: "timeline", text: overrideText };
+    }
     if (!displayed) return null;
     if (!currentQuestion || displayed.questionId !== currentQuestion.id) return null;
     return currentQuestion.comments.find((c) => c.id === displayed.id) ?? null;
-  }, [displayed, currentQuestion]);
+  }, [overrideText, displayed, currentQuestion]);
 
-  // Is the displayed comment still within its min-display window? If so we
-  // keep showing it even if the orchestrator's "current displayed" pointer
-  // has been cleared (defensive — normally those move in lockstep).
-  const isShowing = !!displayedComment;
+  // Is the Q-A commentary still inside its minimum-display window?
+  // While inside, it's "being read" — absolutely nothing can replace it.
+  // Once the window expires AND the interviewer starts monologuing with
+  // a fresh listening hint ready, we let the hint take the pane.
+  // Outside interviewer_speaking (or without a fresh hint) the Q-A stays
+  // visible indefinitely until a new Q-A or a new question arrives.
+  const qaStillFresh =
+    !!displayedComment &&
+    displayed !== null &&
+    Date.now() - displayed.displayedAt < displayed.minMs;
+  const shouldYieldToHint =
+    !qaStillFresh &&
+    listeningHintFresh &&
+    state === "interviewer_speaking";
+  const isShowing = !!displayedComment && !shouldYieldToHint;
 
-  // Empty-state branch
-  let empty: { kind: "none" | "first" | "answer" | "next"; text: string } | null = null;
-  if (!isShowing) {
-    if (!currentQuestion) {
-      if (state === "interviewer_speaking") {
-        empty = { kind: "next", text: labels.waitingNextQ };
-      } else {
-        empty = { kind: "first", text: labels.waitingFirstQ };
-      }
-    } else if (answerInProgress) {
-      empty = { kind: "none", text: "" }; // dots — no text
-    } else {
-      empty = { kind: "answer", text: labels.waitingAnswer };
-    }
-  }
+  // Listening-hint takes the commentary slot whenever the interviewer is
+  // monologuing and we've streamed at least a bit of hint text. Gives
+  // the candidate in-the-moment coaching about what to extract from the
+  // setup, instead of a useless "waiting for next question" placeholder.
+  // Gated on freshness so a stale hint (interviewer went silent ≥ 6s ago)
+  // doesn't linger — once stale, we fall through to the observing state.
+  const showListeningHint =
+    !isShowing &&
+    listeningHintFresh &&
+    state === "interviewer_speaking";
 
+  // Warm-up commentary takes the pane when candidate is speaking in
+  // warm-up phase (no Lead Q locked, no Q-A commentary active, no
+  // listening hint streaming). This is coaching on the self-intro.
+  const showWarmupCommentary =
+    !isShowing &&
+    !showListeningHint &&
+    warmupCommentary.trim().length > 0 &&
+    !currentQuestion;
+
+  // Any moment the pane has nothing concrete to show (no Q-A commentary,
+  // no listening hint, no warm-up commentary) we unify on a single
+  // "AI is observing…" placeholder with animated dots. Previously we
+  // split into five different messages (identifying / waiting-first /
+  // waiting-answer / between-Qs / observing) — too noisy, each transition
+  // felt like the AI changed its mind. The dots + single short line
+  // keeps the pane visually alive and semantically consistent across
+  // every idle state.
+  const isIdle = !isShowing && !showListeningHint && !showWarmupCommentary;
+
+  // Middle pane of the 16:9 frame. Total height is fixed; heading row +
+  // pane together fit exactly COMMENTARY_TOTAL_HEIGHT_PX. The pane itself
+  // has overflow-y-auto as a defensive fallback — prompts are tuned to
+  // keep content within these bounds (3–4 sentences / ~60 words / ~120
+  // Chinese chars) so scrolling is rare.
   return (
-    <div className="mb-6">
-      <div className="text-[11px] text-ink-lighter tracking-wide font-medium mb-2">
+    <div
+      className="flex flex-col border-b border-rule shrink-0"
+      style={{ height: COMMENTARY_TOTAL_HEIGHT_PX }}
+    >
+      <div
+        className="flex items-center px-5 text-[11px] text-ink-lighter tracking-wide font-medium shrink-0"
+        style={{ height: COMMENTARY_HEADING_HEIGHT_PX }}
+      >
         {labels.heading}
       </div>
 
-      <div
-        className="border border-rule rounded-md bg-paper overflow-hidden flex"
-        style={{ height: COMMENTARY_HEIGHT_PX }}
-      >
-        {isShowing && displayedComment ? (
+      <div className="flex-1 min-h-0 mx-5 mb-3 border border-rule bg-paper-subtle rounded-md overflow-hidden flex">
+        {showListeningHint ? (
           <div
-            className="px-4 py-3 m-auto w-full text-[15px] leading-relaxed text-ink prose-live animate-appear"
+            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
+            dangerouslySetInnerHTML={{ __html: listeningHint }}
+          />
+        ) : showWarmupCommentary ? (
+          <div
+            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
+            dangerouslySetInnerHTML={{ __html: warmupCommentary }}
+          />
+        ) : isShowing && displayedComment ? (
+          <div
+            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
             dangerouslySetInnerHTML={{ __html: displayedComment.text || "…" }}
           />
-        ) : empty?.kind === "none" ? (
+        ) : isIdle ? (
+          // Unified idle state: dots + "AI is observing…" across all
+          // sub-cases (role-identification, warm-up, between-Qs,
+          // waiting-for-answer, candidate-mid-answer). Same visual for
+          // all so transitions feel smooth.
           <div className="m-auto inline-flex items-center gap-2 text-ink-lighter italic text-sm">
             <span className="inline-flex gap-[3px]">
               <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot" />
@@ -405,36 +1062,47 @@ function CommentarySection({
             </span>
             {labels.observing}
           </div>
-        ) : (
-          <div className="m-auto px-6 text-sm text-ink-lighter italic text-center">
-            {empty?.text}
-          </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
 }
 
 /**
- * Tencent-Meeting / Teams style live caption pane.
+ * Per-speaker-lane live caption pane.
  *
- *   - Newest at TOP. New utterances push older content downward; overflow
- *     trims from the bottom (oldest clipped off).
- *   - Window: utterances whose summed `duration` (Deepgram per-segment
- *     speaking time) sums to ≥ CAPTIONS_WINDOW_S, walking back from the
- *     latest. Silence doesn't consume budget.
+ * Rationale: a rolling-window, newest-at-top caption list shuffles every
+ * time a new utterance lands or an old one ages out — hard to read. This
+ * version gives each speaker a fixed lane that only changes when THAT
+ * speaker produces new text, so the reader's eye can settle on a single
+ * vertical position per speaker.
+ *
+ *   - Two fixed lanes, stacked: lane A on top, lane B on bottom.
+ *   - Lane A binds to the Interviewer's Deepgram speaker id once identified;
+ *     lane B binds to the Candidate's. Before identification, lane A =
+ *     first-seen speaker, lane B = second-seen speaker.
+ *   - Each lane shows the latest continuous run of utterances by its
+ *     speaker (i.e. the most recent uninterrupted "turn"). When the OTHER
+ *     speaker takes the floor, this lane's text freezes until this speaker
+ *     speaks again.
+ *   - Interim text appends to whichever lane the current speaker owns.
  */
 function LiveCaptions({
   utterances,
   interim,
   isRecording,
   speakerRoles,
+  maxTimeSec,
   labels,
 }: {
   utterances: Utterance[];
   interim: string;
   isRecording: boolean;
   speakerRoles: Record<number, "interviewer" | "candidate">;
+  /** When set (upload + timeline mode), treat only utterances whose
+   *  `atSeconds + duration` (i.e. end time) ≤ maxTimeSec as visible.
+   *  Scrubbing backwards hides later utterances; forward reveals them. */
+  maxTimeSec?: number;
   labels: {
     heading: string;
     live: string;
@@ -443,65 +1111,219 @@ function LiveCaptions({
     speakerPrefix: string;
   };
 }) {
-  const speakerIndex = useMemo(() => {
-    const map = new Map<number, number>();
-    let next = 1;
-    for (const u of utterances) {
-      if (u.dgSpeaker === undefined) continue;
-      if (!map.has(u.dgSpeaker)) map.set(u.dgSpeaker, next++);
-    }
-    return map;
-  }, [utterances]);
-
+  // In timeline mode, filter utterances to those that have "already
+  // happened" at maxTimeSec. Utterance.atSeconds is the start; duration
+  // is how long the segment was — end = atSeconds + duration.
   const visibleUtterances = useMemo(() => {
-    let sum = 0;
-    const out: Utterance[] = [];
-    for (let i = utterances.length - 1; i >= 0; i--) {
-      const u = utterances[i];
-      out.unshift(u);
-      sum += u.duration ?? DEFAULT_UTTERANCE_S;
-      if (sum >= CAPTIONS_WINDOW_S) break;
-    }
-    return out;
-  }, [utterances]);
+    if (maxTimeSec === undefined) return utterances;
+    return utterances.filter(
+      (u) => u.atSeconds + (u.duration ?? 0) <= maxTimeSec
+    );
+  }, [utterances, maxTimeSec]);
 
-  // Group consecutive same-speaker utterances; reverse so newest is first.
-  const paragraphs = useMemo(() => {
-    const out: Array<{ key: string; dgSpeaker: number | undefined; text: string }> = [];
+  const { laneA, laneB, laneBReservedRole, laneAReservedRole } = useMemo(() => {
+    let interviewerDg: number | undefined;
+    let candidateDg: number | undefined;
+    for (const [k, v] of Object.entries(speakerRoles)) {
+      const n = Number(k);
+      if (!Number.isFinite(n)) continue;
+      if (v === "interviewer") interviewerDg = n;
+      else if (v === "candidate") candidateDg = n;
+    }
+    const firstAppearance: number[] = [];
+    const seen = new Set<number>();
     for (const u of visibleUtterances) {
-      const last = out[out.length - 1];
-      if (last && last.dgSpeaker === u.dgSpeaker) {
-        last.text += " " + u.text;
-      } else {
-        out.push({ key: u.id, dgSpeaker: u.dgSpeaker, text: u.text });
+      if (u.dgSpeaker === undefined || seen.has(u.dgSpeaker)) continue;
+      seen.add(u.dgSpeaker);
+      firstAppearance.push(u.dgSpeaker);
+    }
+    const laneA = interviewerDg ?? firstAppearance[0];
+    let laneB =
+      candidateDg ?? firstAppearance.find((s) => s !== laneA);
+    // Dedupe: when only ONE speaker exists in the recording and only the
+    // candidate role has been identified, interviewerDg is undefined →
+    // laneA falls through to the first (and only) speaker number; then
+    // candidateDg refers to that SAME number → laneB collapses to laneA
+    // and the UI renders both lanes with identical text. Force laneB
+    // empty in that case so the single-speaker recording shows one lane.
+    if (laneA !== undefined && laneA === laneB) laneB = undefined;
+
+    // Pre-label empty lanes once the user has tagged one role. If the
+    // user marked dg:0 as "interviewer", we logically know the OTHER
+    // speaker will be the candidate — but Deepgram hasn't emitted a
+    // dg:1 utterance yet, so laneB has no dgSpeaker attached. Reserve
+    // the role visually so the user sees "Candidate · waiting to speak"
+    // in the second lane instead of a generic "Speaker 2" placeholder.
+    const laneAReservedRole: "interviewer" | "candidate" | undefined =
+      laneA === undefined
+        ? interviewerDg === undefined && candidateDg !== undefined
+          ? "interviewer"
+          : interviewerDg !== undefined
+          ? "interviewer"
+          : undefined
+        : undefined;
+    const laneBReservedRole: "interviewer" | "candidate" | undefined =
+      laneB === undefined
+        ? candidateDg === undefined && interviewerDg !== undefined
+          ? "candidate"
+          : candidateDg !== undefined
+          ? "candidate"
+          : undefined
+        : undefined;
+
+    return { laneA, laneB, laneAReservedRole, laneBReservedRole };
+  }, [visibleUtterances, speakerRoles]);
+
+  const lastDgSpeaker =
+    visibleUtterances.length > 0
+      ? visibleUtterances[visibleUtterances.length - 1].dgSpeaker
+      : undefined;
+
+  /**
+   * Per-dgSpeaker cache of each speaker's most recent continuous run of
+   * utterances. In LIVE mode (maxTimeSec undefined) this is a real cache
+   * protecting against the rolling-window trim. In TIMELINE mode each
+   * render re-derives from visibleUtterances directly, since scrubbing
+   * changes the set and stale cache entries would show ghost text.
+   */
+  const [textCache, setTextCache] = useState<Record<number, string>>({});
+
+  const latestRunTextFrom = (arr: Utterance[], dg: number): string => {
+    let end = -1;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i].dgSpeaker === dg) {
+        end = i;
+        break;
       }
     }
-    return out.reverse();
-  }, [visibleUtterances]);
-
-  const resolveLabel = (dg: number | undefined): { name: string; role: Speaker } => {
-    if (dg === undefined) return { name: labels.speakerPrefix, role: "unknown" };
-    const role = speakerRoles[dg];
-    if (role === "interviewer") return { name: labels.interviewer, role: "interviewer" };
-    if (role === "candidate") return { name: labels.candidate, role: "candidate" };
-    const idx = speakerIndex.get(dg) ?? dg + 1;
-    return { name: `${labels.speakerPrefix} ${idx}`, role: "unknown" };
+    if (end === -1) return "";
+    let start = end;
+    while (start > 0 && arr[start - 1].dgSpeaker === dg) start--;
+    return arr
+      .slice(start, end + 1)
+      .map((u) => u.text)
+      .join(" ");
   };
 
-  const colorFor = (role: Speaker) =>
-    role === "interviewer"
-      ? "text-accent"
-      : role === "candidate"
-      ? "text-ink"
-      : "text-ink-lighter";
+  useEffect(() => {
+    if (maxTimeSec !== undefined) return; // timeline mode skips the cache
+    if (visibleUtterances.length === 0) return;
 
-  // Interim text appends to the NEWEST paragraph (which is now index 0 since
-  // we reversed).
-  const newestIndex = 0;
+    setTextCache((prev) => {
+      let next = prev;
+      const clone = () => {
+        if (next === prev) next = { ...prev };
+      };
 
+      // Always refresh the speaker currently holding the floor — their
+      // run is actively growing.
+      if (lastDgSpeaker !== undefined) {
+        const fresh = latestRunTextFrom(visibleUtterances, lastDgSpeaker);
+        if (prev[lastDgSpeaker] !== fresh) {
+          clone();
+          next[lastDgSpeaker] = fresh;
+        }
+      }
+
+      // Seed any speaker we've seen but don't yet have text for. Does
+      // nothing on normal turns since the current speaker is handled
+      // above; matters only on first appearance or after rehydration.
+      const seen = new Set<number>();
+      for (const u of visibleUtterances) {
+        if (u.dgSpeaker !== undefined) seen.add(u.dgSpeaker);
+      }
+      for (const dg of seen) {
+        if (next[dg] !== undefined) continue;
+        const t = latestRunTextFrom(visibleUtterances, dg);
+        if (t) {
+          clone();
+          next[dg] = t;
+        }
+      }
+
+      return next;
+    });
+  }, [visibleUtterances, lastDgSpeaker, maxTimeSec]);
+
+  // Text per lane. Timeline mode: derive directly from visibleUtterances
+  // so scrubbing updates the captions immediately. Live mode: read from
+  // the cache so a quiet speaker's text survives the rolling-window trim.
+  const textA =
+    laneA === undefined
+      ? ""
+      : maxTimeSec !== undefined
+      ? latestRunTextFrom(visibleUtterances, laneA)
+      : textCache[laneA] ?? "";
+  const textB =
+    laneB === undefined
+      ? ""
+      : maxTimeSec !== undefined
+      ? latestRunTextFrom(visibleUtterances, laneB)
+      : textCache[laneB] ?? "";
+
+  const laneName = (
+    dg: number | undefined,
+    reservedRole: "interviewer" | "candidate" | undefined,
+    fallback: string
+  ): string => {
+    if (dg === undefined) {
+      // Lane has no dg attached yet. If we've reserved a role for it
+      // (user tagged the other side), show that role name — otherwise
+      // fall back to the generic "Speaker N" placeholder.
+      if (reservedRole === "interviewer") return labels.interviewer;
+      if (reservedRole === "candidate") return labels.candidate;
+      return fallback;
+    }
+    const role = speakerRoles[dg];
+    if (role === "interviewer") return labels.interviewer;
+    if (role === "candidate") return labels.candidate;
+    return fallback;
+  };
+
+  const metaA = {
+    name: laneName(laneA, laneAReservedRole, `${labels.speakerPrefix} 1`),
+    // "reserved" = we know the role but no voice heard yet → render a
+    // muted "waiting" state instead of a blank body.
+    reserved: laneA === undefined && laneAReservedRole !== undefined,
+  };
+  const metaB = {
+    name: laneName(laneB, laneBReservedRole, `${labels.speakerPrefix} 2`),
+    reserved: laneB === undefined && laneBReservedRole !== undefined,
+  };
+
+  const aSpeaking = laneA !== undefined && lastDgSpeaker === laneA;
+  const bSpeaking = laneB !== undefined && lastDgSpeaker === laneB;
+
+  // Startup-delay fix: Deepgram sends interim transcripts ~1s after the
+  // first speech, but diarization only lands a speaker label on the
+  // FINAL result (a few seconds later). Without a speaker label, neither
+  // lane "owns" the interim text and the captions look dead for the
+  // first few seconds. Convention is that the interviewer starts the
+  // session, so when we have interim text but no finalized utterances
+  // yet, show it in lane A (the interviewer lane by convention).
+  const firstInterimOrphaned =
+    interim.trim().length > 0 &&
+    visibleUtterances.length === 0 &&
+    !aSpeaking &&
+    !bSpeaking;
+  const interimForA = aSpeaking || firstInterimOrphaned ? interim : "";
+  const interimForB = bSpeaking ? interim : "";
+
+  // Bottom section of the 16:9 frame. Total height is fixed; the parent
+  // provides the outer border so we only contribute an inner divider
+  // between the heading and lanes. Always renders two lanes (the second
+  // is blank / placeholder when only one speaker exists) so the total
+  // height stays constant regardless of speaker count — important for
+  // the video aspect ratio.
   return (
-    <div className="border border-rule rounded-md bg-paper-subtle overflow-hidden">
-      <div className="px-4 pt-2.5 pb-1.5 border-b border-rule flex items-center gap-2">
+    <div
+      className="bg-paper-subtle flex flex-col shrink-0"
+      style={{ height: CAPTIONS_TOTAL_HEIGHT_PX }}
+    >
+      <div
+        className="px-4 border-b border-rule flex items-center gap-2 shrink-0"
+        style={{ height: CAPTIONS_HEADING_HEIGHT_PX }}
+      >
         <span className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider">
           {labels.heading}
         </span>
@@ -512,31 +1334,241 @@ function LiveCaptions({
           </span>
         )}
       </div>
+      <CaptionLane
+        meta={metaA}
+        text={textA}
+        isSpeakingNow={aSpeaking || firstInterimOrphaned}
+        interim={interimForA}
+      />
+      <div className="h-px bg-rule" />
+      <CaptionLane
+        meta={metaB}
+        text={textB}
+        isSpeakingNow={bSpeaking}
+        interim={interimForB}
+      />
+    </div>
+  );
+}
+
+/**
+ * A single caption lane. Strictly fixed height (CAPTIONS_LANE_HEIGHT_PX)
+ * with the text area auto-scrolling to the bottom whenever its contents
+ * grow — so when a speaker has a long turn, the reader sees the latest
+ * words instead of a stale top slice. Scrollbar is hidden to keep the
+ * lane looking like a caption strip rather than a list.
+ *
+ * Speaking indicator: the speaker label itself pulses accent-blue while
+ * this lane's speaker has the floor, and is plain black otherwise. No
+ * separate "LIVE" badge — the label IS the indicator.
+ */
+/**
+ * Playback control strip shown at the top of the live view while an
+ * uploaded recording is playing. Binds to the same HTMLAudioElement the
+ * PlaybackSession is driving, so play/pause and seek here propagate to
+ * the session (which listens to the element's own timeupdate events and
+ * flushes utterances forward as needed).
+ */
+function LivePlayerStrip({ audio }: { audio: HTMLAudioElement }) {
+  const [time, setTime] = useState(audio.currentTime);
+  const [duration, setDuration] = useState(
+    isFinite(audio.duration) ? audio.duration : 0
+  );
+  const [paused, setPaused] = useState(audio.paused);
+  const [collapsed, setCollapsed] = useState(false);
+  const setLivePlaybackTime = useStore((s) => s.setLivePlaybackTime);
+
+  useEffect(() => {
+    const onTime = () => {
+      setTime(audio.currentTime);
+      // Mirror into the store so timeline-driven UI (phases, current
+      // question, commentary, listening hints, captions) can re-derive.
+      setLivePlaybackTime(audio.currentTime);
+    };
+    const onMeta = () =>
+      setDuration(isFinite(audio.duration) ? audio.duration : 0);
+    const onPlay = () => setPaused(false);
+    const onPause = () => setPaused(true);
+    audio.addEventListener("timeupdate", onTime);
+    audio.addEventListener("loadedmetadata", onMeta);
+    audio.addEventListener("durationchange", onMeta);
+    audio.addEventListener("play", onPlay);
+    audio.addEventListener("pause", onPause);
+    // `seeked` fires once a seek completes — useful when the user
+    // scrubs while paused (timeupdate may not fire reliably in that
+    // state across browsers). Hooked to the same handler so the store
+    // sees the new position promptly either way.
+    audio.addEventListener("seeked", onTime);
+    // Initial sync in case the element is already beyond these events.
+    onTime();
+    onMeta();
+    setPaused(audio.paused);
+    return () => {
+      audio.removeEventListener("timeupdate", onTime);
+      audio.removeEventListener("loadedmetadata", onMeta);
+      audio.removeEventListener("durationchange", onMeta);
+      audio.removeEventListener("play", onPlay);
+      audio.removeEventListener("pause", onPause);
+      audio.removeEventListener("seeked", onTime);
+    };
+  }, [audio, setLivePlaybackTime]);
+
+  const pct = duration > 0 ? (time / duration) * 100 : 0;
+  const fmt = (s: number) => {
+    if (!isFinite(s)) return "00:00";
+    const mm = Math.floor(s / 60).toString().padStart(2, "0");
+    const ss = Math.floor(s % 60).toString().padStart(2, "0");
+    return `${mm}:${ss}`;
+  };
+
+  const onTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (duration === 0) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const p = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    audio.currentTime = p * duration;
+    setTime(audio.currentTime);
+    // IMPORTANT: push the new position into the store immediately. The
+    // native `timeupdate` event fires after a seek but sometimes only
+    // once and only if the element is playing — if the user scrubs
+    // while paused, the timeline-driven UI (phase / question /
+    // commentary / captions) could otherwise sit on stale state until
+    // they hit play. Direct write keeps everything in sync.
+    setLivePlaybackTime(audio.currentTime);
+  };
+
+  // Collapsed mode: just a small "show progress bar" pill anchored on
+  // the right, so the user can hide the strip but still bring it back.
+  if (collapsed) {
+    return (
+      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0 pb-3 flex justify-end">
+        <button
+          onClick={() => setCollapsed(false)}
+          className="inline-flex items-center gap-1.5 text-[11px] text-ink-lighter hover:text-ink border border-rule bg-paper-subtle px-2.5 py-1 rounded-md"
+        >
+          <span className="font-mono tabular-nums">{fmt(time)}</span>
+          <span>· Show progress</span>
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0 pb-3">
+      <div className="flex items-center gap-3 rounded-md border border-rule bg-paper-subtle px-3 py-2">
+        <button
+          onClick={() => {
+            if (paused) void audio.play();
+            else audio.pause();
+          }}
+          className="w-8 h-8 rounded-full bg-ink hover:bg-[#1f1e1a] text-paper grid place-items-center text-[12px] shrink-0 transition-colors"
+          aria-label={paused ? "Play" : "Pause"}
+        >
+          {paused ? "▶" : "▮▮"}
+        </button>
+        <span className="font-mono text-[11px] text-ink-light tabular-nums min-w-[74px]">
+          <span className="text-ink font-semibold">{fmt(time)}</span>
+          <span> / {fmt(duration)}</span>
+        </span>
+        <div
+          onClick={onTrackClick}
+          className="flex-1 h-1.5 bg-paper-hover rounded-full relative cursor-pointer"
+          role="slider"
+          aria-label="Recording progress"
+          aria-valuenow={Math.round(time)}
+          aria-valuemax={Math.round(duration)}
+        >
+          <div
+            className="absolute left-0 top-0 bottom-0 bg-ink rounded-full"
+            style={{ width: `${pct}%` }}
+          />
+          <div
+            className="absolute top-1/2 w-3 h-3 bg-ink rounded-full border-2 border-paper shadow"
+            style={{ left: `${pct}%`, transform: "translate(-50%, -50%)" }}
+          />
+        </div>
+        <span className="text-[10.5px] text-ink-lighter tracking-wider uppercase">
+          Recording
+        </span>
+        <button
+          onClick={() => setCollapsed(true)}
+          className="shrink-0 text-ink-lighter hover:text-ink text-[13px] leading-none px-1"
+          aria-label="Hide progress bar"
+          title="Hide"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CaptionLane({
+  meta,
+  text,
+  isSpeakingNow,
+  interim,
+}: {
+  meta: { name: string; reserved?: boolean };
+  text: string;
+  isSpeakingNow: boolean;
+  interim: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Only auto-scroll while THIS lane's speaker has the floor. When the
+    // other speaker is talking, freeze this lane's scroll position
+    // completely — otherwise every parent re-render nudges it and the
+    // reader sees constant motion even though the text is unchanged.
+    if (!isSpeakingNow) return;
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text, interim, isSpeakingNow]);
+
+  return (
+    <div
+      className="px-4 py-2 flex gap-3 items-start overflow-hidden"
+      style={{ height: CAPTIONS_LANE_HEIGHT_PX }}
+    >
+      <div className="w-[90px] shrink-0">
+        <div
+          className={`text-[11px] font-semibold uppercase tracking-wider ${
+            isSpeakingNow
+              ? "text-accent animate-pulse-label"
+              : meta.reserved
+              ? "text-ink-lighter"
+              : "text-ink"
+          }`}
+        >
+          {meta.name}
+        </div>
+      </div>
       <div
-        className="px-4 py-3 overflow-hidden"
-        style={{ height: CAPTIONS_HEIGHT_PX }}
+        ref={ref}
+        className="flex-1 min-w-0 text-[14px] leading-relaxed text-ink overflow-y-auto no-scrollbar h-full"
       >
-        {paragraphs.map((p, i) => {
-          const { name, role } = resolveLabel(p.dgSpeaker);
-          return (
-            <p key={p.key} className="mb-3 last:mb-0 text-[14.5px] leading-relaxed">
-              <span className={`font-semibold mr-1.5 ${colorFor(role)}`}>
-                {name}:
-              </span>
-              <span className="text-ink">{p.text}</span>
-              {i === newestIndex && interim && (
-                <span className="text-ink-lighter/70 italic"> {interim}</span>
-              )}
-            </p>
-          );
-        })}
-        {paragraphs.length === 0 && interim && (
-          <p className="mb-0 text-[14.5px] leading-relaxed">
-            <span className="font-semibold mr-1.5 text-ink-lighter">
-              {labels.speakerPrefix}:
+        {meta.reserved ? (
+          // Role is known (the other side was tagged) but this speaker
+          // hasn't been heard yet. Show an explicit waiting state so the
+          // user understands the system is ready — just no voice yet.
+          <span className="text-ink-lighter/70 italic inline-flex items-center gap-2">
+            <span className="inline-flex gap-[3px]">
+              <span className="w-[4px] h-[4px] rounded-full bg-ink-lighter animate-bounce-dot" />
+              <span className="w-[4px] h-[4px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.15s]" />
+              <span className="w-[4px] h-[4px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.3s]" />
             </span>
-            <span className="text-ink-lighter/70 italic">{interim}</span>
-          </p>
+            waiting to speak
+          </span>
+        ) : text ? (
+          <>
+            {text}
+            {interim && (
+              <span className="text-ink-lighter/70 italic"> {interim}</span>
+            )}
+          </>
+        ) : interim ? (
+          <span className="text-ink-lighter/70 italic">{interim}</span>
+        ) : (
+          <span className="text-ink-lighter/70 italic">—</span>
         )}
       </div>
     </div>

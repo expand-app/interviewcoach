@@ -28,16 +28,16 @@ export function ModalShell({ open, onClose, children, variant = "default", dismi
   const width = variant === "wide" ? "w-[600px]" : "w-[420px]";
 
   return (
-    <>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 backdrop-blur-[2px]"
+      onClick={() => dismissible && onClose()}
+    >
       <div
-        className="fixed inset-0 bg-black/35 backdrop-blur-[2px] z-50"
-        onClick={() => dismissible && onClose()}
-      />
-      <div
-        className={`fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-paper border border-rule-strong rounded-xl shadow-[0_20px_60px_rgba(15,15,15,0.22),0_4px_12px_rgba(15,15,15,0.08)] z-[60] ${width} max-w-[92vw] max-h-[90vh] overflow-y-auto animate-appear`}
+        onClick={(e) => e.stopPropagation()}
+        className={`bg-paper border border-rule-strong rounded-xl shadow-[0_20px_60px_rgba(15,15,15,0.22),0_4px_12px_rgba(15,15,15,0.08)] ${width} max-w-[92vw] max-h-[90vh] overflow-y-auto animate-appear`}
       >
         {children}
       </div>
-    </>
+    </div>
   );
 }

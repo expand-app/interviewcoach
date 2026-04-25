@@ -28,6 +28,10 @@ export interface AudioSessionCallbacks {
   onInterimTranscript: (text: string) => void;
   onAudioReady: (audioUrl: string, duration: number) => void;
   onError: (msg: string) => void;
+  /** Fired when playback-driven capture reaches the end of the file.
+   *  Live mic capture never calls this. Used to show a "recording complete —
+   *  view your scoring" prompt and to flush remaining utterances. */
+  onPlaybackEnded?: () => void;
 }
 
 interface DeepgramAlternative {
@@ -68,9 +72,53 @@ const DEEPGRAM_QUERY = new URLSearchParams({
   // raw opus frames, which would silently fail to parse.
 }).toString();
 
+/**
+ * Options that control how the session captures audio. `captureTabAudio`:
+ *   - "auto" (default): after mic grant, look at the system's default audio
+ *     output device. If its label looks like headphones / earphones /
+ *     AirPods, automatically attempt tab audio capture — the interviewer's
+ *     voice won't reach the mic through the room in that case.
+ *   - "on": always attempt tab audio capture.
+ *   - "off": never.
+ * Failures in tab audio capture (user cancels the share dialog, browser
+ * unsupported, no audio track in share) fall back to mic-only without
+ * failing the session.
+ */
+export interface AudioSessionOptions {
+  captureTabAudio?: "auto" | "on" | "off";
+}
+
+/** Check whether the current default audio output is likely an earphone /
+ *  headset / earbud. Relies on device labels, which are only exposed after
+ *  mic permission has been granted. Conservative on "bluetooth" alone
+ *  since it could be a speaker. */
+async function defaultOutputLooksLikeHeadphones(): Promise<boolean> {
+  if (!navigator.mediaDevices?.enumerateDevices) return false;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const outputs = devices.filter((d) => d.kind === "audiooutput");
+    if (outputs.length === 0) return false;
+    // Prefer the explicit "default" deviceId on Chromium; fall back to first.
+    const def = outputs.find((d) => d.deviceId === "default") ?? outputs[0];
+    const label = (def.label || "").toLowerCase();
+    return (
+      label.includes("headphone") ||
+      label.includes("headset") ||
+      label.includes("earphone") ||
+      label.includes("earbud") ||
+      label.includes("airpod")
+    );
+  } catch {
+    return false;
+  }
+}
+
 export class AudioSession {
   private ws: WebSocket | null = null;
   private mediaStream: MediaStream | null = null;
+  private micStream: MediaStream | null = null;
+  private tabStream: MediaStream | null = null;
+  private audioContext: AudioContext | null = null;
   private recorder: MediaRecorder | null = null;
   private audioChunks: Blob[] = [];
   private startTime = 0;
@@ -80,12 +128,16 @@ export class AudioSession {
   /** Deepgram closes the socket after 12s of silence; ping it every 8s. */
   private static KEEP_ALIVE_MS = 8000;
 
-  constructor(private callbacks: AudioSessionCallbacks) {}
+  constructor(
+    private callbacks: AudioSessionCallbacks,
+    private options: AudioSessionOptions = {}
+  ) {}
 
   async start() {
-    // 1) Mic — same constraints as before (EC/NS off so playback comes through cleanly)
+    // 1) Mic — EC/NS off so playback from the room still reaches Deepgram
+    //    cleanly in the speakers-on case.
     try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+      this.micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: false,
           noiseSuppression: false,
@@ -96,6 +148,74 @@ export class AudioSession {
     } catch {
       this.callbacks.onError("Microphone permission denied");
       return;
+    }
+
+    // 1a) Decide whether to ALSO capture tab/system audio. If earphones are
+    //     plugged in, the mic can't pick up the interviewer's voice (it goes
+    //     straight into the ear), so Deepgram would only see the candidate.
+    //     In "auto" mode (default) we inspect the default audio output's
+    //     label; if it looks like headphones we kick off getDisplayMedia
+    //     automatically. The user still has to pick a tab in the native
+    //     share dialog and tick "Share tab audio".
+    const captureMode = this.options.captureTabAudio ?? "auto";
+    let shouldCaptureTab = captureMode === "on";
+    if (captureMode === "auto") {
+      shouldCaptureTab = await defaultOutputLooksLikeHeadphones();
+      if (shouldCaptureTab) {
+        // Tell the user why the share dialog is about to appear. Uses the
+        // existing error-toast channel — harmless; this is informational.
+        this.callbacks.onError(
+          "Earphones detected — in the next dialog, pick your interview tab and check \"Share tab audio\" so the interviewer's voice is transcribed."
+        );
+      }
+    }
+    if (shouldCaptureTab) {
+      try {
+        this.tabStream = await navigator.mediaDevices.getDisplayMedia({
+          // video:true is required by Chrome for the audio track to exist;
+          // we stop the video tracks immediately below.
+          video: true,
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+        for (const t of this.tabStream.getVideoTracks()) t.stop();
+        if (this.tabStream.getAudioTracks().length === 0) {
+          // User didn't check "Share audio" — useless without it.
+          for (const t of this.tabStream.getTracks()) t.stop();
+          this.tabStream = null;
+          this.callbacks.onError(
+            "Tab audio share had no audio track — re-enable \"Share tab audio\" in the browser prompt. Continuing with mic-only."
+          );
+        }
+      } catch {
+        // User cancelled or not supported — keep going with mic only.
+        this.tabStream = null;
+        this.callbacks.onError(
+          "Tab audio capture declined — continuing with mic-only. Interviewer voice won't be transcribed unless laptop speakers are on."
+        );
+      }
+    }
+
+    // 1b) Build the stream we actually hand to MediaRecorder. If we have
+    //     tab audio, mix mic + tab via Web Audio; otherwise the mic stream
+    //     is used directly.
+    if (this.tabStream && this.tabStream.getAudioTracks().length > 0) {
+      this.audioContext = new AudioContext();
+      const dest = this.audioContext.createMediaStreamDestination();
+      this.audioContext
+        .createMediaStreamSource(this.micStream)
+        .connect(dest);
+      this.audioContext
+        .createMediaStreamSource(
+          new MediaStream(this.tabStream.getAudioTracks())
+        )
+        .connect(dest);
+      this.mediaStream = dest.stream;
+    } else {
+      this.mediaStream = this.micStream;
     }
 
     // 2) Get a Deepgram credential from our server route. The route returns
@@ -186,14 +306,34 @@ export class AudioSession {
     if (!transcript) return;
 
     if (msg.is_final) {
-      // Pick the dominant speaker across the words in this final segment.
-      const speaker = pickDominantSpeaker(alt.words);
+      // If the words in this final utterance span multiple speakers
+      // (diarization transition mid-utterance), split into per-speaker
+      // segments rather than attributing the whole text to the dominant
+      // speaker. Without this, the minority-speaker's words "belong to"
+      // the wrong lane until a later final corrects it — ~5s of misattributed
+      // captions during every speaker hand-off.
+      const segments = splitByContinuousSpeaker(alt.words, transcript);
       // Prefer Deepgram's segment duration; fall back to word timings if missing.
-      const duration =
+      const totalDuration =
         typeof msg.duration === "number"
           ? msg.duration
           : computeWordsDuration(alt.words);
-      this.callbacks.onFinalTranscript(transcript, speaker, duration);
+      if (segments.length <= 1) {
+        const speaker = segments[0]?.speaker ?? pickDominantSpeaker(alt.words);
+        this.callbacks.onFinalTranscript(transcript, speaker, totalDuration);
+      } else {
+        // Multi-segment final. Apportion duration across segments by
+        // word count if we have one; otherwise each segment carries
+        // undefined and the consumer falls back to defaults.
+        const wordCount = alt.words?.length ?? 0;
+        for (const seg of segments) {
+          const segDur =
+            totalDuration !== undefined && wordCount > 0
+              ? totalDuration * (seg.wordCount / wordCount)
+              : undefined;
+          this.callbacks.onFinalTranscript(seg.text, seg.speaker, segDur);
+        }
+      }
       // Clear interim view.
       this.callbacks.onInterimTranscript("");
     } else {
@@ -267,8 +407,22 @@ export class AudioSession {
       this.ws = null;
     }
 
-    // Release mic.
-    this.mediaStream?.getTracks().forEach((t) => t.stop());
+    // Release all capture resources: the mic, the tab-share stream if we
+    // started one, and the Web Audio graph that mixed them.
+    this.micStream?.getTracks().forEach((t) => t.stop());
+    this.micStream = null;
+    this.tabStream?.getTracks().forEach((t) => t.stop());
+    this.tabStream = null;
+    if (this.audioContext && this.audioContext.state !== "closed") {
+      try {
+        await this.audioContext.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.audioContext = null;
+    // The mediaStream reference either was the mic stream (already stopped)
+    // or a mixed stream whose sources we just released — drop it either way.
     this.mediaStream = null;
 
     // Hand back the recorded audio.
@@ -289,6 +443,60 @@ function computeWordsDuration(
   if (typeof first !== "number" || typeof last !== "number") return undefined;
   const d = last - first;
   return d > 0 ? d : undefined;
+}
+
+/**
+ * Split a final utterance's words into contiguous same-speaker runs,
+ * reconstructing each run's text from the words. Used when Deepgram's
+ * diarization shifts mid-utterance (end of one speaker's turn bleeds
+ * into the start of the next speaker's turn inside a single final).
+ * Without this, the minority-speaker's words get attributed to the
+ * dominant-speaker's lane for the duration of that utterance.
+ *
+ * Returns one segment per contiguous speaker run. `fullTranscript` is
+ * used as a fallback when the words array is empty or lacks speaker
+ * labels (single-segment case).
+ */
+function splitByContinuousSpeaker(
+  words: Array<{ word: string; punctuated_word?: string; speaker?: number }> | undefined,
+  fullTranscript: string
+): Array<{ speaker: number | undefined; text: string; wordCount: number }> {
+  if (!words || words.length === 0) {
+    return [{ speaker: undefined, text: fullTranscript, wordCount: 0 }];
+  }
+  // Group consecutive words whose speaker label is the same.
+  const segments: Array<{ speaker: number | undefined; text: string; wordCount: number }> = [];
+  let cur: { speaker: number | undefined; parts: string[]; wordCount: number } | null = null;
+  for (const w of words) {
+    const s = typeof w.speaker === "number" ? w.speaker : undefined;
+    const piece = w.punctuated_word || w.word;
+    if (!piece) continue;
+    if (cur && cur.speaker === s) {
+      cur.parts.push(piece);
+      cur.wordCount++;
+    } else {
+      if (cur) {
+        segments.push({
+          speaker: cur.speaker,
+          text: cur.parts.join(" "),
+          wordCount: cur.wordCount,
+        });
+      }
+      cur = { speaker: s, parts: [piece], wordCount: 1 };
+    }
+  }
+  if (cur) {
+    segments.push({
+      speaker: cur.speaker,
+      text: cur.parts.join(" "),
+      wordCount: cur.wordCount,
+    });
+  }
+  // Guard against pathological cases (no valid words).
+  if (segments.length === 0) {
+    return [{ speaker: undefined, text: fullTranscript, wordCount: 0 }];
+  }
+  return segments;
 }
 
 /**

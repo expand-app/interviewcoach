@@ -1,15 +1,15 @@
 "use client";
 
-import { useStore } from "./store";
-
 /**
- * Minimal i18n: we only have two locales and a small UI surface, so instead
- * of a translation table, we pass both strings at the call site.
+ * UI copy is English-only. Commentary language is tracked separately on
+ * the store (`commentLang`) and applied only when generating commentary.
  *
  *   const t = useTranslations();
  *   <div>{t("Pause", "暂停")}</div>
+ *
+ * The Chinese argument is retained at call sites purely for future-proofing
+ * — if we reintroduce a UI language toggle, every string is already paired.
  */
 export function useTranslations() {
-  const lang = useStore((s) => s.commentLang);
-  return (en: string, zh: string) => (lang === "zh" ? zh : en);
+  return (en: string, _zh: string) => en;
 }

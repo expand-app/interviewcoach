@@ -24,6 +24,7 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 debug-classifications.jsonl
+/debug-logs/
 
 # env files (all local environment files)
 .env
@@ -42,3 +43,6 @@ next-env.d.ts
 .idea/
 *.swp
 *.swo
+
+# claude code local settings
+.claude/settings.local.json

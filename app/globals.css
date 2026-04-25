@@ -33,8 +33,8 @@ body {
 
 /* Keyframes used across components */
 @keyframes appear {
-  from { opacity: 0; transform: translateY(4px); }
-  to   { opacity: 1; transform: none; }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; }
@@ -48,7 +48,20 @@ body {
 .animate-appear     { animation: appear .25s ease; }
 .animate-pulse-dot  { animation: pulse-dot 1.4s infinite; }
 .animate-bounce-dot { animation: bounce-dot 1.2s infinite; }
+/* Slower, gentler pulse used on the speaker label of whichever lane has
+   the floor — signals "talking now" without a separate LIVE badge. */
+.animate-pulse-label { animation: pulse-label 2s ease-in-out infinite; }
+@keyframes pulse-label {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
 
 /* Small utility for embedded HTML (bold, em) inside translated text */
 .prose-live strong { font-weight: 600; }
 .prose-live em     { font-style: italic; }
+
+/* Scroll without showing a visible scrollbar. Used for caption lanes
+   that auto-scroll to show the tail of a speaker's turn while staying
+   at a fixed height. */
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.no-scrollbar::-webkit-scrollbar { width: 0; height: 0; display: none; }

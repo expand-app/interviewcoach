@@ -14,9 +14,13 @@ export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
   const pastSessions = useStore((s) => s.pastSessions);
   const selectedPastId = useStore((s) => s.selectedPastId);
   const selectPast = useStore((s) => s.selectPast);
+  const user = useStore((s) => s.user);
+  const signOut = useStore((s) => s.signOut);
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const userMenuRef = useRef<HTMLDivElement>(null);
 
   // Close menu on outside click
   useEffect(() => {
@@ -28,30 +32,65 @@ export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
     return () => document.removeEventListener("click", onClick);
   }, [menuFor]);
 
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    const onClick = (e: MouseEvent) => {
+      if (!userMenuRef.current?.contains(e.target as Node)) setUserMenuOpen(false);
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, [userMenuOpen]);
+
+  const initial = (user?.name?.trim()?.[0] ?? "?").toUpperCase();
+
   return (
     <aside className="w-60 bg-paper-subtle border-r border-rule flex flex-col gap-0.5 p-2.5 overflow-y-auto">
       {/* Workspace header */}
-      <div className="flex items-center gap-2 px-2 py-1.5 mb-2.5 text-sm font-semibold text-ink rounded cursor-pointer hover:bg-paper-hover">
-        <div className="w-[22px] h-[22px] bg-ink text-paper rounded grid place-items-center font-serif italic font-bold text-xs">
-          C
-        </div>
-        <div className="flex flex-col leading-tight overflow-hidden">
-          <span className="truncate">Interview Coach</span>
-          <span className="text-[11px] text-ink-lighter font-normal mt-0.5">Guest</span>
-        </div>
-        <span className="ml-auto text-ink-lighter text-[11px]">⌄</span>
+      <div className="relative mb-2.5" ref={userMenuRef}>
+        <button
+          onClick={() => setUserMenuOpen((v) => !v)}
+          className="w-full flex items-center gap-2 px-2 py-1.5 text-sm font-semibold text-ink rounded hover:bg-paper-hover text-left"
+        >
+          <div className="w-[22px] h-[22px] bg-ink text-paper rounded grid place-items-center font-serif italic font-bold text-xs">
+            {initial}
+          </div>
+          <div className="flex flex-col leading-tight overflow-hidden min-w-0">
+            <span className="truncate">{user?.name ?? "Interview Coach"}</span>
+            <span className="text-[11px] text-ink-lighter font-normal mt-0.5 truncate">
+              {user?.email ?? "Guest"}
+            </span>
+          </div>
+          <span className="ml-auto text-ink-lighter text-[11px] shrink-0">⌄</span>
+        </button>
+
+        {userMenuOpen && (
+          <div className="absolute left-0 right-0 top-full mt-1 bg-paper border border-rule-strong rounded-md shadow-lg p-1 z-[70]">
+            <button
+              onClick={() => {
+                setUserMenuOpen(false);
+                selectPast(null);
+                signOut();
+              }}
+              className="w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded text-sm hover:bg-paper-hover text-left"
+            >
+              <span className="w-3.5 inline-flex justify-center text-ink-lighter text-[13px]">
+                ↩
+              </span>
+              <span>Sign out</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Live Session nav */}
       <button
         onClick={() => selectPast(null)}
-        className={`flex items-center gap-2 px-2 py-1 rounded text-sm text-left ${
+        className={`flex items-center px-2 py-1 rounded text-sm text-left ${
           selectedPastId === null
             ? "bg-paper-hover text-ink font-medium"
             : "text-ink-light hover:bg-paper-hover"
         }`}
       >
-        <span className="text-[15px] w-[18px] text-center">🎙️</span>
         <span>{t("Live Session", "实时会话")}</span>
       </button>
 
@@ -77,7 +116,7 @@ export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
               }`}
             >
               <span className="w-1 h-1 rounded-full bg-ink-lighter shrink-0" />
-              <span className="truncate flex-1" title={s.jd.slice(0, 200)}>
+              <span className="truncate flex-1" title={s.title}>
                 {s.title}
               </span>
               <button

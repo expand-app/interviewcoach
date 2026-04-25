@@ -6,6 +6,14 @@ export type CommentLanguage = "en" | "zh";
 
 export type Speaker = "interviewer" | "candidate" | "unknown";
 
+/** Locally-stored user identity. There is no backend — signing in just
+ *  records a name + email so the sidebar can show it and past sessions can
+ *  be attributed. Null means "not signed in". */
+export interface User {
+  name: string;
+  email: string;
+}
+
 /** State of the current moment — what's happening in the room right now.
  *  Drives the top bar in the live view. */
 export type MomentStateKind =
@@ -75,6 +83,101 @@ export interface DisplayedComment {
   minMs: number;
 }
 
+/** Kinds of phase in an upload-mode timeline. Mirrors the derived
+ *  phase taxonomy used by the live view but is produced up-front by the
+ *  /api/preanalyze-recording endpoint.
+ *
+ *  "candidate_asking" covers the reverse-Q&A tail of a session: the
+ *  interviewer has finished their questions and turned the floor over
+ *  ("any questions for me?"), and the candidate is now asking. UI
+ *  renders this as its own top-bar phase ("Candidate Q&A") with the
+ *  candidate's current question as the content.
+ */
+export type PhaseKind =
+  | "chitchat"
+  | "interviewer_asking_first"
+  | "interviewer_probing"
+  | "candidate_answering"
+  | "between_questions"
+  | "candidate_asking";
+
+/** Pre-computed coaching timeline for an uploaded recording. Lets the
+ *  live view render correct phase / question / commentary / listening
+ *  hint for any playback position, including after a seek. */
+export interface RecordingTimeline {
+  questions: Array<{
+    id: string;
+    text: string;
+    parentId?: string;
+    askedAtSec: number;
+  }>;
+  commentary: Array<{
+    id: string;
+    questionId: string;
+    atSec: number;
+    text: string;
+  }>;
+  listeningHints: Array<{
+    id: string;
+    atSec: number;
+    text: string;
+  }>;
+  phases: Array<{
+    fromSec: number;
+    kind: PhaseKind;
+    questionId?: string;
+  }>;
+}
+
+/** Overall end-of-session assessment produced by /api/score-session.
+ *  Computed once when the session ends and cached on the Session so the
+ *  past-session view can redisplay without re-calling the model. */
+export interface SessionScore {
+  /** Sum of judged dimension scores. 0 when verdict is "insufficient_data". */
+  total: number;
+  /** Sum of `max` across judged dimensions. 100 when all five were judged,
+   *  smaller when some were N/A. 0 when verdict is "insufficient_data". */
+  totalMax: number;
+  /** Percentage = total / totalMax * 100, rounded. Used for the verdict
+   *  thresholds so pro-rated totals still map to the same pass/fail bands. */
+  percent: number;
+  /** Verdict. "insufficient_data" when the transcript didn't contain enough
+   *  content for the model to form a judgment (e.g. 2-minute session with
+   *  only pleasantries). */
+  verdict:
+    | "strong_pass"
+    | "pass"
+    | "borderline"
+    | "fail"
+    | "insufficient_data";
+  /** One or two sentence overall summary of how the interview went. When
+   *  verdict is "insufficient_data", this is the REASON why — e.g. "Only
+   *  one substantive question was asked; not enough to judge."
+   */
+  summary: string;
+  /** Per-dimension breakdown. `score` is null when the dimension couldn't
+   *  be judged from the available transcript (e.g. Role Fit when no JD-
+   *  aligned questions were asked) — in that case `justification` explains
+   *  why and the dimension is excluded from `total` / `totalMax`. */
+  dimensions: Array<{
+    /** Stable identifier: one of
+     *  question_addressing | specificity | depth | role_fit | communication */
+    key: string;
+    /** Human-readable label, e.g. "Question Addressing". */
+    label: string;
+    /** Max points for this dimension (25 / 25 / 20 / 15 / 15). */
+    max: number;
+    /** Points awarded, 0 .. max. null = not assessable from transcript. */
+    score: number | null;
+    /** One-line justification tied to moments from the transcript (or, when
+     *  `score` is null, the reason this dimension couldn't be judged). */
+    justification: string;
+  }>;
+  /** 2–3 actionable suggestions referencing specific moments. May be empty
+   *  when verdict is "insufficient_data". */
+  improvements: string[];
+}
+
 export interface Session {
   id: string;
   title: string;
@@ -87,6 +190,8 @@ export interface Session {
   durationSeconds: number;
   /** Raw audio blob URL (object URL, lost on refresh since we don't persist). */
   audioUrl?: string;
+  /** Overall assessment — undefined while scoring is in flight or if it failed. */
+  score?: SessionScore;
 }
 
 /** Transient state during a live recording. */
