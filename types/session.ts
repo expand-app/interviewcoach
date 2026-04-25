@@ -20,12 +20,22 @@ export type MomentStateKind =
   | "idle"                  // session just started, nothing classified yet
   | "chitchat"              // small talk, intros, audio check
   | "interviewer_speaking"  // interviewer is mid-question, not yet finalized
-  | "question_finalized";   // a complete question is ready; commentary can flow
+  | "question_finalized"    // a complete question is ready; commentary can flow
+  | "candidate_questioning"; // reverse Q&A: candidate is asking the interviewer
+                              // questions ("what does the team look like?",
+                              // "what's the day-to-day?"). UI top bar switches
+                              // to "Candidate's Question" mode and commentary
+                              // evaluates the QUESTION quality, not an answer.
 
 export interface MomentState {
   state: MomentStateKind;
   /** One-line human-readable summary, shown in the top bar. */
   summary: string;
+  /** When state === "candidate_questioning", the candidate's current question
+   *  text (in the language they used). Shown in the top bar. Carried on the
+   *  MomentState so a single setMomentState call can update both phase + text
+   *  atomically. Undefined for all other states. */
+  candidateQuestion?: string;
 }
 
 /** A finalized chunk of transcript. The role (interviewer/candidate) is

@@ -1207,10 +1207,17 @@ export class LiveOrchestrator {
     // commentary prompt clean.
     const DIALOGUE_MIN_CHARS = 10;
     if (
-      momentState === "question_finalized" &&
+      (momentState === "question_finalized" ||
+        momentState === "candidate_questioning") &&
       (role === "candidate" || role === "interviewer") &&
       clean.length >= DIALOGUE_MIN_CHARS
     ) {
+      // Both states benefit from running dialogue context:
+      //   - question_finalized: commentary judges how the answer is
+      //     landing; interviewer reactions are part of that signal.
+      //   - candidate_questioning: commentary judges question quality
+      //     and references what was discussed earlier; the interviewer
+      //     answering the candidate's question is also useful context.
       this.dialogueBuffer.push({ speaker: role, text: clean });
       // Cap to keep prompt latency reasonable — last 30 turns is plenty
       // for commentary to read the room.
@@ -1397,7 +1404,7 @@ export class LiveOrchestrator {
   private async streamCommentarySSE(
     body: unknown,
     onDelta: (accumulated: string) => void,
-    kind: "commentary" | "listen-hint" | "warmup-cmt",
+    kind: "commentary" | "listen-hint" | "warmup-cmt" | "cand-q-cmt",
     onApiError?: (err: string) => void
   ): Promise<string | null> {
     const BACKOFFS_MS = [500, 1500]; // delay before attempt #2 and attempt #3
@@ -1517,6 +1524,57 @@ export class LiveOrchestrator {
       }
     } finally {
       this.pendingWarmupCommentary = false;
+    }
+  }
+
+  /** Fire a candidate-question commentary call. Reverse-Q&A phase: the
+   *  candidate is asking the interviewer questions, and we evaluate the
+   *  QUALITY of their question (specific vs. generic, ties to what was
+   *  discussed, suggests a follow-up). Streams into
+   *  `liveCandidateQuestionCommentary` which the UI renders in the
+   *  commentary pane while momentState === "candidate_questioning".
+   *
+   *  Re-fires when applyMomentInner detects a NEW candidate question
+   *  text (different from the prior one). Same question text → no fire,
+   *  the existing commentary stays on screen. */
+  private async generateCandidateQuestionCommentary(candidateQuestion: string) {
+    const { liveJd, liveResume, commentLang, setLiveCandidateQuestionCommentary } =
+      useStore.getState();
+    setLiveCandidateQuestionCommentary(""); // clear previous — streaming starts fresh
+    log("cand-q-cmt", "request", {
+      cqLen: candidateQuestion.length,
+      preview: preview(candidateQuestion, 80),
+    });
+
+    let sawApiError = false;
+    const accumulated = await this.streamCommentarySSE(
+      {
+        jd: liveJd,
+        resume: liveResume,
+        question: "",
+        answer: "",
+        mode: "candidate_question",
+        candidateQuestion,
+        // Pass recent dialogue so the model can spot whether the
+        // question ties back to specifics the interviewer revealed
+        // earlier (e.g. "you mentioned EMR migration — …"). Without
+        // this it would have to evaluate the question in a vacuum.
+        recentDialogue: this.dialogueBuffer.slice(-15),
+        lang: commentLang,
+      },
+      (acc) => useStore.getState().setLiveCandidateQuestionCommentary(acc),
+      "cand-q-cmt",
+      () => {
+        sawApiError = true;
+      }
+    );
+    if (accumulated !== null && !sawApiError && accumulated.length > 0) {
+      this.markCommentaryDisplayed(accumulated);
+      log("cand-q-cmt", "done", {
+        chars: accumulated.length,
+        readMs: this.computeReadingTimeMs(accumulated),
+        preview: preview(accumulated, 100),
+      });
     }
   }
 
@@ -1668,6 +1726,7 @@ export class LiveOrchestrator {
         state?: MomentStateKind;
         summary?: string;
         question?: string;
+        candidateQuestion?: string;
         questionRelation?: QuestionRelation;
       };
       if (!data.state) {
@@ -1679,6 +1738,7 @@ export class LiveOrchestrator {
         state: data.state,
         rel: data.questionRelation,
         q: preview(data.question || "", 60),
+        candQ: preview(data.candidateQuestion || "", 60),
         summary: preview(data.summary || "", 60),
       });
 
@@ -1686,7 +1746,8 @@ export class LiveOrchestrator {
         data.state,
         data.summary || "",
         data.question || "",
-        data.questionRelation ?? null
+        data.questionRelation ?? null,
+        data.candidateQuestion || ""
       );
     } catch (e) {
       log("classify", "error", {
@@ -1714,7 +1775,8 @@ export class LiveOrchestrator {
     next: MomentStateKind,
     summary: string,
     questionText: string,
-    rel: QuestionRelation
+    rel: QuestionRelation,
+    candidateQuestion: string = ""
   ) {
     const prev = useStore.getState().liveMomentState.state;
 
@@ -1760,7 +1822,7 @@ export class LiveOrchestrator {
     }
 
     try {
-      this.applyMomentInner(next, summary, questionText, rel);
+      this.applyMomentInner(next, summary, questionText, rel, candidateQuestion);
     } finally {
       // Log transit ONLY when the store state actually changed, not
       // when the classifier merely proposed a change that anchored-mode
@@ -1777,7 +1839,8 @@ export class LiveOrchestrator {
     next: MomentStateKind,
     summary: string,
     questionText: string,
-    rel: QuestionRelation
+    rel: QuestionRelation,
+    candidateQuestion: string = ""
   ) {
     const store = useStore.getState();
     const currentSubQ = store.liveQuestions.find(
@@ -1788,6 +1851,83 @@ export class LiveOrchestrator {
       : currentSubQ;
     const currentFollowUpQ =
       currentSubQ && currentSubQ !== currentMainQ ? currentSubQ : undefined;
+
+    // ============================================================
+    // Reverse-Q&A branch: candidate is asking the interviewer questions
+    // ("any questions for me?" → candidate asks). Handle this BEFORE the
+    // anchored / pre-anchored branches because it can fire from either —
+    // a session can flip into reverse-Q&A directly from question_finalized
+    // (interviewer wraps "any questions?" right after the candidate's
+    // answer) or from chitchat (interviewer goodbyes + remembers to ask).
+    // ============================================================
+    if (next === "candidate_questioning") {
+      const cq = candidateQuestion.trim();
+      // Strict empty-q guard. If the classifier reports the state but
+      // didn't extract a question text, this is internally inconsistent
+      // — refresh summary only and leave display state intact rather
+      // than nuking the prior Lead based on uncertain signal.
+      if (cq.length < 5) {
+        log("filter", "ignore-empty-cand-q", {
+          len: cq.length,
+          summary: preview(summary, 60),
+        });
+        const currentState = store.liveMomentState.state;
+        store.setMomentState({ state: currentState, summary });
+        return;
+      }
+      // Discard any pending Lead validation — the interview has moved
+      // into reverse Q&A, the proposed Lead is stale.
+      if (this.pendingLead) {
+        this.discardPendingLead("entered-candidate-questioning");
+      }
+      // Archive any locked Lead. Old Q + its commentary stay in
+      // liveQuestions so the post-session review still has them; we
+      // just clear currentQuestionId so the UI's Phase region switches
+      // to the candidate's question.
+      if (currentMainQ) {
+        store.setCurrentQuestionId(null);
+      }
+      // Drain answer-side buffers — the candidate isn't answering
+      // anything anymore. Keep dialogueBuffer intact: the prior Q&A
+      // turns are exactly the context the candidate-question commentary
+      // needs to judge "did the question tie back to what was
+      // discussed earlier?". Trim to the last 20 turns so it doesn't
+      // grow unbounded across a long Q&A tail.
+      this.answerBuffer = "";
+      this.pendingAnswerBuffer = "";
+      if (this.dialogueBuffer.length > 20) {
+        this.dialogueBuffer = this.dialogueBuffer.slice(-20);
+      }
+      this.interviewerMonologueBuffer = "";
+      this.lastListeningHintBufferSize = 0;
+      useStore.getState().setLiveListeningHint("");
+      this.candidateWarmupBuffer = "";
+      this.lastWarmupBufferSize = 0;
+      useStore.getState().setLiveWarmupCommentary("");
+      store.setDisplayedComment(null);
+      store.setAnswerInProgress(false);
+      this.pendingCommentaryFor = null;
+
+      // Was the previous candidate question text the same as this one?
+      // Classifier ticks every 2-3s; while the candidate is still
+      // talking and the interviewer is answering, the classifier may
+      // re-emit the same question text many times in a row. Only fire
+      // a fresh commentary when the question text genuinely changes.
+      const prevCq = (store.liveMomentState.candidateQuestion || "").trim();
+      store.setMomentState({
+        state: "candidate_questioning",
+        summary,
+        candidateQuestion: cq,
+      });
+      if (cq !== prevCq) {
+        // New question — clear prior commentary text and fire a fresh
+        // generation. (Same pattern as warmup commentary.)
+        useStore.getState().setLiveCandidateQuestionCommentary("");
+        log("candidate-q", "new", { text: preview(cq, 80) });
+        void this.generateCandidateQuestionCommentary(cq);
+      }
+      return;
+    }
 
     // Anchored mode — once a main question is locked, be conservative.
     if (currentMainQ) {
@@ -1900,7 +2040,15 @@ export class LiveOrchestrator {
     if (this.pendingLead) {
       this.discardPendingLead("state-changed");
     }
+    // Leaving candidate_questioning → clear its commentary slot so a
+    // stale "evaluation of last candidate question" doesn't linger
+    // into chitchat / interviewer_speaking.
+    const wasCandidateQuestioning =
+      store.liveMomentState.state === "candidate_questioning";
     store.setMomentState({ state: next, summary });
+    if (wasCandidateQuestioning) {
+      useStore.getState().setLiveCandidateQuestionCommentary("");
+    }
     if (next === "interviewer_speaking" || next === "chitchat") {
       this.pendingAnswerBuffer = "";
     }

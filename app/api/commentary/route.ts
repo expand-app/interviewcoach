@@ -33,14 +33,23 @@ interface CommentaryBody {
    *  "warmup" — candidate is speaking before any Lead Question is
    *  locked (typical: self-introduction in response to opening
    *  chitchat). Coach on how they're presenting themselves given what
-   *  the interviewer has already said. */
-  mode?: "answer" | "listening" | "warmup";
+   *  the interviewer has already said.
+   *  "candidate_question" — reverse Q&A near interview end: the
+   *  candidate is asking the interviewer questions about the team /
+   *  role / process. Evaluate the QUALITY of the candidate's question
+   *  (generic vs. specific to what was discussed, signals genuine
+   *  interest, leverages information the interviewer revealed earlier,
+   *  etc.). */
+  mode?: "answer" | "listening" | "warmup" | "candidate_question";
   /** When mode === "listening", the accumulated interviewer monologue
    *  text that we're coaching the candidate to process. */
   interviewerMonologue?: string;
   /** When mode === "warmup", the candidate's self-intro / warm-up
    *  speech accumulated so far. */
   candidateWarmup?: string;
+  /** When mode === "candidate_question", the candidate's question to
+   *  the interviewer (e.g. "What does the team look like?"). */
+  candidateQuestion?: string;
 }
 
 /**
@@ -72,6 +81,7 @@ export async function POST(req: Request) {
     mode = "answer",
     interviewerMonologue = "",
     candidateWarmup = "",
+    candidateQuestion = "",
   } = body;
 
   if (mode === "answer" && (!question || !answer)) {
@@ -82,6 +92,9 @@ export async function POST(req: Request) {
   }
   if (mode === "warmup" && !candidateWarmup.trim()) {
     return new Response("Missing candidateWarmup", { status: 400 });
+  }
+  if (mode === "candidate_question" && !candidateQuestion.trim()) {
+    return new Response("Missing candidateQuestion", { status: 400 });
   }
 
   const client = getAnthropicClient();
@@ -403,6 +416,99 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
 
 基调要 calibrated,不要 roast。这是 warm-up,指出该调整什么,不要小题大做。如果 intro 进行得不错,给一句中性观察就够。`;
 
+  // == Candidate-question mode: reverse Q&A near interview end ==
+  // The candidate has been handed the floor and is asking the
+  // interviewer questions about the team / role / process. We're
+  // coaching on the QUALITY of THEIR question, not judging an answer.
+  // What makes a strong candidate-asked question:
+  //   - Specific to what the interviewer revealed earlier ("you
+  //     mentioned the team is moving from EMR to OpenSearch — what's
+  //     driving that?")
+  //   - Surfaces signal the candidate actually needs to decide on the
+  //     offer (team dynamics, growth expectations, real vs ideal scope)
+  //   - Avoids generic ("what's the culture like?") or self-serving
+  //     ("how can I make this team successful?") framings
+  //   - Doesn't double-back to topics that were already covered
+  // What makes a weak one:
+  //   - Generic / lifted from a Glassdoor list
+  //   - Could have been answered by the JD or the interviewer's earlier
+  //     setup
+  //   - Soft-balls that don't differentiate (no real "wrong" answer)
+  //   - Sandbagging — only asking about benefits / WFH / promotion path
+  const systemCandidateQuestionEn = `You are a senior interview coach observing a live interview during the REVERSE Q&A phase — the interviewer has finished their questions and turned the floor over to the candidate ("any questions for me?"). The candidate is now asking the interviewer questions, and your job is to evaluate the QUALITY of the candidate's question and (where relevant) how to follow it up.
+
+=== JOB DESCRIPTION ===
+${jd}
+=== END JD ===
+
+${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}
+
+Your job: ONE short observation, 3–4 sentences (strict upper bound: ~70 words / ~450 characters). Fits in a fixed display pane. ENGLISH with technical terms preserved. May use <strong>...</strong> for 1–2 key terms. No markdown. No preamble.
+
+What makes a STRONG candidate question:
+- SPECIFIC to something the interviewer revealed earlier in the conversation. ("You mentioned the team is migrating from EMR to OpenSearch — is that already in production, or still in design?") Shows the candidate listened.
+- Surfaces signal the candidate actually needs to decide on an offer: real vs. ideal team scope, current pain points, what success looks like at 6 months, the team's actual roadmap (vs. the recruiter pitch).
+- Hard to answer with platitudes — forces the interviewer to give a real, differentiated answer.
+- Calibrated to the interviewer's level — asking a junior IC about org strategy is misplaced; asking a hiring manager about IC-day-to-day misses the chance to learn from the manager.
+
+What makes a WEAK candidate question:
+- Generic / Glassdoor-list ("What's the culture like?", "What do you like about working here?") — interviewer can't help but give a rehearsed answer.
+- Could have been answered by the JD or the interviewer's prior setup. ("What does the team do?" after a 5-min team intro = the candidate didn't listen.)
+- Self-serving as the lead-off: only asking about WFH / benefits / promotion path before establishing any interest in the work.
+- Soft-balls ("Is the team friendly?") — no real answer.
+
+Angles you can take in your observation:
+- Praise specificity / good listening when it's present, with a follow-up suggestion. ("Good — that ties back to what he said about regulatory timelines. Push deeper: ask what the typical review cycle looks like in practice.")
+- Flag genericness when present, with a sharper rephrase. ("Generic — could've asked it before reading the JD. A sharper version: 'You mentioned scaling the team next year — what's the bottleneck holding that back today?'")
+- Suggest a strong follow-up the candidate could chain on after this answer.
+- Calibrate the question to the role / interview round if relevant (asking the wrong audience).
+- Note what the question SIGNALS about the candidate (curious about ownership? execution-oriented? values mentorship?) — the interviewer reads this too.
+
+Tone: warm, calibrated, candid. Coach toward sharper questions, don't roast. If the question is genuinely strong, just say so plus one follow-up direction.
+
+Examples:
+- "Good question — ties straight back to the EMR → OpenSearch migration he just mentioned. Strong listening signal. Follow up with 'and how does that affect on-call burden?' to surface the actual pain."
+- "Generic 'culture' question after a 20-min real conversation. Interviewer will give a polished pitch. A sharper one: 'You said the team ships weekly — what's the most recent thing that DIDN'T ship on time, and why?'"
+- "Asking the hiring manager about IC tooling is fine but a bit narrow for this round. Bigger lever: ask what's keeping HIM up at night about the team in the next 6 months."
+- "Soft question — invites a soft answer. After he replies, follow up with 'and what would make a new hire actually move the needle on that in the first 3 months?'"`;
+
+  const systemCandidateQuestionZh = `你是一位资深面试教练,正在旁观一场真实面试的 REVERSE Q&A 阶段 —— 面试官的问题问完了,把发言权交给了候选人("你有什么想问我的?"),候选人现在在问面试官问题。你的工作是评价**候选人这个问题的质量**,以及在哪里可以追问。
+
+=== 岗位描述 (JD) ===
+${jd}
+=== JD 结束 ===
+
+${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
+
+输出:一条观察,3-4 句(严格上限:主体 150 字以内,英文术语不计入)。要放进固定大小展示框。中文为主,英文术语保留。可以用 <strong>...</strong> 标 1-2 个关键词。不要 markdown,不要开场白。
+
+什么是 STRONG 的候选人提问:
+- 锚在面试官前面 reveal 的具体细节上("你刚才提到团队从 EMR 迁到 OpenSearch —— 这个已经 in production 了还是在 design?")。说明候选人在听。
+- 真正能帮候选人做 offer 决策的信号:团队 actual vs ideal scope、现在的 pain points、6 个月后 success 长什么样、团队真实 roadmap(不是 recruiter pitch)。
+- 不容易用 platitude 回答 —— 逼面试官给真实、有 differentiate 的答案。
+- 和面试官的角色 calibrated —— 问一个 junior IC 公司战略不合适;问 hiring manager 日常细节又错过了管理者视角。
+
+什么是 WEAK 的候选人提问:
+- 通用 / Glassdoor 模板题("Culture 怎么样?""你喜欢这里什么?")—— 面试官只会给 rehearsed 答案。
+- JD 或者面试官前面 setup 已经回答过了。("团队做什么?"在面试官刚讲完 5 分钟团队介绍之后 = 候选人没听。)
+- Lead-off 就问 self-serving 的(WFH / benefits / 晋升)—— 还没体现对工作本身有兴趣。
+- 软球("团队和睦吗?")—— 没有真实答案。
+
+可以从这些角度写观察:
+- 候选人问得 specific / 听得仔细就肯定他,并给一个追问方向。("好 —— 锚在他刚说的 regulatory timeline 上。可以继续追:'你们 review cycle 实际是怎么走的?'")
+- 太通用的话点出来,并给一个 sharper 版本。("有点通用,JD 上就能找到答案。一个更 sharp 的版本:'你提到明年要 scale team —— 现在 holding 这件事的 bottleneck 是什么?'")
+- 建议一个候选人可以在面试官回答之后 chain 的好 follow-up。
+- 必要时点出问错对象(audience 不合适)。
+- 顺带提一下这个问题 signal 出候选人什么样的 priority(关心 ownership? 执行?重视 mentorship?)—— 面试官也会读这个。
+
+基调:warm, calibrated, candid。指出该往更 sharp 的方向调整,不要 roast。如果问得真的很好,就说好,加一个 follow-up 方向。
+
+示例:
+- "好问题 —— 直接锚在他刚说的 EMR → OpenSearch 迁移上,strong listening signal。可以追:'那 on-call 负担是不是也跟着重了?',能逼出真实 pain。"
+- "在 20 分钟实质对话之后还问 'culture 怎么样' 比较 generic,只能拿到 polished pitch。更 sharp 的版本:'你说团队每周 ship —— 最近一次没按时 ship 的是什么,为什么?'"
+- "问 hiring manager IC 的 tooling 没问题但 narrow。更大杠杆:问他未来 6 个月最让他焦虑的事是什么。"
+- "软球 —— 招来软答。等他回答之后追一句:'那新人前 3 个月做什么能真的 move the needle?'"`;
+
   const userMsg =
     mode === "listening"
       ? lang === "zh"
@@ -412,6 +518,10 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
       ? lang === "zh"
         ? `候选人目前的 warm-up 讲话(还没有正式问题 finalize):\n"""\n${candidateWarmup}\n"""${dialogueBlock}\n\n给一条 warm-up coaching 观察。`
         : `Candidate's warm-up speech so far (no question finalized yet):\n"""\n${candidateWarmup}\n"""${dialogueBlock}\n\nGive one warm-up coaching observation.`
+      : mode === "candidate_question"
+      ? lang === "zh"
+        ? `候选人现在向面试官问的问题:\n"""\n${candidateQuestion}\n"""${dialogueBlock}\n\n评价这个问题的质量,并(如果合适)建议一个追问方向。`
+        : `Candidate's current question to the interviewer:\n"""\n${candidateQuestion}\n"""${dialogueBlock}\n\nEvaluate the quality of this question, and (where relevant) suggest a follow-up.`
       : lang === "zh"
         ? `候选人目前的回答:\n"""\n${answer}\n"""${dialogueBlock}${priorBlock}\n\n给出你的下一句观察。`
         : `Candidate's answer so far:\n"""\n${answer}\n"""${dialogueBlock}${priorBlock}\n\nGive your next observation.`;
@@ -425,6 +535,10 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
       ? lang === "zh"
         ? systemWarmupZh
         : systemWarmupEn
+      : mode === "candidate_question"
+      ? lang === "zh"
+        ? systemCandidateQuestionZh
+        : systemCandidateQuestionEn
       : lang === "zh"
         ? systemZh
         : systemEn;

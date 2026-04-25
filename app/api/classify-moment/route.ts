@@ -24,7 +24,8 @@ async function logClassification(entry: Record<string, unknown>) {
 type MomentStateKind =
   | "chitchat"
   | "interviewer_speaking"
-  | "question_finalized";
+  | "question_finalized"
+  | "candidate_questioning";
 
 type QuestionRelation = "new_topic" | "follow_up" | null;
 
@@ -187,13 +188,15 @@ This system tracks two kinds of interview questions, both ONLY from Interviewer 
 
 The following are NOT Lead or Probe questions — they should NOT finalize and should keep the currently locked-in question on screen:
 - Administrative / conversational asks from the interviewer, even if grammatically questions: "Do you have any questions before we start?", "Ready to begin?", "Can you hear me OK?", "Should we get started?", "Any issues with the setup?", "Does that make sense so far?", "Want to take a short break?". These are real utterances but they are not substantive interview questions.
-- CANDIDATE-initiated questions back to the interviewer: "What kind of data can I use?", "Can you clarify what you mean by scale?", "Is it OK if I sketch this out?" The Probe Question panel is STRICTLY interviewer → candidate. A candidate asking for clarification is not a probe question — it must not be put there.
+- CANDIDATE-initiated clarification mid-answer: "Can you clarify what you mean by scale?", "Is it OK if I sketch this out?", "What kind of data can I use?" — these belong to "chitchat" (a small clarifying ask doesn't shift the phase). The Probe Question panel is STRICTLY interviewer → candidate.
 - Meta-process chatter: "let me switch tabs", "one sec", "got it", "uh-huh".
 
-When the conversation sits in one of these categories, return state = "chitchat" so no question card is created. (The "chitchat" state is really "nothing to surface" — it covers both casual small talk AND these non-question utterances.)
+NOTE: A SEPARATE state (candidate_questioning, see below) covers the reverse-Q&A tail of the interview, where the interviewer has finished their questions and explicitly hands the floor over ("any questions for me?") and the candidate now asks substantive questions about the team/role/process.
+
+When in doubt about a non-question utterance, return state = "chitchat" so no question card is created.
 
 == STATES ==
-- "chitchat": nothing to surface as a Lead or Probe Question. Includes: small talk, greetings, intros, audio test, screen sharing chatter, administrative interviewer asks (see above), and all candidate-initiated questions to the interviewer. NOT this if the candidate is delivering a substantive self-introduction in response to a "tell me about yourself" prompt.
+- "chitchat": nothing to surface. Small talk, greetings, intros, audio test, screen sharing chatter, administrative interviewer asks (see above), and isolated candidate-initiated clarifications mid-answer. NOT this if the candidate is delivering a substantive self-introduction in response to a "tell me about yourself" prompt.
 - "interviewer_speaking": the interviewer is mid-question. Started but not finished. Any of these signal NOT YET DONE:
     • silence < 3 seconds
     • the latest interviewer utterance ends with "so", "and", "um", "uh", "let me think", "actually", "wait", or any other transition word
@@ -203,6 +206,15 @@ When the conversation sits in one of these categories, return state = "chitchat"
     1. msSinceLastTranscript >= 3000 OR the candidate has substantively started answering (>= 20 chars of first-person speech in the most recent turn), AND
     2. the accumulated interviewer text forms a complete, coherent question (interrogative or clear imperative ask), AND
     3. the question does NOT trail off into a transition word.
+- "candidate_questioning": the reverse Q&A near the end of the interview. ALL of these must hold:
+    1. The interviewer has clearly handed the floor over — explicit cue like "do you have any questions for me?", "any questions for us?", "anything you want to ask?", or "we have time for your questions" within the last few turns. OR the candidate has asked TWO consecutive substantive questions about the team/role/process and the interviewer has been answering them.
+    2. The candidate's most recent utterance IS a substantive question to the interviewer about the role / team / company / process — NOT a one-off clarification embedded in their own answer. Examples: "What does the team look like?", "How does the team measure success?", "What's the day-to-day for this role?", "What are the biggest challenges the team is facing?", "How is the on-call rotation set up?", "What's the next step after this interview?".
+    3. NOT a clarification of an interview question they're trying to answer ("Can you give me an example of what you mean by scale?" while mid-answer — that's chitchat).
+
+Once in candidate_questioning, STAY in it across multiple back-and-forths (interviewer answers, candidate asks another) until ONE of:
+    • the interviewer signals wrap-up: "well, that's about all the time we have", "thanks for your time", "we'll be in touch", "do you have any other questions?" followed by the candidate declining ("no, that's all", "no further questions"),
+    • or the candidate stops asking questions and says goodbye / thanks.
+At that wrap-up, return state = "chitchat".
 
 Compound questions ("Can you tell me about X, and also Y?") count as ONE question still being formed until the interviewer clearly stops.
 
@@ -210,18 +222,20 @@ Compound questions ("Can you tell me about X, and also Y?") count as ONE questio
 If currentMainQuestionText (the current Lead Question) is non-empty, be VERY conservative about disrupting it:
 
 1. Interviewer probing on the same topic — clarification ("by X I mean Y"), drilling deeper ("can you give a specific example?", "what was the architecture?"), or a sub-question on the same story → questionRelation = "follow_up" (this is a Probe Question). This does NOT archive the Lead Question.
-2. Candidate asking the interviewer a clarifying question, going off-topic, or chatting → DON'T transition. Return state = "chitchat", questionRelation = null. Do NOT place the candidate's question into the Probe Question slot.
+2. Candidate asking the interviewer a clarifying question mid-answer, going off-topic, or chatting → DON'T transition. Return state = "chitchat", questionRelation = null. Do NOT place the candidate's question into the Probe Question slot.
 3. ONLY when the interviewer pivots to a clearly DIFFERENT topic / story / area set questionRelation = "new_topic":
    - Q1 was about Project A → interviewer asks about Project B → new_topic
    - Q1 was about technical decisions → interviewer asks about team management → new_topic
    - Q1 was about background → interviewer asks "let's do a case study" → new_topic
 4. If a Probe Question has finalized (currentFollowUpText non-empty) and the interviewer drills further into the SAME sub-area, that's still "follow_up" (replacing the previous Probe Question).
+5. When state transitions to candidate_questioning, questionRelation = null. The prior Lead is archived implicitly by the orchestrator (do NOT set "new_topic" for the candidate's question — that field is reserved for interviewer-asked Lead/Probe pivots).
 
 == OUTPUT (JSON only, no prose) ==
 {
-  "state": "chitchat" | "interviewer_speaking" | "question_finalized",
+  "state": "chitchat" | "interviewer_speaking" | "question_finalized" | "candidate_questioning",
   "summary": "<one short human-readable line for the UI top bar>",
   "question": "<cleaned question text — only when state=question_finalized, otherwise empty>",
+  "candidateQuestion": "<cleaned candidate question text — only when state=candidate_questioning, otherwise empty>",
   "questionRelation": "new_topic" | "follow_up" | null
 }
 
@@ -229,18 +243,21 @@ questionRelation guidance:
 - When currentMainQuestionText is empty: this is the very first Lead Question, set questionRelation = "new_topic" (or null — both treated as a new Lead).
 - When state is question_finalized + the new question text is identical/near-identical to currentMainQuestionText OR currentFollowUpText: questionRelation = null (it's the same question, no-op).
 - When state is interviewer_speaking and you can already tell it's a topic shift, set questionRelation = "new_topic" so the orchestrator can move display state proactively. Otherwise null or "follow_up".
+- When state is candidate_questioning: questionRelation = null always.
 
 Summary writing style:
 - chitchat: "Greeting and audio check"
 - interviewer_speaking: short topic phrase, e.g. "asking about the recommendation model goal"
 - question_finalized: omit or echo the question
+- candidate_questioning: short topic phrase, e.g. "asking about team structure", "asking about next steps"
 
-The "question" field, when present:
+The "question" / "candidateQuestion" field, when present:
 - Clean filler ("so uh", "okay so", "alright")
-- Preserve the interviewer's wording — don't paraphrase meaning
+- Preserve the speaker's wording — don't paraphrase meaning
 - Combine compound clauses into one coherent question
 - FIX obvious speech-recognition errors where a word is clearly nonsensical in context and has a near-homophone that makes sense. Examples: "soft process" → "thought process", "sift system" → "system design", "hire ability" → "hireability", "sink about" → "think about", "resonating model" → "recommendation model". Only fix when the wrong word is genuinely meaningless in the sentence AND the intended word is a close phonetic match — when in doubt, preserve the original.
-- REPHRASE collaborative / statement-style prompts into direct question form addressed to the candidate. The output should read as a clear ask FROM interviewer TO candidate. Examples: "Let's start with the data" → "Can you start with the data?". "So maybe walk me through the algorithm side" → "Can you walk me through the algorithm side?". "I'd love to hear about your project" → "Can you tell me about your project?". Keep already-well-formed imperatives as-is: "Tell me about yourself" stays "Tell me about yourself."`;
+- For the interviewer "question" field: REPHRASE collaborative / statement-style prompts into direct question form addressed to the candidate. Examples: "Let's start with the data" → "Can you start with the data?". Keep already-well-formed imperatives as-is.
+- For the candidate "candidateQuestion" field: keep the candidate's own phrasing — they're asking, so it's already a direct ask. Just clean filler and combine clauses.`;
 
   const formatted = utterances
     .map((u) => `[${u.speaker}]: ${u.text}`)
@@ -321,6 +338,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
       state?: string;
       summary?: string;
       question?: string;
+      candidateQuestion?: string;
       questionRelation?: string;
     } = {};
     try {
@@ -335,12 +353,17 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
     const state: MomentStateKind =
       parsed.state === "chitchat" ||
       parsed.state === "interviewer_speaking" ||
-      parsed.state === "question_finalized"
+      parsed.state === "question_finalized" ||
+      parsed.state === "candidate_questioning"
         ? parsed.state
         : "chitchat";
     const summary = (parsed.summary || "").trim();
     const question =
       state === "question_finalized" ? (parsed.question || "").trim() : "";
+    const respCandidateQuestion =
+      state === "candidate_questioning"
+        ? (parsed.candidateQuestion || "").trim()
+        : "";
     const rel = parsed.questionRelation;
     const questionRelation: QuestionRelation =
       rel === "new_topic" || rel === "follow_up" ? rel : null;
@@ -355,11 +378,18 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
       state,
       summary,
       question,
+      candidateQuestion: respCandidateQuestion,
       questionRelation,
       raw: text,
     });
 
-    return NextResponse.json({ state, summary, question, questionRelation });
+    return NextResponse.json({
+      state,
+      summary,
+      question,
+      candidateQuestion: respCandidateQuestion,
+      questionRelation,
+    });
   } catch (e) {
     // Log the full error body (not just status) so we can diagnose why
     // classify-moment fails. Previously the client log showed only
@@ -387,6 +417,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
         state: "chitchat",
         summary: "",
         question: "",
+        candidateQuestion: "",
         questionRelation: null,
       },
       { status: 500 }

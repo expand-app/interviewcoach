@@ -44,6 +44,9 @@ export function LiveView() {
   const displayedComment = useStore((s) => s.liveDisplayedComment);
   const listeningHint = useStore((s) => s.liveListeningHint);
   const warmupCommentary = useStore((s) => s.liveWarmupCommentary);
+  const candidateQuestionCommentary = useStore(
+    (s) => s.liveCandidateQuestionCommentary
+  );
   const timeline = useStore((s) => s.liveTimeline);
   const playbackTime = useStore((s) => s.livePlaybackTime);
   const isUploadMode = useStore((s) => s.liveIsUploadMode);
@@ -462,6 +465,16 @@ export function LiveView() {
                     )
                   : undefined
               }
+              // Live-mode reverse-Q&A text. When the orchestrator's state
+              // machine is in `candidate_questioning`, moment carries the
+              // candidate's current question text on the MomentState
+              // itself (set atomically with the state transition). Pass
+              // it down so the Phase region renders the question.
+              liveCandidateQuestionText={
+                rolesConfirmed && moment.state === "candidate_questioning"
+                  ? moment.candidateQuestion
+                  : undefined
+              }
               labels={{
                 leadHeader: t("Lead Question", "主问题"),
                 warmupHeader: t(
@@ -473,8 +486,8 @@ export function LiveView() {
                   "问题间隙 · 面试官切换话题"
                 ),
                 candidateAskingHeader: t(
-                  "Candidate Q&A",
-                  "候选人提问环节"
+                  "Candidate's Question",
+                  "候选人提问"
                 ),
                 waitingForFirst: t(
                   "Waiting for the interview to begin…",
@@ -502,6 +515,9 @@ export function LiveView() {
               displayed={rolesConfirmed ? effectiveDisplayed : null}
               listeningHint={rolesConfirmed ? effectiveListeningHint : ""}
               warmupCommentary={rolesConfirmed ? warmupCommentary : ""}
+              candidateQuestionCommentary={
+                rolesConfirmed ? candidateQuestionCommentary : ""
+              }
               overrideText={
                 // Timeline mode: the merged stream may surface a
                 // listening hint with no questionId, which the live-mode
@@ -690,6 +706,7 @@ function CurrentQuestionBar({
   hasEverHadLead,
   timelinePhaseKind,
   candidateAskingText,
+  liveCandidateQuestionText,
   labels,
 }: {
   state: MomentStateKind;
@@ -708,6 +725,12 @@ function CurrentQuestionBar({
   timelinePhaseKind?: string;
   /** Upload-mode only: text to show in Row 2 of Candidate Q&A phase. */
   candidateAskingText?: string;
+  /** Live-mode only: the candidate's current question to the interviewer
+   *  during the reverse-Q&A phase. Carried on liveMomentState
+   *  .candidateQuestion when state === "candidate_questioning". When
+   *  set, the Phase region renders "Candidate's Question" + this text,
+   *  parallel to the upload-mode candidate_asking path. */
+  liveCandidateQuestionText?: string;
   labels: {
     leadHeader: string;
     warmupHeader: string;
@@ -742,18 +765,28 @@ function CurrentQuestionBar({
     );
   }
 
-  // Candidate Q&A phase — only renders in upload mode (timeline-driven)
-  // when the model has classified the current segment as candidate_asking.
-  if (timelinePhaseKind === "candidate_asking") {
+  // Candidate's Question phase. Two paths into this layout:
+  //   (a) Upload mode: timelinePhaseKind === "candidate_asking", text
+  //       derived from utterances at current playback position.
+  //   (b) Live mode: state === "candidate_questioning", text carried
+  //       on the moment as `liveCandidateQuestionText` (set atomically
+  //       by the orchestrator when the classifier flips into reverse Q&A).
+  // Same visual; only the source of the text differs.
+  const inCandidateQuestionPhase =
+    timelinePhaseKind === "candidate_asking" ||
+    (state === "candidate_questioning" && !!liveCandidateQuestionText);
+  if (inCandidateQuestionPhase) {
+    const text =
+      timelinePhaseKind === "candidate_asking"
+        ? candidateAskingText
+        : liveCandidateQuestionText;
     return (
       <BarShell>
         <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
           {labels.candidateAskingHeader}
         </div>
         <div className="font-serif text-[17px] leading-snug text-ink font-medium">
-          {candidateAskingText && candidateAskingText.trim().length > 0
-            ? candidateAskingText
-            : "…"}
+          {text && text.trim().length > 0 ? text : "…"}
         </div>
       </BarShell>
     );
@@ -873,6 +906,7 @@ function CommentarySection({
   displayed,
   listeningHint,
   warmupCommentary,
+  candidateQuestionCommentary,
   overrideText,
   labels,
 }: {
@@ -890,6 +924,12 @@ function CommentarySection({
    *  before any Lead Question is locked. Takes the commentary pane when
    *  a Q-A commentary isn't active AND no listening hint is streaming. */
   warmupCommentary: string;
+  /** Reverse-Q&A commentary streamed in while state === "candidate_questioning".
+   *  Evaluates the candidate's question quality (specific vs. generic, ties
+   *  to earlier discussion, suggests follow-up). Takes the commentary pane
+   *  in the candidate_questioning phase, beating Q-A / hint / warm-up which
+   *  don't apply at that point in the interview. */
+  candidateQuestionCommentary: string;
   /** Timeline-mode override: when set, render this text directly and
    *  skip the `displayed.id` → `currentQuestion.comments` lookup. Needed
    *  because timeline entries from the merged commentary+hints stream
@@ -962,6 +1002,16 @@ function CommentarySection({
     return currentQuestion.comments.find((c) => c.id === displayed.id) ?? null;
   }, [overrideText, displayed, currentQuestion]);
 
+  // Candidate-question commentary takes the TOP priority slot when the
+  // session has shifted into reverse Q&A. The prior Q-A commentary
+  // (about the candidate's last answer) is no longer relevant — the
+  // candidate is now asking, and the user wants the question-quality
+  // evaluation. This intentionally overrides even an in-window Q-A
+  // commentary, because the phase has changed.
+  const showCandidateQuestionCommentary =
+    state === "candidate_questioning" &&
+    candidateQuestionCommentary.trim().length > 0;
+
   // Is the Q-A commentary still inside its minimum-display window?
   // While inside, it's "being read" — absolutely nothing can replace it.
   // Once the window expires AND a fresh listening hint is ready, we let
@@ -969,6 +1019,7 @@ function CommentarySection({
   // fresh hint) the Q-A stays visible indefinitely until a new Q-A or a
   // new question arrives.
   const qaStillFresh =
+    !showCandidateQuestionCommentary &&
     !!displayedComment &&
     displayed !== null &&
     Date.now() - displayed.displayedAt < displayed.minMs;
@@ -990,34 +1041,46 @@ function CommentarySection({
   const hintEligibleByState = HINT_VISIBLE_STATES.includes(state);
   const shouldYieldToHint =
     !qaStillFresh && listeningHintFresh && hintEligibleByState;
-  const isShowing = !!displayedComment && !shouldYieldToHint;
+  const isShowing =
+    !showCandidateQuestionCommentary &&
+    !!displayedComment &&
+    !shouldYieldToHint;
 
   // Listening-hint takes the commentary slot whenever a fresh hint is
   // streaming in an eligible state. Priority order inside the pane:
-  //   fresh Q-A commentary > fresh listening-hint > warm-up > idle
+  //   candidate-question commentary > fresh Q-A commentary >
+  //   fresh listening-hint > warm-up > idle
   // Gated on freshness so a stale hint (interviewer went silent ≥ 6s ago)
   // doesn't linger — once stale, we fall through to the observing state.
   const showListeningHint =
-    !isShowing && listeningHintFresh && hintEligibleByState;
+    !showCandidateQuestionCommentary &&
+    !isShowing &&
+    listeningHintFresh &&
+    hintEligibleByState;
 
   // Warm-up commentary takes the pane when candidate is speaking in
   // warm-up phase (no Lead Q locked, no Q-A commentary active, no
   // listening hint streaming). This is coaching on the self-intro.
   const showWarmupCommentary =
+    !showCandidateQuestionCommentary &&
     !isShowing &&
     !showListeningHint &&
     warmupCommentary.trim().length > 0 &&
     !currentQuestion;
 
   // Any moment the pane has nothing concrete to show (no Q-A commentary,
-  // no listening hint, no warm-up commentary) we unify on a single
-  // "AI is observing…" placeholder with animated dots. Previously we
-  // split into five different messages (identifying / waiting-first /
-  // waiting-answer / between-Qs / observing) — too noisy, each transition
-  // felt like the AI changed its mind. The dots + single short line
-  // keeps the pane visually alive and semantically consistent across
-  // every idle state.
-  const isIdle = !isShowing && !showListeningHint && !showWarmupCommentary;
+  // no listening hint, no warm-up commentary, no candidate-question
+  // commentary) we unify on a single "AI is observing…" placeholder
+  // with animated dots. Previously we split into five different messages
+  // (identifying / waiting-first / waiting-answer / between-Qs /
+  // observing) — too noisy, each transition felt like the AI changed
+  // its mind. The dots + single short line keeps the pane visually
+  // alive and semantically consistent across every idle state.
+  const isIdle =
+    !showCandidateQuestionCommentary &&
+    !isShowing &&
+    !showListeningHint &&
+    !showWarmupCommentary;
 
   // Middle pane of the 16:9 frame. Total height is fixed; heading row +
   // pane together fit exactly COMMENTARY_TOTAL_HEIGHT_PX. The pane itself
@@ -1037,7 +1100,21 @@ function CommentarySection({
       </div>
 
       <div className="flex-1 min-h-0 mx-5 mb-3 border border-rule bg-paper-subtle rounded-md overflow-hidden flex">
-        {showListeningHint ? (
+        {showCandidateQuestionCommentary ? (
+          // Candidate-question commentary: same 14.5px black-text
+          // commentary look as the regular Q-A commentary (since both
+          // are evaluative observations, just on different objects —
+          // an answer vs. a question). No special icon / border —
+          // visually distinct from the listen-hint pane (💡 + blue),
+          // and contextualized by the Phase bar above showing
+          // "Candidate's Question".
+          <div
+            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
+            dangerouslySetInnerHTML={{
+              __html: candidateQuestionCommentary || "…",
+            }}
+          />
+        ) : showListeningHint ? (
           // Listening hint visual treatment: 💡 icon column + accent-blue
           // left border + smaller 13.5px font so the user can tell at a
           // glance this is in-the-moment coaching ("listen for X") vs

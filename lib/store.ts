@@ -84,6 +84,15 @@ interface StoreState {
   liveWarmupCommentary: string;
   setLiveWarmupCommentary: (text: string) => void;
 
+  /** Commentary shown when the candidate is asking the interviewer
+   *  questions in the reverse-Q&A phase ("any questions for me?").
+   *  The model evaluates the QUALITY of the candidate's question
+   *  rather than judging an answer. Streams in like listeningHint /
+   *  warmupCommentary; the UI renders this in the commentary pane while
+   *  momentState === "candidate_questioning". */
+  liveCandidateQuestionCommentary: string;
+  setLiveCandidateQuestionCommentary: (text: string) => void;
+
   /** Pending manual speaker-identification prompt for live mode. When a
    *  new dgSpeaker appears with no role assigned and no other role can
    *  be inferred, we set this so the UI renders a floating "Who is
@@ -218,6 +227,9 @@ export const useStore = create<StoreState>()(
   liveWarmupCommentary: "",
   setLiveWarmupCommentary: (liveWarmupCommentary) =>
     set({ liveWarmupCommentary }),
+  liveCandidateQuestionCommentary: "",
+  setLiveCandidateQuestionCommentary: (liveCandidateQuestionCommentary) =>
+    set({ liveCandidateQuestionCommentary }),
   liveSpeakerPrompt: null,
   setLiveSpeakerPrompt: (liveSpeakerPrompt) => set({ liveSpeakerPrompt }),
   resolveSpeakerPrompt: (role) =>
@@ -255,6 +267,7 @@ export const useStore = create<StoreState>()(
       liveAnswerInProgress: false,
       liveListeningHint: "",
       liveWarmupCommentary: "",
+      liveCandidateQuestionCommentary: "",
       liveSpeakerPrompt: null,
       liveTimeline: null,
       livePlaybackTime: 0,
@@ -337,6 +350,7 @@ export const useStore = create<StoreState>()(
       liveAnswerInProgress: false,
       liveListeningHint: "",
       liveWarmupCommentary: "",
+      liveCandidateQuestionCommentary: "",
       liveSpeakerPrompt: null,
       liveTimeline: null,
       livePlaybackTime: 0,
@@ -361,6 +375,7 @@ export const useStore = create<StoreState>()(
       liveAnswerInProgress: false,
       liveListeningHint: "",
       liveWarmupCommentary: "",
+      liveCandidateQuestionCommentary: "",
       liveSpeakerPrompt: null,
       liveTimeline: null,
       livePlaybackTime: 0,
