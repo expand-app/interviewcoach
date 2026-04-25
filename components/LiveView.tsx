@@ -34,6 +34,28 @@ const CAPTIONS_HEADING_HEIGHT_PX = 28;
  *  caption font also shrunk — same line-count visible per lane. */
 const CAPTIONS_LANE_HEIGHT_PX = 60;
 
+/** Length-based reading time for a piece of pane content. Mirrors the
+ *  orchestrator's computeMinDisplayMs (deliberate duplication — keeps
+ *  the orchestrator's internal helper internal). Per the user's spec:
+ *  CJK chars at 4/sec, English words at 2/sec, take the slower side
+ *  (so mixed CJK+English doesn't get cut off), plus a 1500ms buffer.
+ *  Examples:
+ *    200 CJK chars  → 200/4 + 1.5 = 51.5s
+ *    50  CJK chars  → 50/4 + 1.5  = 14s
+ *    20 English words → 20/2 + 1.5 = 11.5s
+ *  Floor 4s (even a one-word comment gets read time), ceiling 90s. */
+function computePaneMinDisplayMs(text: string): number {
+  const FLOOR = 4000;
+  const CEIL = 90000;
+  const BUFFER = 1500;
+  if (!text) return FLOOR;
+  const cjk = (text.match(/[一-鿿]/g) || []).length;
+  const englishWords = text.split(/\s+/).filter((w) => /[a-zA-Z]/.test(w))
+    .length;
+  const readingMs = Math.max(cjk / 4, englishWords / 2) * 1000;
+  return Math.min(CEIL, Math.max(FLOOR, readingMs + BUFFER));
+}
+
 export function LiveView() {
   const t = useTranslations();
   const questions = useStore((s) => s.liveQuestions);
@@ -956,16 +978,21 @@ function CommentarySection({
     return () => clearTimeout(id);
   }, [displayed]);
 
-  // Listening-hint staleness: track when the hint text last changed. If
-  // ≥ LISTENING_HINT_STALE_MS passes with no updates, the interviewer's
-  // thought has ended (they paused / handed off) — we suppress the hint
-  // and fall through to the "AI is observing…" empty state. The
-  // orchestrator streams tokens into `listeningHint` live, so while the
-  // interviewer is actively monologuing the timestamp keeps refreshing
-  // and the hint stays on screen. This also handles the case where the
-  // interviewer completes a thought without an explicit phase change —
-  // e.g. trails off before the classifier fires.
-  const LISTENING_HINT_STALE_MS = 6000;
+  // Listening-hint visibility window: length-based, NOT a fixed 6s.
+  //
+  // The orchestrator streams tokens into `listeningHint` live. Each time
+  // the text changes we refresh `hintChangedAt` — that timestamp anchors
+  // the visibility countdown. While the model is still streaming new
+  // tokens the anchor keeps moving, so the hint stays visible. After the
+  // last token arrives the anchor freezes, and the hint stays on screen
+  // for `computePaneMinDisplayMs(finalText)` more — long enough for the
+  // user to actually read it (e.g. ~51.5s for a 200-char Chinese hint
+  // per the user's spec, vs the old fixed 6s which truncated mid-read).
+  //
+  // Once the window expires, the hint goes "stale" → freshness flag flips
+  // false → the consume-once retire effect (below) clears it from the
+  // store so a stale hint can never come back when nothing else is
+  // showing.
   const [hintChangedAt, setHintChangedAt] = useState<number>(0);
   const lastHintRef = useRef<string>("");
   useEffect(() => {
@@ -974,21 +1001,22 @@ function CommentarySection({
       setHintChangedAt(Date.now());
     }
   }, [listeningHint]);
-  // Schedule a re-render exactly when the staleness threshold elapses,
-  // so the hint visibly clears even if no other state changes nudge us.
+  const hintMinDisplayMs = computePaneMinDisplayMs(listeningHint);
+  // Schedule a re-render exactly when the visibility window elapses, so
+  // the hint visibly clears even if no other state changes nudge us.
   useEffect(() => {
     if (!listeningHint || listeningHint.trim().length === 0) return;
     if (hintChangedAt === 0) return;
     const age = Date.now() - hintChangedAt;
-    const remaining = LISTENING_HINT_STALE_MS - age;
+    const remaining = hintMinDisplayMs - age;
     if (remaining <= 0) return;
     const id = setTimeout(() => setTick((n) => n + 1), remaining + 50);
     return () => clearTimeout(id);
-  }, [listeningHint, hintChangedAt]);
+  }, [listeningHint, hintChangedAt, hintMinDisplayMs]);
   const listeningHintFresh =
     listeningHint.trim().length > 0 &&
     hintChangedAt > 0 &&
-    Date.now() - hintChangedAt < LISTENING_HINT_STALE_MS;
+    Date.now() - hintChangedAt < hintMinDisplayMs;
 
   // Resolve which comment text to show.
   //   - Timeline mode: use overrideText directly (fast path).
@@ -1081,6 +1109,58 @@ function CommentarySection({
     !isShowing &&
     !showListeningHint &&
     !showWarmupCommentary;
+
+  // ============================================================
+  // Consume-once: each piece of content shows ONCE; once it's been
+  // yielded to (or aged out of) the slot, it never comes back.
+  //
+  // The bug this fixes: previously, if Commentary 1 was showing and a
+  // Listening Hint took over, Commentary 1 stayed in `displayedComment`
+  // in the store. When the hint went stale, the priority logic re-
+  // resolved to Commentary 1 → it popped back. Combined with new hints
+  // arriving, the pane visibly flickered Commentary↔Hint↔Commentary↔Hint.
+  //
+  // Fix: derive a single "shown kind" identifier from the priority logic
+  // above, and on every transition AWAY from a non-idle kind, retire that
+  // source's underlying state slot (set it to null / ""). Once retired,
+  // the source can't reappear unless fresh content actually streams in.
+  // ============================================================
+  const setDisplayedComment = useStore((s) => s.setDisplayedComment);
+  const setLiveListeningHint = useStore((s) => s.setLiveListeningHint);
+  const setLiveWarmupCommentary = useStore((s) => s.setLiveWarmupCommentary);
+  const setLiveCandidateQuestionCommentary = useStore(
+    (s) => s.setLiveCandidateQuestionCommentary
+  );
+  type ShownKind = "qa" | "hint" | "warmup" | "candidate-q" | "idle";
+  const showingKind: ShownKind = showCandidateQuestionCommentary
+    ? "candidate-q"
+    : showListeningHint
+    ? "hint"
+    : isShowing
+    ? "qa"
+    : showWarmupCommentary
+    ? "warmup"
+    : "idle";
+  const prevShownKindRef = useRef<ShownKind>("idle");
+  useEffect(() => {
+    const prev = prevShownKindRef.current;
+    if (prev !== showingKind && prev !== "idle") {
+      // Transitioned AWAY from a non-idle kind → retire that source so
+      // it can never re-render (consume-once). Done as a side-effect
+      // post-render so we don't fight React's render pipeline.
+      if (prev === "qa") setDisplayedComment(null);
+      else if (prev === "hint") setLiveListeningHint("");
+      else if (prev === "warmup") setLiveWarmupCommentary("");
+      else if (prev === "candidate-q") setLiveCandidateQuestionCommentary("");
+    }
+    prevShownKindRef.current = showingKind;
+  }, [
+    showingKind,
+    setDisplayedComment,
+    setLiveListeningHint,
+    setLiveWarmupCommentary,
+    setLiveCandidateQuestionCommentary,
+  ]);
 
   // Middle pane of the 16:9 frame. Total height is fixed; heading row +
   // pane together fit exactly COMMENTARY_TOTAL_HEIGHT_PX. The pane itself

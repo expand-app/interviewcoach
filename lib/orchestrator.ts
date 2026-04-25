@@ -73,7 +73,12 @@ const COMMENT_TRIGGER_CHARS = 450;
 // 15s so consecutive comments don't pile up on a long continuous answer.
 const COMMENT_MIN_GAP_MS    = 15000;
 const COMMENT_MIN_DISPLAY_MS = 4000;   // floor — even a 1-word comment shows this long
-const COMMENT_MAX_DISPLAY_MS = 30000;  // ceiling — a very long comment can still be replaced
+// Ceiling raised from 30s to 90s. A 200-char CJK listening hint computes
+// to 50s + 1.5s buffer = 51.5s of true reading time per the user's spec
+// (4 chars/sec). The old 30s cap was clipping long hints far below the
+// time a real reader needs, which compounded the consume-once flicker —
+// the slot expired prematurely and re-yielded to a stale prior comment.
+const COMMENT_MAX_DISPLAY_MS = 90000;
 const COMMENT_BUFFER_MS     = 1500;    // padding on top of computed reading time
 
 // Listening-hint triggers — fire when the interviewer has been
