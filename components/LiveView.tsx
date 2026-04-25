@@ -7,27 +7,32 @@ import type { Comment, MomentStateKind, Question, Utterance } from "@/types/sess
 
 /**
  * The three top sections (Interview Phase, Live Commentary, Live Captions)
- * are laid out as a SINGLE 16:9 landscape block — the same aspect ratio
- * as a horizontal video frame, because the user also renders this block
- * inside an actual video. All three heights are fixed so content is
- * deterministic (prompts are tuned to fit these heights).
+ * stack into the main content area. The block is *roughly* 16:9 at
+ * 920px width but the Phase region is allowed to grow slightly when a
+ * Lead Question's text exceeds 2 lines — readability of the question
+ * is more important than holding a perfect rectangle. Commentary and
+ * Captions stay at fixed heights below.
  *
- * At max-w-[920px] the 16:9 frame is 517.5px tall. We use:
- *   Phase:     90 px
- *   Commentary: 232 px  (heading 28 + pane 204)
- *   Captions:   195 px  (heading 32 + lane 80 + divider 1 + lane 80 + border 2)
+ * Target sizes at 920px width:
+ *   Phase:      ~140 px   (min; grows for long questions)
+ *   Commentary:  226 px   (heading 28 + pane 198)
+ *   Captions:    151 px   (heading 28 + lane 60 + divider 1 + lane 60 + border 2)
  *   ─────────────
- *   Total:     517 px   ≈ 16:9 at 920 px width
+ *   Total:       517 px   (≈ 16:9 at 920 px — same overall as before)
+ *
+ * Captions deliberately got smaller (12-13px text vs 14-15px) so the
+ * Phase region could absorb full-text questions without truncation.
  */
-const PHASE_HEIGHT_PX = 90;
-const COMMENTARY_TOTAL_HEIGHT_PX = 232;
+const PHASE_MIN_HEIGHT_PX = 140;
+const COMMENTARY_TOTAL_HEIGHT_PX = 226;
 const COMMENTARY_HEADING_HEIGHT_PX = 28;
 const COMMENTARY_PANE_HEIGHT_PX =
-  COMMENTARY_TOTAL_HEIGHT_PX - COMMENTARY_HEADING_HEIGHT_PX; // 204
-const CAPTIONS_TOTAL_HEIGHT_PX = 195;
-const CAPTIONS_HEADING_HEIGHT_PX = 32;
-/** Each speaker's caption lane. */
-const CAPTIONS_LANE_HEIGHT_PX = 80;
+  COMMENTARY_TOTAL_HEIGHT_PX - COMMENTARY_HEADING_HEIGHT_PX; // 198
+const CAPTIONS_TOTAL_HEIGHT_PX = 151;
+const CAPTIONS_HEADING_HEIGHT_PX = 28;
+/** Each speaker's caption lane. Smaller (60 vs old 80) since the
+ *  caption font also shrunk — same line-count visible per lane. */
+const CAPTIONS_LANE_HEIGHT_PX = 60;
 
 export function LiveView() {
   const t = useTranslations();
@@ -422,20 +427,14 @@ export function LiveView() {
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-20 max-[900px]:px-5">
 
-          {/* ===== 16:9 LANDSCAPE VIDEO FRAME =====
-              Three stacked sections with deterministic heights summing
-              to ~517 px at 920 px width (16:9). Commentary prompts are
-              tuned to fit the 204 px pane without overflowing. Internal
-              overflow-y-auto is a defensive fallback. */}
-          <div
-            className="border border-rule rounded-md overflow-hidden bg-paper flex flex-col mb-6"
-            style={{
-              height:
-                PHASE_HEIGHT_PX +
-                COMMENTARY_TOTAL_HEIGHT_PX +
-                CAPTIONS_TOTAL_HEIGHT_PX,
-            }}
-          >
+          {/* ===== Coaching frame =====
+              Three stacked sections. Total height is approximately
+              16:9 at 920 px width but the Phase region is allowed to
+              grow when a Lead Question text doesn't fit in 2 lines —
+              question readability beats holding a perfect rectangle.
+              Commentary and Captions are fixed heights; only Phase
+              flexes. */}
+          <div className="border border-rule rounded-md overflow-hidden bg-paper flex flex-col mb-6">
             {/* (1) Current Question — fixed-height top bar. */}
             <CurrentQuestionBar
               state={effectiveState}
@@ -751,7 +750,7 @@ function CurrentQuestionBar({
         <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
           {labels.candidateAskingHeader}
         </div>
-        <div className="font-serif text-[17px] leading-snug text-ink font-medium line-clamp-2">
+        <div className="font-serif text-[17px] leading-snug text-ink font-medium">
           {candidateAskingText && candidateAskingText.trim().length > 0
             ? candidateAskingText
             : "…"}
@@ -763,45 +762,39 @@ function CurrentQuestionBar({
   const showAskingFollowUp =
     !followUp && state === "interviewer_speaking" && !!mainQuestion;
 
-  // Question phase (Lead locked). Typography is constrained so the bar
-  // stays at exactly 90 px:
-  //   - Lead alone: up to 2 lines at 17 px serif.
-  //   - Lead + Probe: lead clamps to 1 line, probe clamps to 1 line.
-  //   - Lead + "interviewer asking probe" status: lead clamps to 1 line.
-  const leadIsTight = !!followUp || showAskingFollowUp;
+  // Question phase (Lead locked). Typography NO LONGER clamped — the
+  // full Lead and Probe text wrap naturally. The Phase region uses
+  // min-height + py-3 padding so the strip grows when text wraps to
+  // 2 or 3 lines. Question readability beats holding a rigid frame.
   if (mainQuestion) {
     return (
       <BarShell>
         <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
           {labels.leadHeader}
         </div>
-        <div
-          className={`font-serif text-[17px] leading-snug text-ink font-medium ${
-            leadIsTight ? "line-clamp-1" : "line-clamp-2"
-          }`}
-        >
+        <div className="font-serif text-[17px] leading-snug text-ink font-medium">
           {mainQuestion.text}
         </div>
 
         {followUp && (
-          <div className="mt-1 pl-3 border-l-2 border-rule">
-            <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider">
+          <div className="mt-2 pl-3 border-l-2 border-rule">
+            <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
               {labels.probeHeader}
             </div>
-            <div className="font-serif text-[13.5px] leading-snug text-ink-light line-clamp-1">
+            <div className="font-serif text-[14px] leading-snug text-ink-light">
               {followUp.text}
             </div>
           </div>
         )}
 
         {showAskingFollowUp && (
-          <div className="mt-1 pl-3 border-l-2 border-rule">
+          <div className="mt-2 pl-3 border-l-2 border-rule">
             <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider inline-flex items-center gap-1.5">
               <BouncingDots />
               {labels.interviewerAskingFollowUp}
             </div>
             {summary && (
-              <div className="text-[12.5px] leading-snug text-ink-light italic line-clamp-1">
+              <div className="text-[12.5px] leading-snug text-ink-light italic">
                 {summary}
               </div>
             )}
@@ -824,7 +817,7 @@ function CurrentQuestionBar({
         {headerText}
       </div>
       {summary ? (
-        <div className="font-serif text-[15px] leading-snug text-ink-light italic line-clamp-2">
+        <div className="font-serif text-[15px] leading-snug text-ink-light italic">
           {summary}
         </div>
       ) : (
@@ -834,18 +827,17 @@ function CurrentQuestionBar({
   );
 }
 
-/** Thin wrapper for the Interview Phase section: a fixed-height strip
- *  inside the 16:9 frame. The outer 16:9 container already provides the
- *  border around the block, so this section just contributes a bottom
- *  divider line between itself and the Commentary pane. Content is
- *  vertically centered and overflow-hidden — prompts are tuned to fit;
- *  defensive clipping keeps the frame rigid if a probe question comes in
- *  unusually long. */
+/** Wrapper for the Interview Phase section. Sits at the top of the
+ *  coaching frame with a bottom divider. Uses min-height instead of a
+ *  fixed height so a Lead Question that wraps to 2-3 lines still
+ *  shows in full — readability beats holding a rigid rectangle. The
+ *  py-3 padding gives the question text room to breathe regardless of
+ *  whether it's 1 line or 3. */
 function BarShell({ children }: { children: React.ReactNode }) {
   return (
     <div
-      className="border-b border-rule px-5 flex flex-col justify-center overflow-hidden shrink-0"
-      style={{ height: PHASE_HEIGHT_PX }}
+      className="border-b border-rule px-5 py-3 flex flex-col justify-center shrink-0"
+      style={{ minHeight: PHASE_MIN_HEIGHT_PX }}
     >
       {children}
     </div>
@@ -1526,12 +1518,12 @@ function CaptionLane({
 
   return (
     <div
-      className="px-4 py-2 flex gap-3 items-start overflow-hidden"
+      className="px-4 py-1.5 flex gap-3 items-start overflow-hidden"
       style={{ height: CAPTIONS_LANE_HEIGHT_PX }}
     >
       <div className="w-[90px] shrink-0">
         <div
-          className={`text-[11px] font-semibold uppercase tracking-wider ${
+          className={`text-[10.5px] font-medium uppercase tracking-wider ${
             isSpeakingNow
               ? "text-accent animate-pulse-label"
               : meta.reserved
@@ -1544,7 +1536,7 @@ function CaptionLane({
       </div>
       <div
         ref={ref}
-        className="flex-1 min-w-0 text-[14px] leading-relaxed text-ink overflow-y-auto no-scrollbar h-full"
+        className="flex-1 min-w-0 text-[12.5px] leading-snug text-ink overflow-y-auto no-scrollbar h-full"
       >
         {meta.reserved ? (
           // Role is known (the other side was tagged) but this speaker
