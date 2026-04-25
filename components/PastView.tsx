@@ -12,6 +12,49 @@ function fmt(sec: number) {
   return `${mm}:${ss}`;
 }
 
+/** Small text button anchored next to the verdict chip, lets the user
+ *  re-fire /api/score-session against the same Session. While in flight,
+ *  swaps the icon for a pulsing dot and disables clicks so a user
+ *  spamming the button doesn't queue duplicate requests. Notion-style:
+ *  no border, hover underlines, sits as a quiet affordance rather than
+ *  competing with the chip. */
+function RefreshScoreButton({
+  onClick,
+  isRefreshing,
+}: {
+  onClick: () => void;
+  isRefreshing: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={isRefreshing}
+      className="shrink-0 inline-flex items-center gap-1.5 text-[11px] text-ink-lighter hover:text-ink disabled:opacity-60 disabled:cursor-not-allowed transition-colors group"
+      title="Re-score this session"
+    >
+      {isRefreshing ? (
+        <>
+          <span className="inline-flex gap-[2px]">
+            <span className="w-[3px] h-[3px] rounded-full bg-ink-lighter animate-bounce-dot" />
+            <span className="w-[3px] h-[3px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.15s]" />
+            <span className="w-[3px] h-[3px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.3s]" />
+          </span>
+          <span>Re-scoring…</span>
+        </>
+      ) : (
+        <>
+          <span className="text-[12px] leading-none group-hover:rotate-180 transition-transform duration-300">
+            ↻
+          </span>
+          <span className="group-hover:underline underline-offset-2">
+            Re-score
+          </span>
+        </>
+      )}
+    </button>
+  );
+}
+
 /**
  * End-of-session scorecard. Three rendering modes:
  *   - No score yet: loading strip (scoring request in flight).
@@ -19,8 +62,30 @@ function fmt(sec: number) {
  *     the model explicitly declined to judge.
  *   - Normal: score / totalMax with verdict chip, per-dimension bars (N/A
  *     dimensions render as a dash with their reason), and improvements.
+ *
+ * Refresh: when `onRefresh` is supplied, both the insufficient-data card
+ * and the normal scorecard expose a small "Re-score" link button that
+ * re-fires /api/score-session against the same Session. Useful when:
+ *   - a session was saved before scoring rules tightened up (the
+ *     answer-text fix landed mid-week, older sessions show insufficient
+ *     even though they have substantive content)
+ *   - the user wants a second opinion / refresh after editing the JD or
+ *     resume on file
+ *   - a transient API hiccup made the first scoring attempt fail
+ *
+ * `isRefreshing` swaps the chip / button into a spinner state so the
+ * user sees the request is in flight; the existing score stays on screen
+ * underneath until the new one lands (no flicker to blank).
  */
-function ScoreCard({ score }: { score?: SessionScore }) {
+function ScoreCard({
+  score,
+  onRefresh,
+  isRefreshing,
+}: {
+  score?: SessionScore;
+  onRefresh?: () => void;
+  isRefreshing?: boolean;
+}) {
   if (!score) {
     return (
       <div className="mb-8 rounded-xl border border-rule bg-paper-subtle px-5 py-4 text-sm text-ink-lighter italic animate-pulse-dot">
@@ -63,15 +128,25 @@ function ScoreCard({ score }: { score?: SessionScore }) {
 
   // Insufficient-data rendering: no score circle, no dimension bars,
   // just the chip and the reason. Improvements are omitted here because
-  // the endpoint returns none in this case.
+  // the endpoint returns none in this case. The Refresh button is
+  // anchored top-right of the chip row so the user can retry without
+  // having to start a new session.
   if (score.verdict === "insufficient_data") {
     return (
       <div className="mb-10 rounded-xl border border-rule bg-paper overflow-hidden">
         <div className="p-5">
-          <div
-            className={`inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${v.chip}`}
-          >
-            {v.label}
+          <div className="flex items-start justify-between gap-3">
+            <div
+              className={`inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${v.chip}`}
+            >
+              {v.label}
+            </div>
+            {onRefresh && (
+              <RefreshScoreButton
+                onClick={onRefresh}
+                isRefreshing={!!isRefreshing}
+              />
+            )}
           </div>
           <p className="mt-2.5 text-[14.5px] leading-relaxed text-ink">
             {score.summary}
@@ -105,10 +180,18 @@ function ScoreCard({ score }: { score?: SessionScore }) {
           </div>
         </div>
         <div className="flex-1 min-w-0">
-          <div
-            className={`inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${v.chip}`}
-          >
-            {v.label} · {score.percent}%
+          <div className="flex items-start justify-between gap-3">
+            <div
+              className={`inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${v.chip}`}
+            >
+              {v.label} · {score.percent}%
+            </div>
+            {onRefresh && (
+              <RefreshScoreButton
+                onClick={onRefresh}
+                isRefreshing={!!isRefreshing}
+              />
+            )}
           </div>
           <p className="mt-2.5 text-[14.5px] leading-relaxed text-ink">
             {score.summary}
@@ -190,10 +273,49 @@ export function PastView() {
   const t = useTranslations();
   const selectedPastId = useStore((s) => s.selectedPastId);
   const pastSessions = useStore((s) => s.pastSessions);
+  const setPastSessionScore = useStore((s) => s.setPastSessionScore);
 
   const session = pastSessions.find((s) => s.id === selectedPastId);
   const [currentTime, setCurrentTime] = useState(0);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const controlsRef = useRef<PlayerControls | null>(null);
+
+  // Re-fire /api/score-session against the same Session payload. Keeps
+  // the existing score visible until the new one lands (no flicker to
+  // the loading strip). On failure, surfaces a small error line under
+  // the card and leaves the prior score intact. Mirrors the original
+  // post-end-of-session call in app/page.tsx but without the toast
+  // dependency — we render the error inline so the user sees it next
+  // to the button they clicked.
+  const refreshScore = async () => {
+    if (!session || isRefreshing) return;
+    setIsRefreshing(true);
+    setRefreshError(null);
+    try {
+      const resp = await fetch("/api/score-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jd: session.jd,
+          resume: session.resume,
+          questions: session.questions,
+          durationSeconds: session.durationSeconds,
+        }),
+      });
+      if (!resp.ok) throw new Error(`Score request failed: ${resp.status}`);
+      const data = (await resp.json()) as { score?: SessionScore };
+      if (data.score) {
+        setPastSessionScore(session.id, data.score);
+      } else {
+        throw new Error("No score returned from server");
+      }
+    } catch (e) {
+      setRefreshError(e instanceof Error ? e.message : "Re-score failed");
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
 
   if (!session) {
     return (
@@ -227,7 +349,16 @@ export function PastView() {
 
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-40 max-[900px]:px-5">
-          <ScoreCard score={session.score} />
+          <ScoreCard
+            score={session.score}
+            onRefresh={refreshScore}
+            isRefreshing={isRefreshing}
+          />
+          {refreshError && (
+            <div className="-mt-7 mb-8 text-[12px] text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-3 py-2">
+              {refreshError}
+            </div>
+          )}
 
           {session.questions.map((q) => {
             const isPlaying = q.id === activeQId;
