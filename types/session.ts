@@ -76,6 +76,16 @@ export interface Question {
    *  the parent's id. undefined for top-level (main) questions. Follow-ups
    *  archive together with their main when a new_topic question arrives. */
   parentQuestionId?: string;
+  /** Concatenated candidate speech that landed under this question — i.e.
+   *  every candidate utterance whose `atSeconds` is between this question's
+   *  `askedAtSeconds` and the next question's `askedAtSeconds` (or end of
+   *  session). Computed once at `endLive` and stashed here so the scoring
+   *  endpoint can grade against the actual answer rather than only the
+   *  in-flight coach commentary. Empty string when no candidate speech
+   *  was attributable to this question (e.g. interviewer pivoted before
+   *  the candidate answered). Optional for backward compatibility with
+   *  sessions saved before this field existed. */
+  answerText?: string;
 }
 
 /** Tracking for the single piece of commentary currently shown in the live

@@ -99,23 +99,64 @@ export async function POST(req: Request) {
     followUps.set(q.parentQuestionId, list);
   }
 
+  // Build the per-question block. CRITICAL: include the candidate's
+  // actual answer text alongside the in-flight coach commentary. The
+  // rubric (Question Addressing / Specificity / Depth / Communication)
+  // requires direct evidence of what was said — commentary alone is
+  // second-hand observation and the model cannot grade reliably from it.
+  // Older sessions saved before answerText existed will have
+  // answerText === undefined; in that case the prompt explicitly notes
+  // that the answer text isn't available so the model knows to lean on
+  // commentary instead of pretending it has nothing.
+  const fmtAnswer = (q: Question): string => {
+    if (typeof q.answerText !== "string") {
+      return "  ANSWER: (not recorded — older session schema; rely on commentary)";
+    }
+    const a = q.answerText.trim();
+    if (a.length === 0) {
+      return "  ANSWER: (no candidate speech attributed to this question)";
+    }
+    // The transcript can be long; pass it whole — Sonnet handles a 32-min
+    // session of plain text easily within the 1500-token output budget +
+    // a multi-thousand-token input. We truncate only at an absurd 8000-
+    // char ceiling per answer to keep the request payload bounded.
+    const trimmed = a.length > 8000 ? a.slice(0, 8000) + "…" : a;
+    return `  ANSWER: ${trimmed}`;
+  };
+
   const qaBlock = mains
     .map((m, i) => {
+      const answerLine = fmtAnswer(m);
       const commentLines = m.comments.length
-        ? m.comments.map((c) => `  · ${stripTags(c.text)}`).join("\n")
-        : "  (no commentary)";
+        ? "  COACH NOTES (in-flight commentary, may include interviewer-reaction reads):\n" +
+          m.comments.map((c) => `    · ${stripTags(c.text)}`).join("\n")
+        : "  COACH NOTES: (none)";
       const probes = followUps.get(m.id) ?? [];
       const probeBlock = probes
         .map((p) => {
+          const pAnswer = fmtAnswer(p);
           const pc = p.comments.length
-            ? p.comments.map((c) => `    · ${stripTags(c.text)}`).join("\n")
-            : "    (no commentary)";
-          return `  ↳ PROBE: ${p.text}\n${pc}`;
+            ? "    COACH NOTES:\n" +
+              p.comments.map((c) => `      · ${stripTags(c.text)}`).join("\n")
+            : "    COACH NOTES: (none)";
+          return `  ↳ PROBE: ${p.text}\n  ${pAnswer}\n${pc}`;
         })
         .join("\n");
-      return `Q${i + 1}. ${m.text}\n${commentLines}${probeBlock ? "\n" + probeBlock : ""}`;
+      return `Q${i + 1}. ${m.text}\n${answerLine}\n${commentLines}${probeBlock ? "\n" + probeBlock : ""}`;
     })
     .join("\n\n");
+
+  // Aggregate stats so the model can sanity-check against the
+  // insufficient-data threshold without having to re-count itself.
+  const totalAnswerChars = questions.reduce(
+    (sum, q) =>
+      sum + (typeof q.answerText === "string" ? q.answerText.trim().length : 0),
+    0
+  );
+  const questionsWithAnswers = questions.filter(
+    (q) =>
+      typeof q.answerText === "string" && q.answerText.trim().length >= 60
+  ).length;
 
   const rubricBlock = DIMENSIONS.map(
     (d) => `- ${d.label} (${d.max} pts, key="${d.key}"): ${d.description}`
@@ -166,14 +207,21 @@ Do NOT output pure English. Do NOT output pure Chinese — keep the bilingual mi
 
 Keep each justification under 25 Chinese characters (English terms don't count). Each improvement: 1-2 sentences, specific to a moment in the transcript.
 
+== TRANSCRIPT STRUCTURE ==
+Each question block contains TWO data sources:
+  - ANSWER: the candidate's verbatim speech captured during the time window between this question and the next. This is the PRIMARY ground truth for grading. It may be filler-heavy or disfluent — that's real speech, score Communication accordingly. If ANSWER says "(not recorded — older session schema; rely on commentary)" then this is a session saved before answer-capture was implemented and you must lean on COACH NOTES.
+  - COACH NOTES: in-flight observations a coach made WHILE the answer was being given. They reflect the coach's read of how the answer landed (interviewer reactions, misses, strengths) and are useful colour but are SECONDARY to the answer itself. Do NOT score the coach's opinion — score the candidate's actual speech. Use COACH NOTES to corroborate or to fill in things you can't see directly (e.g. "interviewer laughed", "interviewer pivoted to a simpler question").
+
+If the answer is short or fragmented but on-topic, that's normal — many real interview answers are. Don't conflate disfluency with lack of substance. Filler ("like", "you know", "kind of") doesn't lower the content score; it lowers the Communication score.
+
 == WHEN THERE ISN'T ENOUGH TO JUDGE ==
 Honesty over false confidence. Two cases — draw the line carefully:
 
-(1) INSUFFICIENT OVERALL — the transcript has almost NO substantive Q&A to work with. Reserved for truly thin sessions. Use this ONLY when one of the following is true:
-  - Session has no substantively-answered question at all (pure chitchat, audio setup, an interrupted intro).
-  - The candidate's speaking content across the whole session is < ~30 seconds worth of words.
-  - Fewer than 2 questions were asked AND no meaningful answer was given.
-  DO NOT use this for a session that covered multiple questions with real answers — even if the session was short-ish (5-10 min) or covered only behavioral questions. If at least one real question has a real answer, score it (some dimensions may be N/A, see below).
+(1) INSUFFICIENT OVERALL — the transcript has almost NO substantive Q&A to work with. Reserved for TRULY thin sessions. Use this ONLY when ALL of the following are true:
+  - Total candidate speech across all ANSWER fields is under ~200 characters of meaningful content.
+  - No question had an answer of at least 2 sentences of on-topic candidate speech.
+  - The session reads as audio setup / chitchat / immediate disconnect, not as a real Q&A.
+  DO NOT use this for a session where at least ONE question has a real candidate answer with concrete content (a project, a metric, a story, a methodology). Even if other questions are thin, score what's there. A 30-minute session with 3+ substantively-answered questions is NEVER insufficient.
   Return:
   {"insufficient": true, "reason": "<specific reason tied to what actually happened — e.g. 'Session ran 4 minutes and ended after the self-introduction; no follow-up question was reached.'>"}
   When insufficient=true, do NOT return dimensions or improvements.
@@ -182,7 +230,7 @@ Honesty over false confidence. Two cases — draw the line carefully:
   - Only behavioral questions asked; no technical / JD-aligned problem → Role Fit is N/A.
   - Candidate only answered self-intro questions; no scoped problem to reason through → Depth & Reasoning is N/A.
   - Very short transcript snippets that don't reveal pacing/filler behavior → Communication is N/A.
-  Set "score": null and use "justification" to explain what was missing. That dimension is excluded from the total. Other dimensions still get scored normally. This is preferred over the insufficient-overall escape hatch whenever there's enough content to score SOME dimensions. Do not use N/A to dodge a harsh score.
+  Set "score": null and use "justification" to explain what was missing. That dimension is excluded from the total. Other dimensions still get scored normally. This is preferred over the insufficient-overall escape hatch whenever there's enough content to score SOME dimensions. Do not use N/A to dodge a harsh score — if you have an ANSWER you can grade, grade it.
 
 == OUTPUT (strict JSON, no prose wrapper) ==
 
@@ -218,13 +266,17 @@ ${resume ? `=== CANDIDATE RESUME ===
 ${resume}
 === END RESUME ===
 
-` : ""}=== INTERVIEW TRANSCRIPT (questions + live commentary, in order) ===
+` : ""}=== INTERVIEW TRANSCRIPT (questions, candidate answers, coach notes — in order) ===
 ${qaBlock}
 === END TRANSCRIPT ===
 
-Session duration: ${Math.round(durationSeconds / 60)} minutes, ${mains.length} main question${mains.length === 1 ? "" : "s"} covered.
+Session stats:
+- Duration: ${Math.round(durationSeconds / 60)} minutes
+- Main questions: ${mains.length}
+- Questions with substantive candidate answers (≥ 60 chars): ${questionsWithAnswers}
+- Total candidate speech (across all answers): ${totalAnswerChars} characters
 
-Score the interview. Return JSON only.`;
+Score the interview. Return JSON only. Remember: the ANSWER fields are ground truth — grade against them, with COACH NOTES as supporting colour.`;
 
   try {
     const client = getAnthropicClient();

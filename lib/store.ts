@@ -325,12 +325,55 @@ export const useStore = create<StoreState>()(
 
   endLive: (title, audioUrl) => {
     const s = get();
+    // Hydrate each Question with its candidate-answer text BEFORE we wipe
+    // liveUtterances — the scoring endpoint needs the actual answer
+    // content, not just the in-flight coach commentary, to grade the
+    // rubric (Question Addressing / Specificity / Depth / Communication
+    // all reference what the candidate ACTUALLY said).
+    //
+    // Bucket: for each question Q at askedAt T, gather candidate
+    // utterances u where T <= u.atSeconds < nextQ.askedAtSeconds (or end
+    // of session for the last Q). "candidate" is resolved via
+    // liveSpeakerRoles[u.dgSpeaker]. Utterances with unresolved roles
+    // are skipped — better to omit than to mis-attribute interviewer
+    // speech as a candidate answer.
+    const sortedQs = [...s.liveQuestions].sort(
+      (a, b) => a.askedAtSeconds - b.askedAtSeconds
+    );
+    const sessionEndSec = s.live.elapsedSeconds;
+    const questionsWithAnswers = sortedQs.map((q, i) => {
+      const startSec = q.askedAtSeconds;
+      const endSec =
+        i + 1 < sortedQs.length ? sortedQs[i + 1].askedAtSeconds : sessionEndSec;
+      const answerParts: string[] = [];
+      for (const u of s.liveUtterances) {
+        if (u.atSeconds < startSec || u.atSeconds >= endSec) continue;
+        if (u.dgSpeaker === undefined) continue;
+        const role = s.liveSpeakerRoles[u.dgSpeaker];
+        if (role !== "candidate") continue;
+        const t = u.text.trim();
+        if (!t) continue;
+        answerParts.push(t);
+      }
+      return { ...q, answerText: answerParts.join(" ").trim() };
+    });
+    // Re-key by id to preserve original insertion order (Question objects
+    // are stored chronologically already; sort above was just for the
+    // bucketing pass — restore the original order to keep ids stable
+    // for any past UI that lookups by index).
+    const idToWithAnswer = new Map(
+      questionsWithAnswers.map((q) => [q.id, q])
+    );
+    const finalQuestions = s.liveQuestions.map(
+      (q) => idToWithAnswer.get(q.id) ?? q
+    );
+
     const session: Session = {
       id: `sess-${Date.now()}`,
       title,
       jd: s.liveJd,
       resume: s.liveResume,
-      questions: s.liveQuestions,
+      questions: finalQuestions,
       startedAt: new Date(
         Date.now() - s.live.elapsedSeconds * 1000
       ).toISOString(),
