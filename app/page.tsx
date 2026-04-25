@@ -41,6 +41,16 @@ export default function Page() {
   const [showEnd, setShowEnd] = useState(false);
   const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+  // Closing-detection prompt: surfaces when the orchestrator detects a
+  // mutual-goodbye + 3s silence pattern. User picks save (one-click End
+  // & Save with the auto-derived liveTitle) or "continue recording"
+  // (permanently silences future closing-detection fires this session).
+  const [showClosingPrompt, setShowClosingPrompt] = useState(false);
+  useEffect(() => {
+    const handler = () => setShowClosingPrompt(true);
+    window.addEventListener("ic:closing-detected", handler);
+    return () => window.removeEventListener("ic:closing-detected", handler);
+  }, []);
 
   // Toast state (simple non-intrusive error notifications)
   const [toast, setToast] = useState<string | null>(null);
@@ -346,6 +356,45 @@ export default function Page() {
         onConfirm={() => {
           if (deleteTarget) deletePast(deleteTarget.id);
           setDeleteTarget(null);
+        }}
+      />
+
+      {/* Closing-detected prompt — fired by the orchestrator when the
+          classifier flips into `closing` and no substantive utterance
+          arrives within 3 seconds. Two options:
+            - Continue recording: permanently silences future closing-
+              detection fires this session (calls
+              orchestrator.disableClosingDetection()) and dismisses.
+            - Save & view scoring: one-click End & Save with the
+              auto-derived liveTitle, then jumps to the Past view.
+              Skips the title-prompt modal — the user can rename later
+              from the past sessions list. */}
+      <ConfirmModal
+        open={showClosingPrompt}
+        title={t(
+          "Looks like the interview just wrapped up",
+          "面试似乎已经结束"
+        )}
+        description={t(
+          "Detected a goodbye exchange and 3 seconds of silence. Save now and view the scorecard?",
+          "检测到对话已收尾且双方静默超过 3 秒。要现在保存并查看评分吗?"
+        )}
+        confirmLabel={t("Save & view scoring", "保存并查看评分")}
+        cancelLabel={t("Continue recording", "继续录制")}
+        onCancel={() => {
+          setShowClosingPrompt(false);
+          getOrchestrator().disableClosingDetection();
+        }}
+        onConfirm={() => {
+          setShowClosingPrompt(false);
+          // One-click save: use the auto-derived live title (or a
+          // generic fallback). Routes through handleEndConfirm — same
+          // flow as the manual End & Save button, including audioUrl
+          // pickup, scoreSessionAsync fire, and selectPast(saved.id)
+          // which jumps to the scorecard view.
+          const titleForSave =
+            liveTitle || t("Live Interview Session", "面试录制");
+          void handleEndConfirm(titleForSave);
         }}
       />
 

@@ -25,7 +25,8 @@ type MomentStateKind =
   | "chitchat"
   | "interviewer_speaking"
   | "question_finalized"
-  | "candidate_questioning";
+  | "candidate_questioning"
+  | "closing";
 
 type QuestionRelation = "new_topic" | "follow_up" | null;
 
@@ -206,6 +207,12 @@ When in doubt about a non-question utterance, return state = "chitchat" so no qu
     1. msSinceLastTranscript >= 3000 OR the candidate has substantively started answering (>= 20 chars of first-person speech in the most recent turn), AND
     2. the accumulated interviewer text forms a complete, coherent question (interrogative or clear imperative ask), AND
     3. the question does NOT trail off into a transition word.
+- "closing": the interview is wrapping up — both sides are saying goodbye, thanking each other, or one side has clearly concluded ("that's about all the time we have", "thanks for your time, we'll be in touch", "have a good day"). Triggers when ANY of these patterns appear in the last few turns:
+    • Mutual goodbye / thanks: interviewer says "thank you for your time" or "great conversation" or "we'll be in touch" or "have a good day" AND candidate says "thank you" / "have a good week" / "goodbye" / "talk to you later".
+    • Explicit conclusion from interviewer: "that's all the time we have", "we're at time", "I'll let you go", "we have your contact info, we'll follow up".
+    • Candidate signals end + interviewer accepts: candidate says "that's all my questions" / "no more questions from me" and interviewer responds with a closing pleasantry rather than another substantive question.
+    • The session has been in candidate_questioning and the candidate just said "no more questions" / "that's all".
+  Do NOT enter closing on a single polite "thanks" mid-interview — closing requires BOTH sides to be in the goodbye register, OR a clear "we're done" statement from the interviewer. If only one side is saying goodbye and the other might still continue, stay in the previous state.
 - "candidate_questioning": the reverse Q&A near the end of the interview. ALL of these must hold:
     1. The interviewer has clearly handed the floor over — explicit cue like "do you have any questions for me?", "any questions for us?", "anything you want to ask?", or "we have time for your questions" within the last few turns. OR the candidate has asked TWO consecutive substantive questions about the team/role/process and the interviewer has been answering them.
     2. The candidate's most recent utterance IS a substantive question to the interviewer about the role / team / company / process — NOT a one-off clarification embedded in their own answer. Examples: "What does the team look like?", "How does the team measure success?", "What's the day-to-day for this role?", "What are the biggest challenges the team is facing?", "How is the on-call rotation set up?", "What's the next step after this interview?".
@@ -232,7 +239,7 @@ If currentMainQuestionText (the current Lead Question) is non-empty, be VERY con
 
 == OUTPUT (JSON only, no prose) ==
 {
-  "state": "chitchat" | "interviewer_speaking" | "question_finalized" | "candidate_questioning",
+  "state": "chitchat" | "interviewer_speaking" | "question_finalized" | "candidate_questioning" | "closing",
   "summary": "<one short human-readable line for the UI top bar>",
   "question": "<cleaned question text — only when state=question_finalized, otherwise empty>",
   "candidateQuestion": "<cleaned candidate question text — only when state=candidate_questioning, otherwise empty>",
@@ -354,7 +361,8 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
       parsed.state === "chitchat" ||
       parsed.state === "interviewer_speaking" ||
       parsed.state === "question_finalized" ||
-      parsed.state === "candidate_questioning"
+      parsed.state === "candidate_questioning" ||
+      parsed.state === "closing"
         ? parsed.state
         : "chitchat";
     const summary = (parsed.summary || "").trim();

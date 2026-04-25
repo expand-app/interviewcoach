@@ -337,6 +337,27 @@ export class LiveOrchestrator {
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private classifyInFlight = false;
 
+  // === Closing-detection (interview-end) state ===
+  // When the classifier flips moment state to "closing" (mutual goodbye
+  // / "thanks for your time" / "we'll be in touch"), we arm a 3s
+  // silence timer. If no substantive utterance (>10 chars) lands within
+  // that window, the interview is genuinely over — fire `ic:closing-
+  // detected` so the UI can prompt "Save now?". User-side outcomes:
+  //   - "Save & view scoring" → normal End & Save flow
+  //   - "Continue recording"  → call `disableClosingDetection()` so we
+  //     never fire again this session (prevents annoyance loops where
+  //     the classifier keeps flapping in and out of closing).
+  // Single-shot per session: once fired (or once the user dismissed),
+  // `closingDetectionDisabled` flips true and stays that way.
+  private closingSilenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private closingDetectionDisabled = false;
+  private closingDetectionFired = false;
+  /** ms; tunable via the user spec ("3-second silence after closing"). */
+  private static CLOSING_SILENCE_MS = 3000;
+  /** ms; minimum utterance length that counts as "they're still talking,
+   *  cancel the closing timer". Filler like "yeah" / "ok" doesn't count. */
+  private static CLOSING_UTTERANCE_MIN_CHARS = 10;
+
   async start(
     options: { captureTabAudio?: "auto" | "on" | "off" } = {}
   ) {
@@ -1067,6 +1088,16 @@ export class LiveOrchestrator {
     if (!clean) return;
 
     this.recentTranscript = (this.recentTranscript + " " + clean).slice(-1200);
+
+    // Closing-silence timer: any substantive (≥10 char) utterance means
+    // the interview isn't over after all — cancel the pending prompt.
+    // Filler ("yeah", "ok", "thanks") under 10 chars doesn't count.
+    if (
+      this.closingSilenceTimer &&
+      clean.length >= LiveOrchestrator.CLOSING_UTTERANCE_MIN_CHARS
+    ) {
+      this.cancelClosingSilenceTimer("substantive-utterance");
+    }
 
     {
       const state = useStore.getState();
@@ -2057,6 +2088,74 @@ export class LiveOrchestrator {
     if (next === "interviewer_speaking" || next === "chitchat") {
       this.pendingAnswerBuffer = "";
     }
+    // Closing-state side effect: arm the 3-second silence timer so we
+    // can detect a mutual-goodbye + silence pattern and prompt the user
+    // to End & Save. Single-shot per session.
+    if (next === "closing") {
+      this.armClosingSilenceTimer();
+    }
+  }
+
+  // ============================================================
+  // Closing-detection helpers
+  // ============================================================
+
+  /** Arm the 3-second silence timer when state enters "closing". A
+   *  substantive utterance (>10 chars, see onUtterance) cancels it.
+   *  No-op once fired or once user opted to keep recording. */
+  private armClosingSilenceTimer(): void {
+    if (this.closingDetectionDisabled) return;
+    if (this.closingDetectionFired) return;
+    if (this.closingSilenceTimer) {
+      clearTimeout(this.closingSilenceTimer);
+    }
+    log("closing", "armed", {
+      ms: LiveOrchestrator.CLOSING_SILENCE_MS,
+    });
+    this.closingSilenceTimer = setTimeout(() => {
+      this.closingSilenceTimer = null;
+      if (this.closingDetectionDisabled) return;
+      // Verify we're STILL in closing at fire time. If the classifier
+      // moved us back to interviewer_speaking / chitchat in the
+      // intervening 3s (e.g. interviewer pivoted to "actually one more
+      // question…"), silently abandon — don't prompt the user to save
+      // when the interview clearly isn't over.
+      const stateNow = useStore.getState().liveMomentState.state;
+      if (stateNow !== "closing") {
+        log("closing", "abandoned", { stateNow });
+        return;
+      }
+      this.closingDetectionFired = true;
+      log("closing", "fired", {});
+      // Dispatch to the UI. Caught by LiveView, which renders the
+      // "Save now?" confirmation dialog. If the user picks "continue
+      // recording", they'll call disableClosingDetection() to silence
+      // future fires.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("ic:closing-detected"));
+      }
+    }, LiveOrchestrator.CLOSING_SILENCE_MS);
+  }
+
+  /** Cancel the in-flight closing-silence timer. Called from
+   *  onUtterance whenever a substantive utterance lands — speech
+   *  means the interview isn't over. */
+  private cancelClosingSilenceTimer(reason: string): void {
+    if (this.closingSilenceTimer) {
+      clearTimeout(this.closingSilenceTimer);
+      this.closingSilenceTimer = null;
+      log("closing", "cancelled", { reason });
+    }
+  }
+
+  /** Public hook for the UI to call when the user picks "continue
+   *  recording" from the closing-detected dialog. Permanently disables
+   *  closing detection for the rest of this session so the dialog
+   *  doesn't keep popping every time the classifier re-enters closing. */
+  public disableClosingDetection(): void {
+    this.closingDetectionDisabled = true;
+    this.cancelClosingSilenceTimer("user-dismissed-dialog");
+    log("closing", "disabled-by-user", {});
   }
 
   // ============================================================

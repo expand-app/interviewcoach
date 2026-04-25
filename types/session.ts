@@ -21,11 +21,18 @@ export type MomentStateKind =
   | "chitchat"              // small talk, intros, audio check
   | "interviewer_speaking"  // interviewer is mid-question, not yet finalized
   | "question_finalized"    // a complete question is ready; commentary can flow
-  | "candidate_questioning"; // reverse Q&A: candidate is asking the interviewer
+  | "candidate_questioning" // reverse Q&A: candidate is asking the interviewer
                               // questions ("what does the team look like?",
                               // "what's the day-to-day?"). UI top bar switches
                               // to "Candidate's Question" mode and commentary
                               // evaluates the QUESTION quality, not an answer.
+  | "closing";              // both sides have entered goodbye register
+                              // ("thanks for your time, we'll be in touch",
+                              // "have a good day"). Once detected, the
+                              // orchestrator starts a 3s silence timer; if no
+                              // new substantive utterance arrives, it dispatches
+                              // ic:closing-detected so the UI can prompt the
+                              // user to End & Save.
 
 export interface MomentState {
   state: MomentStateKind;
