@@ -249,6 +249,14 @@ export interface Session {
   durationSeconds: number;
   /** Raw audio blob URL (object URL, lost on refresh since we don't persist). */
   audioUrl?: string;
+  /** Screen-recording blob URL — populated when the user enabled the
+   *  "Also record screen video" option AND successfully shared a tab/
+   *  window with a video track. Same blob-URL caveat as audioUrl: lost
+   *  on refresh because there is no server-side storage. The Past
+   *  Session view shows a Video block + download button when this is
+   *  set; the download is the only way to keep the recording past the
+   *  current tab session. */
+  videoUrl?: string;
   /** Overall assessment — undefined while scoring is in flight. Once
    *  set, scoring is finalized (success or insufficient_data verdict).
    *  See `scoreError` for the failure case. */

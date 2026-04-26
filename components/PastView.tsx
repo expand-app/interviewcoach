@@ -354,6 +354,66 @@ function ScoreCard({
   );
 }
 
+/**
+ * Screen recording playback + download for a past session.
+ *
+ * Only mounted when session.videoUrl is set (recording was enabled
+ * and the share included a video track). The video element is
+ * native HTML5 + browser default controls — keeps this lightweight
+ * and works for whatever WebM (vp9 / vp8 / fallback) the recorder
+ * happened to produce.
+ *
+ * The download button generates an `<a download>` from the same
+ * blob URL the player uses. File name embeds the session title +
+ * date for easy file-tree organization.
+ */
+function VideoSection({
+  videoUrl,
+  sessionTitle,
+}: {
+  videoUrl: string;
+  sessionTitle: string;
+}) {
+  // Sanitize the title into a filesystem-safe filename — strip
+  // characters Windows / macOS will choke on or that browsers will
+  // refuse, and trim length to keep the suggested filename readable.
+  const downloadName = (() => {
+    const safe = sessionTitle
+      .replace(/[\\/:*?"<>|]+/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80);
+    const stamp = new Date().toISOString().slice(0, 10);
+    return `${safe || "interview-recording"} — ${stamp}.webm`;
+  })();
+  return (
+    <div className="rounded-md border border-rule overflow-hidden bg-paper mb-8">
+      <div className="px-5 py-3 border-b border-rule flex items-center justify-between">
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-lighter">
+          Recording
+        </div>
+        <a
+          href={videoUrl}
+          download={downloadName}
+          className="text-[12px] font-medium text-accent hover:underline inline-flex items-center gap-1"
+        >
+          ↓ Download (.webm)
+        </a>
+      </div>
+      <video
+        src={videoUrl}
+        controls
+        preload="metadata"
+        className="w-full bg-black"
+      />
+      <div className="px-5 py-2 text-[11px] text-ink-lighter italic border-t border-rule">
+        Held in browser memory — closing or refreshing this tab will
+        erase the recording. Download to keep it.
+      </div>
+    </div>
+  );
+}
+
 export function PastView() {
   const t = useTranslations();
   const selectedPastId = useStore((s) => s.selectedPastId);
@@ -480,6 +540,18 @@ export function PastView() {
             <div className="-mt-7 mb-8 text-[12px] text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-3 py-2">
               {refreshError}
             </div>
+          )}
+
+          {/* Screen recording — shown only when the session was captured
+              with "Also record screen video" enabled AND the user shared
+              a tab/window with a video track. The blob URL is in-memory
+              and dies on tab close / refresh; download is the only way
+              to keep it long-term. */}
+          {session.videoUrl && (
+            <VideoSection
+              videoUrl={session.videoUrl}
+              sessionTitle={session.title}
+            />
           )}
 
           {session.questions.map((q) => {

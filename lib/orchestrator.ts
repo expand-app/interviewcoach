@@ -407,17 +407,22 @@ export class LiveOrchestrator {
   private static CLOSING_UTTERANCE_MIN_CHARS = 10;
 
   async start(
-    options: { captureTabAudio?: "auto" | "on" | "off" } = {}
+    options: {
+      captureTabAudio?: "auto" | "on" | "off";
+      captureVideo?: boolean;
+    } = {}
   ) {
     if (this.audio) return;
     resetClientLog();
     log("session", "start", {
       mode: "live",
       captureTabAudio: options.captureTabAudio ?? "auto",
+      captureVideo: options.captureVideo ?? false,
     });
     this.resetSessionState();
     this.audio = new AudioSession(this.makeCallbacks(), {
       captureTabAudio: options.captureTabAudio ?? "auto",
+      captureVideo: options.captureVideo ?? false,
     });
     await this.audio.start();
   }
@@ -1079,6 +1084,14 @@ export class LiveOrchestrator {
         this.onUtterance(text, speaker, duration),
       onAudioReady: (audioUrl: string) => {
         (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = audioUrl;
+      },
+      onVideoReady: (videoUrl: string) => {
+        // Symmetric to audioUrl: stash on window so app/page.tsx's
+        // End-&-Save flow can read it and pass to endLive(). Cleared
+        // there after consumption so a stale URL can't leak into the
+        // next session.
+        (window as unknown as { __ic_videoUrl?: string }).__ic_videoUrl =
+          videoUrl;
       },
       onError: (msg: string) => {
         window.dispatchEvent(new CustomEvent("ic:error", { detail: msg }));

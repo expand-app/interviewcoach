@@ -27,6 +27,14 @@ export interface AudioSessionCallbacks {
   onFinalTranscript: (text: string, speaker?: number, duration?: number) => void;
   onInterimTranscript: (text: string) => void;
   onAudioReady: (audioUrl: string, duration: number) => void;
+  /** Fired alongside onAudioReady when captureVideo was enabled and the
+   *  user successfully shared a tab/window. The blob is a WebM with
+   *  video (vp9) + the same mixed audio track Deepgram saw, so playback
+   *  matches the transcript. Not fired when captureVideo was off, when
+   *  the share dialog was declined, or when the share had no video
+   *  track (audio-only share). The URL is a browser blob URL — only
+   *  valid for the lifetime of the page tab. */
+  onVideoReady?: (videoUrl: string, duration: number) => void;
   onError: (msg: string) => void;
   /** Fired when playback-driven capture reaches the end of the file.
    *  Live mic capture never calls this. Used to show a "recording complete —
@@ -86,6 +94,11 @@ const DEEPGRAM_QUERY = new URLSearchParams({
  */
 export interface AudioSessionOptions {
   captureTabAudio?: "auto" | "on" | "off";
+  /** When true AND the user accepts the tab/window share prompt with a
+   *  video track, retain the video track and record a parallel WebM
+   *  with video + mixed audio. Calls onVideoReady on stop().
+   *  No-op when captureTabAudio is "off" or the user declined the share. */
+  captureVideo?: boolean;
 }
 
 /** Check whether the current default audio output is likely an earphone /
@@ -121,6 +134,14 @@ export class AudioSession {
   private audioContext: AudioContext | null = null;
   private recorder: MediaRecorder | null = null;
   private audioChunks: Blob[] = [];
+  /** Optional second recorder for video+audio output. Only spun up when
+   *  options.captureVideo is true AND tab share included a video track. */
+  private videoRecorder: MediaRecorder | null = null;
+  private videoChunks: Blob[] = [];
+  /** Combined stream fed to videoRecorder: video track from tab share +
+   *  the same mixed audio destination Deepgram receives. Held so we
+   *  can release it cleanly on stop. */
+  private videoStream: MediaStream | null = null;
   private startTime = 0;
   private stopped = false;
   private paused = false;
@@ -172,8 +193,11 @@ export class AudioSession {
     if (shouldCaptureTab) {
       try {
         this.tabStream = await navigator.mediaDevices.getDisplayMedia({
-          // video:true is required by Chrome for the audio track to exist;
-          // we stop the video tracks immediately below.
+          // video:true is required by Chrome for the audio track to exist.
+          // We stop the video tracks immediately below UNLESS the caller
+          // wants the screen recording (captureVideo option), in which
+          // case we keep them alive and feed them into a parallel WebM
+          // recorder.
           video: true,
           audio: {
             echoCancellation: false,
@@ -181,7 +205,9 @@ export class AudioSession {
             autoGainControl: false,
           },
         });
-        for (const t of this.tabStream.getVideoTracks()) t.stop();
+        if (!this.options.captureVideo) {
+          for (const t of this.tabStream.getVideoTracks()) t.stop();
+        }
         if (this.tabStream.getAudioTracks().length === 0) {
           // User didn't check "Share audio" — useless without it.
           for (const t of this.tabStream.getTracks()) t.stop();
@@ -216,6 +242,27 @@ export class AudioSession {
       this.mediaStream = dest.stream;
     } else {
       this.mediaStream = this.micStream;
+    }
+
+    // 1c) Build the parallel video+audio stream IF caller requested
+    //     captureVideo AND tab share included a video track. We use the
+    //     EXACT same mixed audio destination as Deepgram + the recording
+    //     blob, so video playback audio matches the transcript exactly.
+    //     If captureVideo was requested but no video track survived
+    //     (audio-only share, or share declined), we silently skip — the
+    //     audio recording is still produced.
+    if (
+      this.options.captureVideo &&
+      this.tabStream &&
+      this.tabStream.getVideoTracks().length > 0
+    ) {
+      const videoTracks = this.tabStream.getVideoTracks();
+      // Pull audio from this.mediaStream (the mic+tab mix when tab audio
+      // is present, or just the mic stream when not). This way the
+      // recording always has both sides of the conversation regardless
+      // of which path the audio path took.
+      const audioTracks = this.mediaStream.getAudioTracks();
+      this.videoStream = new MediaStream([...videoTracks, ...audioTracks]);
     }
 
     // 2) Get a Deepgram credential from our server route. The route returns
@@ -358,16 +405,49 @@ export class AudioSession {
     };
     // 250ms chunks: low enough latency, big enough to be a complete container fragment.
     this.recorder.start(250);
+
+    // Parallel video+audio recorder for the screen recording, when
+    // captureVideo was requested and we have a video stream. Larger
+    // chunks here (1s) — no Deepgram latency requirement, just a
+    // playable artifact at the end. VP9 + Opus is the broadly-supported
+    // WebM combo; we fall back to default WebM if VP9 isn't available
+    // (older browsers).
+    if (this.videoStream) {
+      const videoMime = MediaRecorder.isTypeSupported(
+        "video/webm;codecs=vp9,opus"
+      )
+        ? "video/webm;codecs=vp9,opus"
+        : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
+        ? "video/webm;codecs=vp8,opus"
+        : "video/webm";
+      try {
+        this.videoRecorder = new MediaRecorder(this.videoStream, {
+          mimeType: videoMime,
+        });
+        this.videoRecorder.ondataavailable = (e) => {
+          if (e.data.size === 0) return;
+          this.videoChunks.push(e.data);
+        };
+        this.videoRecorder.start(1000);
+      } catch {
+        // If MediaRecorder construction fails (rare — codec mismatch
+        // or some headless context), don't fail the session — just skip
+        // the video recording. Audio path is unaffected.
+        this.videoRecorder = null;
+      }
+    }
   }
 
   pause() {
     this.paused = true;
     if (this.recorder?.state === "recording") this.recorder.pause();
+    if (this.videoRecorder?.state === "recording") this.videoRecorder.pause();
   }
 
   resume() {
     this.paused = false;
     if (this.recorder?.state === "paused") this.recorder.resume();
+    if (this.videoRecorder?.state === "paused") this.videoRecorder.resume();
   }
 
   async stop() {
@@ -393,6 +473,19 @@ export class AudioSession {
       await new Promise<void>((resolve) => {
         this.recorder!.onstop = () => resolve();
         this.recorder!.stop();
+      });
+    }
+
+    // Stop the parallel video recorder if we started one. Independent
+    // promise — failure here doesn't block the audio path.
+    if (this.videoRecorder && this.videoRecorder.state !== "inactive") {
+      await new Promise<void>((resolve) => {
+        this.videoRecorder!.onstop = () => resolve();
+        try {
+          this.videoRecorder!.stop();
+        } catch {
+          resolve();
+        }
       });
     }
 
@@ -424,11 +517,22 @@ export class AudioSession {
     // The mediaStream reference either was the mic stream (already stopped)
     // or a mixed stream whose sources we just released — drop it either way.
     this.mediaStream = null;
+    // videoStream's underlying tracks were all owned by tabStream and
+    // mediaStream above, both already stopped. Just drop the wrapper.
+    this.videoStream = null;
 
     // Hand back the recorded audio.
     const blob = new Blob(this.audioChunks, { type: "audio/webm" });
     const url = URL.createObjectURL(blob);
     this.callbacks.onAudioReady(url, duration);
+
+    // Hand back the recorded video, if any. Skip when nothing was
+    // captured (captureVideo off, or share declined / no video track).
+    if (this.videoChunks.length > 0 && this.callbacks.onVideoReady) {
+      const videoBlob = new Blob(this.videoChunks, { type: "video/webm" });
+      const videoUrl = URL.createObjectURL(videoBlob);
+      this.callbacks.onVideoReady(videoUrl, duration);
+    }
   }
 }
 

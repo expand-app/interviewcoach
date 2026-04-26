@@ -11,13 +11,18 @@ interface Props {
   /** jd, resume: always present. file: present iff mode === "upload".
    *  captureSystemAudio: only meaningful in live mode — when true, the
    *  AudioSession will prompt for tab/window share with audio so Zoom
-   *  meetings, browser playback, etc. are picked up alongside the mic. */
+   *  meetings, browser playback, etc. are picked up alongside the mic.
+   *  captureVideo: only effective when captureSystemAudio is also true —
+   *  if so, the same tab/window share retains its video track and a
+   *  WebM screen recording is saved on the session for later playback +
+   *  download from the Past Session view. */
   onStart: (args: {
     mode: StartMode;
     jd: string;
     resume: string;
     file?: File;
     captureSystemAudio?: boolean;
+    captureVideo?: boolean;
   }) => void;
 }
 
@@ -32,6 +37,11 @@ export function StartModal({ open, onCancel, onStart }: Props) {
   // when this is off, so flipping off is a safe explicit override
   // (e.g. in-room interview with laptop speakers).
   const [captureSystemAudio, setCaptureSystemAudio] = useState(true);
+  // Default ON when system audio is on: the same browser share dialog
+  // already has a video track piggy-backed; we just keep it instead
+  // of stopping it. Cost: ~50-150 MB per 30-min session held in tab
+  // memory. User can flip off if they only need transcript / scoring.
+  const [captureVideo, setCaptureVideo] = useState(true);
 
   useEffect(() => {
     if (open) {
@@ -40,6 +50,7 @@ export function StartModal({ open, onCancel, onStart }: Props) {
       setResume("");
       setFile(null);
       setCaptureSystemAudio(true);
+      setCaptureVideo(true);
     }
   }, [open]);
 
@@ -84,7 +95,10 @@ export function StartModal({ open, onCancel, onStart }: Props) {
         {/* System-audio capture toggle (live mode only). When ON, the
             session prompts for a tab/window share with "Share tab audio"
             checked, so Zoom meeting audio + browser playback get
-            transcribed alongside the mic. Default ON. */}
+            transcribed alongside the mic. Default ON.
+            The "Also record screen video" sub-checkbox piggybacks on the
+            same browser share — no extra dialog. Disabled / hidden when
+            system audio is off because there's no share to attach to. */}
         {mode === "live" && (
           <div className="mb-4 px-3.5 py-3 rounded-md border border-rule bg-paper-subtle">
             <label className="flex items-start gap-2.5 cursor-pointer">
@@ -112,6 +126,28 @@ export function StartModal({ open, onCancel, onStart }: Props) {
                 </span>
               </span>
             </label>
+            {captureSystemAudio && (
+              <label className="mt-2 ml-6 flex items-start gap-2.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={captureVideo}
+                  onChange={(e) => setCaptureVideo(e.target.checked)}
+                  className="mt-0.5 cursor-pointer accent-accent"
+                />
+                <span className="flex-1 text-[12.5px] leading-relaxed">
+                  <span className="font-semibold text-ink">
+                    Also record screen video
+                  </span>
+                  <span className="text-ink-light">
+                    {" "}
+                    — saves a WebM of the shared tab/window with the
+                    same mixed audio. Available for download from the
+                    Past Session view. Held in browser memory, lost on
+                    refresh — download to keep.
+                  </span>
+                </span>
+              </label>
+            )}
           </div>
         )}
 
@@ -194,6 +230,10 @@ export function StartModal({ open, onCancel, onStart }: Props) {
                 file: mode === "upload" && file ? file : undefined,
                 captureSystemAudio:
                   mode === "live" ? captureSystemAudio : undefined,
+                captureVideo:
+                  mode === "live" && captureSystemAudio
+                    ? captureVideo
+                    : undefined,
               })
             }
             disabled={!canSubmit}

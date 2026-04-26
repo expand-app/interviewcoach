@@ -215,7 +215,11 @@ interface StoreState {
   setDisplayedComment: (d: DisplayedComment | null) => void;
   setAnswerInProgress: (v: boolean) => void;
   /** End the live session, snapshot it into past sessions with the given title. */
-  endLive: (title: string, audioUrl?: string) => Session;
+  endLive: (
+    title: string,
+    audioUrl?: string,
+    videoUrl?: string
+  ) => Session;
   /** Wipe live state (after End & Save, or a hard reset). */
   resetLive: () => void;
 }
@@ -419,7 +423,7 @@ export const useStore = create<StoreState>()(
 
   setAnswerInProgress: (v) => set({ liveAnswerInProgress: v }),
 
-  endLive: (title, audioUrl) => {
+  endLive: (title, audioUrl, videoUrl) => {
     const s = get();
     // No more end-of-session bucketing: candidate answer text has been
     // accumulated onto each Question's `answerText` field LIVE (via the
@@ -445,6 +449,7 @@ export const useStore = create<StoreState>()(
       ).toISOString(),
       durationSeconds: s.live.elapsedSeconds,
       audioUrl,
+      videoUrl,
     };
     set((state) => ({
       pastSessions: [session, ...state.pastSessions],

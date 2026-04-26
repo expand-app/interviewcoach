@@ -115,6 +115,7 @@ export default function Page() {
     resume: string;
     file?: File;
     captureSystemAudio?: boolean;
+    captureVideo?: boolean;
   }) => {
     setShowStart(false);
     startLive(args.jd, args.resume);
@@ -197,7 +198,10 @@ export default function Page() {
             : args.captureSystemAudio === false
             ? "off"
             : "auto";
-        await getOrchestrator().start({ captureTabAudio });
+        // captureVideo is meaningless without tab share — gate on it.
+        const captureVideo =
+          captureTabAudio !== "off" && args.captureVideo === true;
+        await getOrchestrator().start({ captureTabAudio, captureVideo });
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to start";
@@ -225,9 +229,18 @@ export default function Page() {
     getOrchestrator().flushBeforeEnd();
     await getOrchestrator().stop();
     // Pick up the recorded audio URL that the orchestrator stashed.
-    const audioUrl = (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl;
-    const saved = endLive(title, audioUrl);
-    (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = undefined;
+    // Same dance for the optional video URL — only present when the
+    // user enabled "Also record screen video" AND the share was
+    // accepted with a video track.
+    const win = window as unknown as {
+      __ic_audioUrl?: string;
+      __ic_videoUrl?: string;
+    };
+    const audioUrl = win.__ic_audioUrl;
+    const videoUrl = win.__ic_videoUrl;
+    const saved = endLive(title, audioUrl, videoUrl);
+    win.__ic_audioUrl = undefined;
+    win.__ic_videoUrl = undefined;
     selectPast(saved.id);
 
     // Fire-and-forget overall scoring. PastView renders a spinner until
