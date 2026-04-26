@@ -77,6 +77,66 @@ function RefreshScoreButton({
  * user sees the request is in flight; the existing score stays on screen
  * underneath until the new one lands (no flicker to blank).
  */
+
+/** Translate a raw API error string into a user-friendly headline +
+ *  subline. The raw error often leaks HTTP codes / API jargon
+ *  ("HTTP 400: Missing JD or questions") that look like a system
+ *  crash to non-technical users. Pattern-match on known causes and
+ *  fall back to a generic message for unknown ones. */
+function friendlyScoreError(raw: string): {
+  headline: string;
+  subline: string;
+} {
+  const r = raw.toLowerCase();
+  // Most common: session was too short / didn't include any locked
+  // questions / didn't include a JD. The /api/score-session route
+  // returns "Missing JD or questions" for this case.
+  if (
+    r.includes("missing jd") ||
+    r.includes("missing questions") ||
+    r.includes("missing jd or questions")
+  ) {
+    return {
+      headline:
+        "This session didn't capture enough content to score.",
+      subline:
+        "Either no Lead Question was locked, or the session ended before any substantive answer landed.",
+    };
+  }
+  if (r.includes("insufficient")) {
+    return {
+      headline: "Not enough content for a confident score.",
+      subline:
+        "The transcript was too short or only contained pleasantries.",
+    };
+  }
+  if (r.includes("rate limit") || r.includes("429")) {
+    return {
+      headline: "AI scoring is temporarily rate-limited.",
+      subline: "Wait a moment and retry.",
+    };
+  }
+  if (r.includes("timeout") || r.includes("timed out")) {
+    return {
+      headline: "Scoring timed out.",
+      subline:
+        "The AI took too long to respond — usually a transient issue.",
+    };
+  }
+  if (r.includes("network") || r.includes("fetch") || r.includes("econnreset")) {
+    return {
+      headline: "Couldn't reach the scoring service.",
+      subline: "Check your connection and retry.",
+    };
+  }
+  // Generic fallback — don't expose HTTP code or stack to the user.
+  return {
+    headline: "We couldn't generate scoring for this session.",
+    subline:
+      "Something on the AI side went wrong. The transcript is still intact.",
+  };
+}
+
 function ScoreCard({
   score,
   scoreError,
@@ -91,14 +151,21 @@ function ScoreCard({
   // Failure state — distinguishes "still scoring" (no error, no score)
   // from "scoring permanently failed" (error set). Without this branch
   // the user sees an indefinite loading strip after a failed scoring
-  // request with no way to retry except hard-refreshing.
+  // request with no way to retry except hard-refreshing. Visual tone
+  // is muted-warning, NOT alarming-error: the rest of the session
+  // (recording, transcript) is fine — only the AI scoring step
+  // couldn't complete. We hide the raw error message (HTTP codes etc.)
+  // behind a collapsed "Show details" since it's only useful for
+  // engineers, and surface a user-friendly explanation derived from
+  // the error pattern instead.
   if (!score && scoreError) {
+    const friendly = friendlyScoreError(scoreError);
     return (
-      <div className="mb-10 rounded-xl border border-rose-200 bg-rose-50 overflow-hidden">
+      <div className="mb-10 rounded-md border border-rule bg-paper-subtle overflow-hidden">
         <div className="p-5">
           <div className="flex items-start justify-between gap-3">
-            <div className="inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-rose-100 text-rose-800">
-              Scoring failed
+            <div className="inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-paper-hover text-ink-light">
+              Scoring unavailable
             </div>
             {onRefresh && (
               <RefreshScoreButton
@@ -107,14 +174,21 @@ function ScoreCard({
               />
             )}
           </div>
-          <p className="mt-2.5 text-[14.5px] leading-relaxed text-rose-900 font-mono break-all">
-            {scoreError}
+          <p className="mt-3 text-[14.5px] leading-relaxed text-ink">
+            {friendly.headline}
           </p>
-          <p className="mt-3 text-[12.5px] leading-relaxed text-rose-700">
-            The scoring request didn&apos;t complete. The transcript is
-            preserved below — click <strong>Re-score</strong> above to
-            retry.
+          <p className="mt-1.5 text-[13px] leading-relaxed text-ink-light">
+            {friendly.subline} Your recording and transcript are still
+            saved below. {onRefresh ? "Click Re-score to try again." : ""}
           </p>
+          <details className="mt-3 text-[11.5px] text-ink-lighter">
+            <summary className="cursor-pointer hover:text-ink-light select-none">
+              Show technical details
+            </summary>
+            <p className="mt-1.5 font-mono break-all bg-paper border border-rule rounded px-2 py-1.5">
+              {scoreError}
+            </p>
+          </details>
         </div>
       </div>
     );
@@ -537,8 +611,15 @@ export function PastView() {
             isRefreshing={isRefreshing}
           />
           {refreshError && (
-            <div className="-mt-7 mb-8 text-[12px] text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-3 py-2">
-              {refreshError}
+            // Re-score retry failed. Same muted-warning treatment as
+            // the ScoreCard's failure card — error string is shown
+            // here too because if both failures are about the same
+            // root cause, the technical detail at least helps the
+            // user spot a pattern. Click-to-dismiss could be added
+            // later if this becomes noisy.
+            <div className="-mt-7 mb-8 text-[12px] text-ink-light bg-paper-subtle border border-rule rounded-md px-3 py-2">
+              <span className="font-semibold">Re-score didn&apos;t complete:</span>{" "}
+              <span className="text-ink-lighter">{refreshError}</span>
             </div>
           )}
 

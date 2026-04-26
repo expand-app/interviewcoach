@@ -44,8 +44,8 @@ function rolesAreConfirmed(
  *  AudioSession (mic) and PlaybackSession (uploaded file) satisfy this. */
 interface CaptureSource {
   start(): Promise<void>;
-  pause(): void;
-  resume(): void;
+  pause(): void | Promise<void>;
+  resume(): void | Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -1116,13 +1116,25 @@ export class LiveOrchestrator {
     }
   }
 
-  pause() {
-    this.audio?.pause();
+  /** Pause the live session. Per user spec, this is a FULL pause —
+   *  the underlying AudioSession releases the mic, closes its
+   *  Deepgram socket, and stops MediaRecorders. The mic system
+   *  indicator goes off. Accumulated audio/video chunks are kept
+   *  on the AudioSession instance so resume() can continue the
+   *  same recording. */
+  async pause() {
+    await this.audio?.pause();
     useStore.getState().setLiveStatus("paused");
   }
 
-  resume() {
-    this.audio?.resume();
+  /** Resume after a paused live session. Re-acquires the mic, re-
+   *  opens Deepgram, restarts MediaRecorders. If the original session
+   *  had captureSystemAudio enabled, the browser will re-prompt for
+   *  tab/window share (unavoidable per browser security model — the
+   *  share permission isn't held across the underlying getDisplayMedia
+   *  release). */
+  async resume() {
+    await this.audio?.resume();
     useStore.getState().setLiveStatus("recording");
   }
 

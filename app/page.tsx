@@ -10,6 +10,7 @@ import { LoginView } from "@/components/LoginView";
 import { StartModal } from "@/components/modals/StartModal";
 import { ConfirmModal } from "@/components/modals/ConfirmModal";
 import { PromptModal } from "@/components/modals/PromptModal";
+import { EndSessionModal } from "@/components/modals/EndSessionModal";
 import { ModalShell } from "@/components/modals/ModalShell";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
@@ -35,6 +36,7 @@ export default function Page() {
   const liveIsUploadMode = useStore((s) => s.liveIsUploadMode);
   const setElapsed = useStore((s) => s.setElapsed);
   const setLiveStatus = useStore((s) => s.setLiveStatus);
+  const resetLive = useStore((s) => s.resetLive);
 
   // Modal state
   const [showStart, setShowStart] = useState(false);
@@ -102,7 +104,10 @@ export default function Page() {
   const handleStart = () => {
     if (liveStatus === "paused") {
       // Resume — no modal, just flip status and resume audio.
-      getOrchestrator().resume();
+      // The browser may re-prompt for tab share if system-audio was
+      // enabled; that's the cost of fully releasing the mic on pause
+      // per user spec.
+      void getOrchestrator().resume();
       return;
     }
     // Fresh start — show the JD/Resume modal
@@ -212,13 +217,41 @@ export default function Page() {
   };
 
   // Pause is fire-and-forget — no confirmation modal. Clicking the
-  // pause button in the Topbar immediately halts capture. Resume
-  // button appears in its place.
+  // pause button in the Topbar immediately halts capture (releases
+  // mic, closes Deepgram socket, stops MediaRecorders). Resume button
+  // appears in its place.
   const handlePauseRequest = () => {
-    getOrchestrator().pause();
+    void getOrchestrator().pause();
   };
 
   const handleEndRequest = () => setShowEnd(true);
+
+  /** "Discard" branch of the End modal — user wants to stop the
+   *  live session WITHOUT saving it. Releases mic / closes Deepgram /
+   *  drops accumulated chunks (audio + video), wipes the live state.
+   *  Past Sessions list is unaffected. Used when the live session was
+   *  a misstart, a mic check, or otherwise not worth preserving. */
+  const handleEndDiscard = async () => {
+    setShowEnd(false);
+    setPlaybackDone(false);
+    // Stop the orchestrator. This calls AudioSession.stop() which
+    // builds the audio/video blobs and stashes them on window.__ic_*Url
+    // — but we deliberately do NOT read those URLs into a Session,
+    // so the blob objects become garbage-collectable as soon as we
+    // null out the window references below.
+    await getOrchestrator().stop();
+    const win = window as unknown as {
+      __ic_audioUrl?: string;
+      __ic_videoUrl?: string;
+    };
+    win.__ic_audioUrl = undefined;
+    win.__ic_videoUrl = undefined;
+    // Wipe in-memory live state (questions, utterances, timeline,
+    // moment-state machine, etc.). This is the same cleanup that
+    // resetLive does internally; calling it here means the LiveView
+    // re-renders empty, ready for a fresh Start.
+    resetLive();
+  };
 
   const handleEndConfirm = async (title: string) => {
     setShowEnd(false);
@@ -325,11 +358,12 @@ export default function Page() {
       const msg = e instanceof Error ? e.message : "Scoring failed";
       console.error("[scoring] failed:", msg);
       // Mark the session's score as permanently failed (until retried).
-      // PastView's ScoreCard renders an error UI with a Re-score button
-      // when this is set, instead of the indefinite "Scoring this
-      // session…" loading state.
+      // PastView's ScoreCard renders a friendly muted-warning UI when
+      // scoreError is set (with a Re-score button), so we DON'T also
+      // fire a red toast for the same failure — that was triple-banner
+      // noise (rose ScoreCard + small rose box + bottom red toast).
+      // The ScoreCard alone is sufficient and on-context.
       setPastSessionScoreError(saved.id, msg);
-      setToast(msg);
     }
   };
 
@@ -391,19 +425,12 @@ export default function Page() {
         onStart={handleStartConfirm}
       />
 
-      <PromptModal
+      <EndSessionModal
         open={showEnd}
-        title={t("End & save this session?", "结束并保存本场?")}
-        description={t(
-          "This will stop recording and save everything to Past Sessions. You can give this session a name for easier reference later.",
-          "录音将停止,整场内容会保存到 Past Sessions。你可以给这次面试命名方便之后查找。"
-        )}
-        placeholder={t("Session name", "面试名称")}
-        initialValue={liveTitle || t("Untitled session", "未命名面试")}
-        confirmLabel={t("End & save", "结束并保存")}
-        cancelLabel={t("Cancel", "取消")}
+        initialTitle={liveTitle || t("Untitled session", "未命名面试")}
+        onSave={handleEndConfirm}
+        onDiscard={handleEndDiscard}
         onCancel={() => setShowEnd(false)}
-        onConfirm={handleEndConfirm}
       />
 
       <PromptModal
@@ -516,8 +543,8 @@ export default function Page() {
       {playbackDone && (
         <div className="fixed bottom-20 left-1/2 -translate-x-1/2 bg-ink text-paper py-3 px-4 rounded-md text-[13.5px] z-[100] shadow-lg animate-appear flex items-center gap-3 max-w-[620px]">
           <span className="flex-1">
-            Recording complete — click <b>End & Save</b> to see how you
-            performed.
+            Recording complete — click <b>End</b> to save and see how
+            you performed.
           </span>
           <button
             onClick={() => {
@@ -526,7 +553,7 @@ export default function Page() {
             }}
             className="shrink-0 bg-accent text-white text-[12.5px] font-medium py-1.5 px-3 rounded-md hover:bg-[#1a73d1]"
           >
-            End & Save →
+            End →
           </button>
           <button
             onClick={() => setPlaybackDone(false)}

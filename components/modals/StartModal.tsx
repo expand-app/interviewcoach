@@ -12,10 +12,9 @@ interface Props {
    *  captureSystemAudio: only meaningful in live mode — when true, the
    *  AudioSession will prompt for tab/window share with audio so Zoom
    *  meetings, browser playback, etc. are picked up alongside the mic.
-   *  captureVideo: only effective when captureSystemAudio is also true —
-   *  if so, the same tab/window share retains its video track and a
-   *  WebM screen recording is saved on the session for later playback +
-   *  download from the Past Session view. */
+   *  captureVideo: piggybacks on captureSystemAudio (no separate UI
+   *  toggle) — when system audio is on, the same share keeps its video
+   *  track and we save a WebM screen recording on the session. */
   onStart: (args: {
     mode: StartMode;
     jd: string;
@@ -37,11 +36,13 @@ export function StartModal({ open, onCancel, onStart }: Props) {
   // when this is off, so flipping off is a safe explicit override
   // (e.g. in-room interview with laptop speakers).
   const [captureSystemAudio, setCaptureSystemAudio] = useState(true);
-  // Default ON when system audio is on: the same browser share dialog
-  // already has a video track piggy-backed; we just keep it instead
-  // of stopping it. Cost: ~50-150 MB per 30-min session held in tab
-  // memory. User can flip off if they only need transcript / scoring.
-  const [captureVideo, setCaptureVideo] = useState(true);
+  // Video recording always-on when system audio is on. The same browser
+  // share dialog already has a video track piggy-backed; we just keep
+  // it. Per user spec there is no separate UI toggle — capturing the
+  // video is a property of "system audio capture is on", not an
+  // independent decision. The constant lives here as a named symbol
+  // to keep the wire-up to onStart explicit.
+  const captureVideo = true;
 
   useEffect(() => {
     if (open) {
@@ -50,7 +51,6 @@ export function StartModal({ open, onCancel, onStart }: Props) {
       setResume("");
       setFile(null);
       setCaptureSystemAudio(true);
-      setCaptureVideo(true);
     }
   }, [open]);
 
@@ -115,39 +115,18 @@ export function StartModal({ open, onCancel, onStart }: Props) {
                 <span className="text-ink-light">
                   {" "}
                   — pick up sound from a Zoom meeting, browser playback,
-                  or any other tab. After clicking Start, your browser
-                  will ask which tab/window to share —{" "}
+                  or any other tab, and save a WebM screen recording of
+                  the shared tab/window. After clicking Start, your
+                  browser will ask which tab/window to share —{" "}
                   <strong className="text-ink">
                     check &quot;Share tab audio&quot;
                   </strong>{" "}
-                  in that prompt or only the mic will be used. Leave on
-                  if interviewing through any audio source other than
-                  the mic.
+                  in that prompt or only the mic will be used. The
+                  recording is downloadable from the Past Session view
+                  but lives in browser memory — download to keep.
                 </span>
               </span>
             </label>
-            {captureSystemAudio && (
-              <label className="mt-2 ml-6 flex items-start gap-2.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={captureVideo}
-                  onChange={(e) => setCaptureVideo(e.target.checked)}
-                  className="mt-0.5 cursor-pointer accent-accent"
-                />
-                <span className="flex-1 text-[12.5px] leading-relaxed">
-                  <span className="font-semibold text-ink">
-                    Also record screen video
-                  </span>
-                  <span className="text-ink-light">
-                    {" "}
-                    — saves a WebM of the shared tab/window with the
-                    same mixed audio. Available for download from the
-                    Past Session view. Held in browser memory, lost on
-                    refresh — download to keep.
-                  </span>
-                </span>
-              </label>
-            )}
           </div>
         )}
 

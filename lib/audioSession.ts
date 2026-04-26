@@ -142,7 +142,17 @@ export class AudioSession {
    *  the same mixed audio destination Deepgram receives. Held so we
    *  can release it cleanly on stop. */
   private videoStream: MediaStream | null = null;
+  /** Wall-clock when the CURRENT run-segment started (i.e. last
+   *  start() / resume() call). Reset on each resume, so it only
+   *  measures the active recording slice. Pause/resume cycles
+   *  accumulate into accumulatedDurationMs. */
   private startTime = 0;
+  /** Total recording duration across all pause/resume cycles, in ms.
+   *  On pause, we add (now - startTime) into this accumulator and
+   *  tear down. On stop, we add the final segment too and report
+   *  the sum. Without this, a paused-then-resumed session would
+   *  report only the duration of the last segment. */
+  private accumulatedDurationMs = 0;
   private stopped = false;
   private paused = false;
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
@@ -155,6 +165,13 @@ export class AudioSession {
   ) {}
 
   async start() {
+    // start() is called both for fresh sessions AND for resume() after
+    // a pause(). Reset the per-run flags so subsequent calls work.
+    // audioChunks / videoChunks / accumulatedDurationMs intentionally
+    // persist across resume so the saved recording covers the full
+    // session — see pause() for the duration accumulation.
+    this.stopped = false;
+    this.paused = false;
     // 1) Mic — EC/NS off so playback from the room still reaches Deepgram
     //    cleanly in the speakers-on case.
     try {
@@ -438,22 +455,75 @@ export class AudioSession {
     }
   }
 
-  pause() {
+  /** Full pause: tear down the entire audio capture pipeline (mic
+   *  released, Deepgram socket closed, MediaRecorders stopped) but
+   *  keep accumulated chunks + duration on the instance so resume()
+   *  can pick up where we left off. Per user spec: when paused, the
+   *  mic system indicator should go off — partial / MediaRecorder-
+   *  only pause was insufficient because the mic stream stays active. */
+  async pause() {
+    if (this.paused || this.stopped) return;
+    // Add this run-segment's duration to the accumulator before we
+    // tear down. start() will reset startTime when resume kicks off
+    // a new segment.
+    if (this.startTime > 0) {
+      this.accumulatedDurationMs += Date.now() - this.startTime;
+    }
     this.paused = true;
-    if (this.recorder?.state === "recording") this.recorder.pause();
-    if (this.videoRecorder?.state === "recording") this.videoRecorder.pause();
+    await this.tearDown();
   }
 
-  resume() {
-    this.paused = false;
-    if (this.recorder?.state === "paused") this.recorder.resume();
-    if (this.videoRecorder?.state === "paused") this.videoRecorder.resume();
+  /** Full resume: re-acquire mic, re-prompt for tab share if it was
+   *  active, re-open Deepgram, restart MediaRecorders. The new
+   *  MediaRecorders append to the same audioChunks / videoChunks as
+   *  before pause, so the final saved blob covers the entire session.
+   *  NOTE: each pause/resume cycle yields a separate WebM container
+   *  in the chunk list — concatenated at stop() time. Playback is
+   *  generally fine but seek behavior across segment boundaries is
+   *  not guaranteed by the WebM spec. */
+  async resume() {
+    if (!this.paused) return;
+    await this.start();
   }
 
   async stop() {
+    if (this.stopped) return;
     this.stopped = true;
-    const duration = (Date.now() - this.startTime) / 1000;
 
+    // Compute total duration: previously-accumulated + the active
+    // run-segment if we're not already paused (pause already added
+    // its segment in).
+    if (!this.paused && this.startTime > 0) {
+      this.accumulatedDurationMs += Date.now() - this.startTime;
+    }
+    const duration = this.accumulatedDurationMs / 1000;
+
+    // If we're already paused, the pipeline is already torn down —
+    // skip straight to finalizing blobs. Otherwise tear down now.
+    if (!this.paused) {
+      await this.tearDown();
+    }
+
+    // Hand back the recorded audio. Built from ALL chunks accumulated
+    // across pause/resume cycles.
+    const blob = new Blob(this.audioChunks, { type: "audio/webm" });
+    const url = URL.createObjectURL(blob);
+    this.callbacks.onAudioReady(url, duration);
+
+    // Hand back the recorded video, if any. Skip when nothing was
+    // captured (captureVideo off, or share declined / no video track).
+    if (this.videoChunks.length > 0 && this.callbacks.onVideoReady) {
+      const videoBlob = new Blob(this.videoChunks, { type: "video/webm" });
+      const videoUrl = URL.createObjectURL(videoBlob);
+      this.callbacks.onVideoReady(videoUrl, duration);
+    }
+  }
+
+  /** Shared resource-teardown used by both pause() and stop().
+   *  Closes Deepgram, stops MediaRecorders (waits for final chunks),
+   *  releases mic + tab streams, closes AudioContext. Does NOT
+   *  finalize blobs / fire onAudioReady — that's stop()'s job. */
+  private async tearDown() {
     if (this.keepAliveTimer) {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
@@ -520,19 +590,9 @@ export class AudioSession {
     // videoStream's underlying tracks were all owned by tabStream and
     // mediaStream above, both already stopped. Just drop the wrapper.
     this.videoStream = null;
-
-    // Hand back the recorded audio.
-    const blob = new Blob(this.audioChunks, { type: "audio/webm" });
-    const url = URL.createObjectURL(blob);
-    this.callbacks.onAudioReady(url, duration);
-
-    // Hand back the recorded video, if any. Skip when nothing was
-    // captured (captureVideo off, or share declined / no video track).
-    if (this.videoChunks.length > 0 && this.callbacks.onVideoReady) {
-      const videoBlob = new Blob(this.videoChunks, { type: "video/webm" });
-      const videoUrl = URL.createObjectURL(videoBlob);
-      this.callbacks.onVideoReady(videoUrl, duration);
-    }
+    this.recorder = null;
+    this.videoRecorder = null;
+    this.startTime = 0;
   }
 }
 

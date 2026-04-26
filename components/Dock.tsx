@@ -68,7 +68,7 @@ export function Dock({ onStart, onPause, onEnd }: Props) {
         className="text-ink hover:bg-paper-hover disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent px-2.5 py-[5px] rounded-md text-[12.5px] font-medium inline-flex items-center gap-1.5 transition-colors"
       >
         <span>↺</span>
-        <span>{t("End & Save", "结束并保存")}</span>
+        <span>{t("End", "结束")}</span>
       </button>
 
       <div className="w-px h-5 bg-rule mx-1.5" />
