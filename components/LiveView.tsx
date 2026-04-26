@@ -649,10 +649,6 @@ export function LiveView() {
                   "等待确认说话人身份 — 请在上方提示中标记。"
                 ),
                 probeHeader: t("Probe Question", "追问"),
-                interviewerAskingFollowUp: t(
-                  "Interviewer is asking a probe question…",
-                  "面试官正在追问…"
-                ),
               }}
             />
 
@@ -880,12 +876,15 @@ function deriveCandidateAskingText(
  *      Row 2: candidate's question text (locked > live > timeline)
  *   4. Lead Question — `mainQuestion` is currently locked.
  *      Row 1: "LEAD QUESTION" + question text
- *      Row 2 (optional): "PROBE QUESTION" + probe text. Text source:
- *        followUp.text (resolved via currentQuestionId) ?? lockedProbeQuestionText
- *        (lock survives intermediate-frame flicker between state updates
- *         and oscillations between interviewer_speaking and question_finalized)
- *      Row 2 (optional): "INTERVIEWER IS ASKING A PROBE QUESTION…" +
- *        summary, when state===interviewer_speaking AND no followUp/lock yet
+ *      Row 2 (optional): "PROBE QUESTION" + actual probe question text.
+ *        Text source: followUp.text (resolved via currentQuestionId)
+ *        ?? lockedProbeQuestionText (lock survives intermediate-frame
+ *        flicker between state updates and oscillations between
+ *        interviewer_speaking and question_finalized).
+ *        ONLY shown when an actual probe question text is available —
+ *        no "asking probe…" placeholder with summary text. The summary
+ *        is too vague to substitute for the real question; if the probe
+ *        hasn't formally landed yet, the sub-row stays hidden.
  *   5. Interview Ongoing — fallthrough. Covers all transitional states
  *      (warm-up, between-Leads, post-reverse-Q&A wrap-up). Shows the
  *      moment summary so the user sees what's happening even when no
@@ -954,7 +953,6 @@ function CurrentQuestionBar({
     waitingForFirst: string;
     awaitingIdentity: string;
     probeHeader: string;
-    interviewerAskingFollowUp: string;
   };
 }) {
   // Pre-confirmation: roles not identified yet → neutral placeholder.
@@ -1017,15 +1015,13 @@ function CurrentQuestionBar({
     );
   }
 
-  // "Interviewer is asking a probe…" placeholder shows ONLY when there
-  // isn't yet a locked probe. Once we have either a real followUp or a
-  // locked probe text, the sub-row above shows the actual probe content
-  // and this placeholder is redundant.
-  const showAskingFollowUp =
-    !followUp &&
-    !lockedProbeQuestionText &&
-    state === "interviewer_speaking" &&
-    !!mainQuestion;
+  // No "asking probe…" placeholder anymore. The placeholder used to
+  // show `summary` (a vague gerund phrase) under a "面试官正在追问…"
+  // header whenever state===interviewer_speaking with mainQuestion locked.
+  // That was misleading: it mixed the in-progress interviewer monologue
+  // summary with the Probe Question slot, even when no actual probe Q
+  // text had been identified yet. Per spec: only show the probe sub-row
+  // when a real probe Q text exists (locked or formally committed).
 
   // Question phase (Lead locked). Typography NO LONGER clamped — the
   // full Lead and Probe text wrap naturally. The Phase region uses
@@ -1060,20 +1056,6 @@ function CurrentQuestionBar({
             <div className="font-serif text-[14px] leading-snug text-ink-light">
               {followUp?.text ?? lockedProbeQuestionText}
             </div>
-          </div>
-        )}
-
-        {showAskingFollowUp && (
-          <div className="mt-2 pl-3 border-l-2 border-rule">
-            <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider inline-flex items-center gap-1.5">
-              <BouncingDots />
-              {labels.interviewerAskingFollowUp}
-            </div>
-            {summary && (
-              <div className="text-[12.5px] leading-snug text-ink-light italic">
-                {summary}
-              </div>
-            )}
           </div>
         )}
       </BarShell>
@@ -1119,16 +1101,6 @@ function BarShell({ children }: { children: React.ReactNode }) {
     >
       {children}
     </div>
-  );
-}
-
-function BouncingDots() {
-  return (
-    <span className="inline-flex gap-[3px]">
-      <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot" />
-      <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.15s]" />
-      <span className="w-[5px] h-[5px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.3s]" />
-    </span>
   );
 }
 

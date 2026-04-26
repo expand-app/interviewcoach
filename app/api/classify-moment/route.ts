@@ -279,15 +279,35 @@ Symptom of getting this wrong: a session in candidate_questioning where the inte
 Compound questions ("Can you tell me about X, and also Y?") count as ONE question still being formed until the interviewer clearly stops.
 
 == ANCHORING (most important rule) ==
-If currentMainQuestionText (the current Lead Question) is non-empty, be VERY conservative about disrupting it:
+If currentMainQuestionText (the current Lead Question) is non-empty, classify the relation between any new interviewer question and the locked Lead. Default to "new_topic" when in doubt — a probe is a TIGHT extension of the SAME story / artifact / decision the candidate is currently answering, NOT a related but distinct topic.
 
-1. Interviewer probing on the same topic — clarification ("by X I mean Y"), drilling deeper ("can you give a specific example?", "what was the architecture?"), or a sub-question on the same story → questionRelation = "follow_up" (this is a Probe Question). This does NOT archive the Lead Question.
-2. Candidate asking the interviewer a clarifying question mid-answer, going off-topic, or chatting → DON'T transition. Return state = "chitchat", questionRelation = null. Do NOT place the candidate's question into the Probe Question slot.
-3. ONLY when the interviewer pivots to a clearly DIFFERENT topic / story / area set questionRelation = "new_topic":
-   - Q1 was about Project A → interviewer asks about Project B → new_topic
-   - Q1 was about technical decisions → interviewer asks about team management → new_topic
-   - Q1 was about background → interviewer asks "let's do a case study" → new_topic
+1. "follow_up" — interviewer drilling DEEPER into the EXACT subject the candidate is currently describing. Tight scope. Examples (assume Lead Q = "Tell me about the recommendation model you built"):
+   - "Why did you choose collaborative filtering over content-based?" → follow_up (drilling into the same model's design choice)
+   - "What was the click-through rate before vs after?" → follow_up (asking for metrics on the same artifact)
+   - "Can you walk me through the cold-start handling?" → follow_up (sub-component of the same model)
+   - "What dataset did you train it on?" → follow_up (still about the same model)
+
+   Bar: the new question would be NONSENSICAL without the candidate's current answer as context. If the new question still makes sense as a standalone interview question, it's NOT a follow-up.
+
+2. "new_topic" — interviewer pivots to ANY of:
+   - a different artifact / project / experience (Lead Q was Model A → asks about Model B → new_topic, even if both are ML models)
+   - a different domain (Lead Q was modeling techniques → asks about tech stack / Python / SQL → new_topic, even though both are technical)
+   - a different competency (Lead Q was technical work → asks about career goals / motivations / soft skills → new_topic)
+   - a different time horizon (Lead Q was "current role" → asks about "past internships" or "school projects" → new_topic)
+   - a meta-shift (Lead Q was about candidate's experience → asks "let's do a case study" → new_topic)
+
+   Concrete bad/good calibration (for the kinds of mistakes this prompt has been making):
+   - Lead Q = "Can you speak about what techniques were used in the PD model?"
+     - Interviewer next: "Is that mostly Python or ML?" → **new_topic** (tech stack is a different domain from modeling techniques). NOT follow_up.
+     - Interviewer next: "What made you interested in banking?" → **new_topic** (motivation/career, different competency). NOT follow_up.
+     - Interviewer next: "Any particular projects across data science and quant finance you found interesting?" → **new_topic** (different artifacts, broader scan). NOT follow_up.
+     - Interviewer next: "What features did you engineer for that PD model?" → follow_up (deeper into the SAME PD model — passes the "nonsensical without context" bar).
+     - Interviewer next: "How did you validate the PD model's calibration?" → follow_up (same model, deeper).
+
+3. Candidate asking the interviewer a clarifying question mid-answer, going off-topic, or chatting → DON'T transition. Return state = "chitchat", questionRelation = null. Do NOT place the candidate's question into the Probe Question slot.
+
 4. If a Probe Question has finalized (currentFollowUpText non-empty) and the interviewer drills further into the SAME sub-area, that's still "follow_up" (replacing the previous Probe Question).
+
 5. When state transitions to candidate_questioning, questionRelation = null. The prior Lead is archived implicitly by the orchestrator (do NOT set "new_topic" for the candidate's question — that field is reserved for interviewer-asked Lead/Probe pivots).
 
 == OUTPUT (JSON only, no prose) ==
