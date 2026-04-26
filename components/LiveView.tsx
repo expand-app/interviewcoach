@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
+import { ModalShell } from "@/components/modals/ModalShell";
 import type { Comment, MomentStateKind, Question, Utterance } from "@/types/session";
 
 /**
@@ -184,6 +185,8 @@ export function LiveView() {
   const timeline = useStore((s) => s.liveTimeline);
   const playbackTime = useStore((s) => s.livePlaybackTime);
   const isUploadMode = useStore((s) => s.liveIsUploadMode);
+  const forceSetSpeakerRole = useStore((s) => s.forceSetSpeakerRole);
+  const [retagModalOpen, setRetagModalOpen] = useState(false);
 
   const [interim, setInterim] = useState("");
   useEffect(() => {
@@ -637,8 +640,8 @@ export function LiveView() {
               labels={{
                 leadHeader: t("Lead Question", "主问题"),
                 warmupHeader: t(
-                  "Warm-up · Interviewer Introduction",
-                  "热身 · 面试官介绍"
+                  "Warm-up",
+                  "热身"
                 ),
                 betweenQuestionsHeader: t(
                   "Between Questions · Interviewer Transitioning",
@@ -693,13 +696,20 @@ export function LiveView() {
               }}
             />
 
-            {/* (3) Live Captions — two speaker lanes stacked, fixed. */}
+            {/* (3) Live Captions — two speaker lanes stacked, fixed.
+                Re-tag affordance only in live mode (upload-mode roles
+                come from the pre-identify pass which is more reliable
+                than a single user click + can be redone via re-upload). */}
             <LiveCaptions
               utterances={utterances}
               interim={interim}
               isRecording={live.status === "recording"}
               speakerRoles={speakerRoles}
               maxTimeSec={isUploadMode ? playbackTime : undefined}
+              onRetagClick={
+                !isUploadMode ? () => setRetagModalOpen(true) : undefined
+              }
+              retagLabel={t("Re-tag", "重新标注")}
               labels={{
                 heading: t("LIVE CAPTIONS", "实时字幕"),
                 live: t("LIVE", "直播中"),
@@ -709,6 +719,39 @@ export function LiveView() {
               }}
             />
           </div>
+
+          {/* Re-tag speakers modal — opens from the LIVE CAPTIONS
+              header's "Re-tag" link. Lets the user fix a mis-clicked
+              role assignment (e.g. tagged the wrong person as
+              interviewer at session start). Per-speaker buttons apply
+              immediately via forceSetSpeakerRole; captions re-label
+              live so the user can confirm. */}
+          <RetagSpeakersModal
+            open={retagModalOpen}
+            onClose={() => setRetagModalOpen(false)}
+            utterances={utterances}
+            speakerRoles={speakerRoles}
+            onForceRole={(dg, role) => forceSetSpeakerRole(dg, role)}
+            labels={{
+              title: t(
+                "Re-tag Interviewer / Candidate",
+                "重新标注面试官 / 候选人"
+              ),
+              description: t(
+                "If you tagged a speaker incorrectly, fix it here. Each change applies immediately — captions update so you can verify.",
+                "如果开始时标错了说话人,在这里改正。每次点击立即生效,可以从字幕区确认。"
+              ),
+              interviewer: t("Interviewer", "面试官"),
+              candidate: t("Candidate", "候选人"),
+              sample: t("Sample", "示例"),
+              unlabeled: t("Not yet labeled", "尚未标注"),
+              close: t("Close", "关闭"),
+              noSpeakers: t(
+                "No speakers detected yet — recording hasn't picked up any voices.",
+                "尚未检测到说话人 — 录音还没有采集到声音。"
+              ),
+            }}
+          />
 
           {/* Earlier in this interview — archived mains, with follow-ups.
               Lives OUTSIDE the 16:9 video frame — a normal scrolling
@@ -1426,12 +1469,150 @@ function CommentarySection({
  *     speaks again.
  *   - Interim text appends to whichever lane the current speaker owns.
  */
+/** Modal that lets the user correct a mis-assigned speaker role
+ *  mid-session. Lists every dgSpeaker that has produced at least one
+ *  utterance, alongside their current role and a sample line so the
+ *  user can identify who's who. Each speaker has Interviewer /
+ *  Candidate buttons that immediately call `forceSetSpeakerRole` —
+ *  no save step, the change is live so the user sees the captions
+ *  re-label in real time and can confirm. Caveats:
+ *    - Utterance role labels in the captions update immediately
+ *      (computed from speakerRoles each render).
+ *    - Per-question `answerText` accumulated BEFORE the re-tag is
+ *      already baked in with the wrong role. For long sessions where
+ *      the mistake is caught late, the user should restart. Re-tagging
+ *      is most useful for early-session mis-clicks. */
+function RetagSpeakersModal({
+  open,
+  onClose,
+  utterances,
+  speakerRoles,
+  onForceRole,
+  labels,
+}: {
+  open: boolean;
+  onClose: () => void;
+  utterances: Utterance[];
+  speakerRoles: Record<number, "interviewer" | "candidate">;
+  onForceRole: (
+    dgSpeaker: number,
+    role: "interviewer" | "candidate"
+  ) => void;
+  labels: {
+    title: string;
+    description: string;
+    interviewer: string;
+    candidate: string;
+    sample: string;
+    unlabeled: string;
+    close: string;
+    noSpeakers: string;
+  };
+}) {
+  // Build per-speaker rows: distinct dgSpeaker numbers seen so far,
+  // plus their first utterance text (a short sample to help the user
+  // identify which voice this is). Sorted by first-appearance order.
+  const speakers = useMemo(() => {
+    const firstSeen = new Map<number, Utterance>();
+    for (const u of utterances) {
+      if (u.dgSpeaker === undefined) continue;
+      if (firstSeen.has(u.dgSpeaker)) continue;
+      firstSeen.set(u.dgSpeaker, u);
+    }
+    return Array.from(firstSeen.entries())
+      .map(([dg, u]) => ({
+        dgSpeaker: dg,
+        sample: u.text,
+        role: speakerRoles[dg],
+      }))
+      .sort((a, b) => a.dgSpeaker - b.dgSpeaker);
+  }, [utterances, speakerRoles]);
+
+  return (
+    <ModalShell open={open} onClose={onClose}>
+      <div className="p-7 px-8">
+        <h2 className="text-[18px] font-semibold mb-1.5 text-ink">
+          {labels.title}
+        </h2>
+        <div className="text-sm text-ink-light mb-4 leading-relaxed">
+          {labels.description}
+        </div>
+
+        {speakers.length === 0 ? (
+          <div className="py-6 text-center text-[13px] text-ink-lighter italic">
+            {labels.noSpeakers}
+          </div>
+        ) : (
+          <div className="space-y-3 mb-4">
+            {speakers.map((s) => (
+              <div
+                key={s.dgSpeaker}
+                className="border border-rule rounded-md p-3 bg-paper-subtle"
+              >
+                <div className="flex items-baseline justify-between gap-3 mb-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-lighter">
+                    Speaker {s.dgSpeaker}
+                    {s.role && (
+                      <span className="ml-2 normal-case font-normal text-ink-light">
+                        · current: <strong>{s.role === "interviewer" ? labels.interviewer : labels.candidate}</strong>
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="text-[12px] text-ink-light italic mb-2.5 leading-snug line-clamp-2">
+                  <span className="text-ink-lighter not-italic mr-1">
+                    {labels.sample}:
+                  </span>
+                  &ldquo;{s.sample}&rdquo;
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onForceRole(s.dgSpeaker, "interviewer")}
+                    className={`flex-1 px-3 py-1.5 rounded-md text-[12.5px] font-medium border transition-colors ${
+                      s.role === "interviewer"
+                        ? "bg-accent text-paper border-accent"
+                        : "bg-paper text-ink border-rule-strong hover:bg-paper-hover"
+                    }`}
+                  >
+                    {labels.interviewer}
+                  </button>
+                  <button
+                    onClick={() => onForceRole(s.dgSpeaker, "candidate")}
+                    className={`flex-1 px-3 py-1.5 rounded-md text-[12.5px] font-medium border transition-colors ${
+                      s.role === "candidate"
+                        ? "bg-accent text-paper border-accent"
+                        : "bg-paper text-ink border-rule-strong hover:bg-paper-hover"
+                    }`}
+                  >
+                    {labels.candidate}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="flex justify-end mt-4">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 rounded-md text-sm font-medium border border-rule-strong bg-paper text-ink hover:bg-paper-hover"
+          >
+            {labels.close}
+          </button>
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
 function LiveCaptions({
   utterances,
   interim,
   isRecording,
   speakerRoles,
   maxTimeSec,
+  onRetagClick,
+  retagLabel,
   labels,
 }: {
   utterances: Utterance[];
@@ -1442,6 +1623,12 @@ function LiveCaptions({
    *  `atSeconds + duration` (i.e. end time) ≤ maxTimeSec as visible.
    *  Scrubbing backwards hides later utterances; forward reveals them. */
   maxTimeSec?: number;
+  /** Live-mode only: opens the manual re-tag modal so the user can
+   *  fix a mis-clicked role assignment mid-session (no auto-retry
+   *  exists for the original speaker prompt). Undefined in upload
+   *  mode → button hidden. */
+  onRetagClick?: () => void;
+  retagLabel?: string;
   labels: {
     heading: string;
     live: string;
@@ -1671,6 +1858,21 @@ function LiveCaptions({
             <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
             {labels.live}
           </span>
+        )}
+        {onRetagClick && (
+          // Manual role re-tagging escape hatch. Sits in the captions
+          // header right side so the user knows where to click if they
+          // realize they mis-assigned interviewer/candidate at the
+          // start. Discoverable but not noisy. Only renders in live
+          // mode (upload mode pre-identifies via Haiku).
+          <button
+            onClick={onRetagClick}
+            className="ml-auto inline-flex items-center gap-1 text-[10.5px] text-ink-lighter hover:text-ink hover:underline underline-offset-2 transition-colors"
+            title="Re-tag interviewer / candidate"
+          >
+            <span className="text-[11px] leading-none">↻</span>
+            <span>{retagLabel || "Re-tag"}</span>
+          </button>
         )}
       </div>
       <CaptionLane

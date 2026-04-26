@@ -182,6 +182,15 @@ interface StoreState {
   /** Merge new identifications into the role map. Existing entries are NOT
    *  overwritten — once a speaker's role is decided, it sticks. */
   mergeSpeakerRoles: (roles: Record<number, "interviewer" | "candidate">) => void;
+  /** User-driven override: force a specific dgSpeaker to a specific role,
+   *  overwriting any prior assignment. Used by the "Re-tag speakers"
+   *  modal so the user can correct a wrong manual tag mid-session
+   *  (since the auto-assign + first-speaker-prompt path can't be
+   *  retried otherwise). */
+  forceSetSpeakerRole: (
+    dgSpeaker: number,
+    role: "interviewer" | "candidate"
+  ) => void;
   setMomentState: (m: MomentState) => void;
   setDisplayedComment: (d: DisplayedComment | null) => void;
   setAnswerInProgress: (v: boolean) => void;
@@ -367,6 +376,17 @@ export const useStore = create<StoreState>()(
         changed = true;
       }
       return changed ? { liveSpeakerRoles: next } : {};
+    }),
+
+  forceSetSpeakerRole: (dgSpeaker, role) =>
+    set((s) => {
+      if (s.liveSpeakerRoles[dgSpeaker] === role) return {};
+      return {
+        liveSpeakerRoles: {
+          ...s.liveSpeakerRoles,
+          [dgSpeaker]: role,
+        },
+      };
     }),
 
   setMomentState: (m) => set({ liveMomentState: m }),
