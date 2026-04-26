@@ -310,7 +310,7 @@ When verbal feedback and behavior conflict, trust the behavior. Don't be fooled 
 Don't invent reactions that aren't in the transcript. But when the commentary clearly reflects interviewer energy, use it — good coaching scores the interview as it actually went, not as a checklist.
 
 == OUTPUT LANGUAGE (Chinese with English keywords) ==
-Write every user-facing string — \`summary\`, each dimension's \`justification\`, and every \`improvements\` entry — in Chinese as the base language, with English keywords preserved inline. Match the tone and mixing style of the Live Commentary:
+Write every user-facing string — \`summary\`, each dimension's \`justification\`, every \`improvements\` entry's \`title\`, \`detail\`, and \`fix\` — in Chinese as the base language, with English keywords preserved inline. Match the tone and mixing style of the Live Commentary:
 - Product / technical terms (recommendation model, feature store, A/B test, CCAR, LightGBM, tradeoff, scope, probe) → keep English.
 - Named entities from the JD / resume (company names, team names, model/framework names) → keep as they appear.
 - Direct candidate quotes → preserve in the original language the candidate used.
@@ -387,15 +387,26 @@ Case B — normal scoring (with or without per-dimension N/As):
   ],
   "summary": "<1-2 sentence overall read>",
   "improvements": [
-    "<actionable — name the moment>",
-    "<second>",
-    "<optional third>"
+    {
+      "title": "<short headline of the candidate's biggest single issue, 8-15 words>",
+      "detail": "<2-4 sentences. Name specific transcript moments. Explain WHY this is the biggest issue and HOW it materially hurts the interviewer's read of this candidate>",
+      "fix": "<1-3 sentences. Concrete adjustment for next time — what to say differently, what to prepare, what habit to rehearse against. Not generic 'be more specific' — actionable script-level guidance.>"
+    },
+    {"title": "<secondary issue 2, headline only — no detail/fix>"},
+    {"title": "<secondary issue 3>"},
+    {"title": "<optional 4>"},
+    {"title": "<optional 5>"}
   ]
 }
 
-Justifications and improvements must reference SPECIFIC moments from the transcript (question numbers, phrases the candidate used, or gaps that stood out). Generic advice like "be more specific" is not acceptable — it must tie to something that actually happened.
+improvements rules:
+- Up to 5 entries TOTAL. The FIRST entry is the candidate's single biggest problem and is the only one with detail + fix populated. Entries 2-5 are secondary issues, just title.
+- Be selective. Most sessions have 2-3 secondary issues worth flagging, not 5. Only fill all 5 if there are genuinely 5 distinct problems.
+- The MAIN issue's detail must reference SPECIFIC moments (question numbers, phrases the candidate used, gaps that stood out). The MAIN issue's fix must be concrete and rehearsable.
+- Secondary titles also reference moments where possible, but fit in one short line.
+- Generic advice like "be more specific" is not acceptable for any entry — it must tie to something that actually happened in this transcript.
 
-Each justification under 25 words. Each improvement 1–2 sentences.`;
+Justifications under 25 words each.`;
 
   const schemaLine = isLegacySchema
     ? "Schema: LEGACY (coach notes only — grade directly from observations; do NOT mark insufficient just because ANSWER lines are absent)"
@@ -482,7 +493,12 @@ Score the interview. Return JSON only.`;
         justification?: string;
       }>;
       summary?: string;
-      improvements?: string[];
+      // New shape: array of structured items. Backward-compat: also
+      // accept legacy string[] from any cached response or older model.
+      improvements?: Array<
+        | string
+        | { title?: string; detail?: string; fix?: string }
+      >;
     } = {};
     try {
       parsed = JSON.parse(text);
@@ -610,9 +626,25 @@ Score the interview. Return JSON only.`;
         (parsed.summary || "").trim() || "No overall summary produced.",
       dimensions: dimensionsOut,
       improvements: (parsed.improvements || [])
-        .map((s) => (s || "").trim())
-        .filter(Boolean)
-        .slice(0, 3),
+        // Normalize: accept either string (legacy) or structured object.
+        // Strings become title-only entries.
+        .map((entry) => {
+          if (typeof entry === "string") {
+            const t = entry.trim();
+            return t ? { title: t } : null;
+          }
+          const title = (entry?.title || "").trim();
+          if (!title) return null;
+          const detail = (entry?.detail || "").trim();
+          const fix = (entry?.fix || "").trim();
+          return {
+            title,
+            ...(detail ? { detail } : {}),
+            ...(fix ? { fix } : {}),
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null)
+        .slice(0, 5),
     };
 
     return NextResponse.json({ score });

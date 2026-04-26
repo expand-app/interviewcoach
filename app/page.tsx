@@ -114,6 +114,7 @@ export default function Page() {
     jd: string;
     resume: string;
     file?: File;
+    captureSystemAudio?: boolean;
   }) => {
     setShowStart(false);
     startLive(args.jd, args.resume);
@@ -184,9 +185,19 @@ export default function Page() {
         await getOrchestrator().startWithFile(args.file, data.utterances);
         useStore.getState().setLiveProcessingStage("idle");
       } else {
-        // Earphones auto-detection happens inside AudioSession — no flag
-        // needed here.
-        await getOrchestrator().start();
+        // captureSystemAudio: explicit user choice from the start modal.
+        // - true  → "on": always prompt for tab/window share with audio,
+        //           regardless of headphone detection
+        // - false → "off": mic-only, skip the share prompt entirely
+        // - undefined → "auto": legacy default (headphones-detected →
+        //           prompt for share). Kept for any non-modal entry points.
+        const captureTabAudio: "auto" | "on" | "off" =
+          args.captureSystemAudio === true
+            ? "on"
+            : args.captureSystemAudio === false
+            ? "off"
+            : "auto";
+        await getOrchestrator().start({ captureTabAudio });
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to start";

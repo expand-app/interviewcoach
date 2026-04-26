@@ -210,9 +210,31 @@ export interface SessionScore {
      *  `score` is null, the reason this dimension couldn't be judged). */
     justification: string;
   }>;
-  /** 2–3 actionable suggestions referencing specific moments. May be empty
-   *  when verdict is "insufficient_data". */
-  improvements: string[];
+  /** Up to 5 actionable suggestions referencing specific moments. The
+   *  FIRST entry is the candidate's single biggest issue, with full
+   *  elaboration + concrete adjustment guidance. Entries 2-5 are
+   *  secondary issues, more terse. May be empty when verdict is
+   *  "insufficient_data".
+   *
+   *  Backward compat: legacy sessions stored `improvements` as
+   *  `string[]`. The render layer in PastView accepts BOTH shapes —
+   *  string entries are treated as { title: <string>, fix: "" }. New
+   *  sessions always use the structured shape. */
+  improvements: SessionImprovement[];
+}
+
+/** One actionable improvement item in the score-session output. */
+export interface SessionImprovement {
+  /** Short headline of the issue, e.g. "Filler word density disrupts
+   *  delivery". 8-15 words. Always populated. */
+  title: string;
+  /** Expanded explanation. ONLY populated for the first/main item —
+   *  the rest leave this empty. 2-4 sentences naming concrete
+   *  transcript moments. */
+  detail?: string;
+  /** Concrete adjustment guidance — what to do differently next time.
+   *  ONLY populated for the first/main item. 1-3 sentences. */
+  fix?: string;
 }
 
 export interface Session {

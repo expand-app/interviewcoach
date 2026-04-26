@@ -9,12 +9,15 @@ interface Props {
   open: boolean;
   onCancel: () => void;
   /** jd, resume: always present. file: present iff mode === "upload".
-   *  Earphone / tab-audio handling is automatic in live mode — no flag here. */
+   *  captureSystemAudio: only meaningful in live mode — when true, the
+   *  AudioSession will prompt for tab/window share with audio so Zoom
+   *  meetings, browser playback, etc. are picked up alongside the mic. */
   onStart: (args: {
     mode: StartMode;
     jd: string;
     resume: string;
     file?: File;
+    captureSystemAudio?: boolean;
   }) => void;
 }
 
@@ -23,6 +26,12 @@ export function StartModal({ open, onCancel, onStart }: Props) {
   const [jd, setJd] = useState("");
   const [resume, setResume] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  // Default ON: most users running this run an interview through Zoom
+  // / Meet on their laptop with headphones, where mic-only would miss
+  // the interviewer entirely. Auto-detect headphones still kicks in
+  // when this is off, so flipping off is a safe explicit override
+  // (e.g. in-room interview with laptop speakers).
+  const [captureSystemAudio, setCaptureSystemAudio] = useState(true);
 
   useEffect(() => {
     if (open) {
@@ -30,6 +39,7 @@ export function StartModal({ open, onCancel, onStart }: Props) {
       setJd("");
       setResume("");
       setFile(null);
+      setCaptureSystemAudio(true);
     }
   }, [open]);
 
@@ -70,6 +80,40 @@ export function StartModal({ open, onCancel, onStart }: Props) {
             Upload recording
           </button>
         </div>
+
+        {/* System-audio capture toggle (live mode only). When ON, the
+            session prompts for a tab/window share with "Share tab audio"
+            checked, so Zoom meeting audio + browser playback get
+            transcribed alongside the mic. Default ON. */}
+        {mode === "live" && (
+          <div className="mb-4 px-3.5 py-3 rounded-md border border-rule bg-paper-subtle">
+            <label className="flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={captureSystemAudio}
+                onChange={(e) => setCaptureSystemAudio(e.target.checked)}
+                className="mt-0.5 cursor-pointer accent-accent"
+              />
+              <span className="flex-1 text-[13px] leading-relaxed">
+                <span className="font-semibold text-ink">
+                  Capture system audio
+                </span>
+                <span className="text-ink-light">
+                  {" "}
+                  — pick up sound from a Zoom meeting, browser playback,
+                  or any other tab. After clicking Start, your browser
+                  will ask which tab/window to share —{" "}
+                  <strong className="text-ink">
+                    check &quot;Share tab audio&quot;
+                  </strong>{" "}
+                  in that prompt or only the mic will be used. Leave on
+                  if interviewing through any audio source other than
+                  the mic.
+                </span>
+              </span>
+            </label>
+          </div>
+        )}
 
         {/* Upload field (visible only in upload mode) */}
         {mode === "upload" && (
@@ -148,6 +192,8 @@ export function StartModal({ open, onCancel, onStart }: Props) {
                 jd: jd.trim(),
                 resume: resume.trim(),
                 file: mode === "upload" && file ? file : undefined,
+                captureSystemAudio:
+                  mode === "live" ? captureSystemAudio : undefined,
               })
             }
             disabled={!canSubmit}

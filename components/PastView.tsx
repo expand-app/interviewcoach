@@ -283,19 +283,71 @@ function ScoreCard({
         })}
       </div>
 
-      {/* Improvements */}
+      {/* Improvements — first entry is the MAIN issue (with elaboration
+          + fix); subsequent entries are secondary, title only.
+          Backward-compat: legacy sessions stored improvements as
+          string[]; we render those as title-only entries. */}
       {score.improvements.length > 0 && (
         <div className="px-5 py-4 bg-paper-subtle border-t border-rule">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-lighter mb-2">
-            Targeted Improvements
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-lighter mb-3">
+            Areas of Improvement
           </div>
-          <ol className="space-y-2 list-decimal list-inside marker:text-ink-lighter marker:font-mono marker:text-[12px]">
-            {score.improvements.map((imp, i) => (
-              <li key={i} className="text-[14px] leading-relaxed text-ink">
-                {imp}
-              </li>
-            ))}
-          </ol>
+          {(() => {
+            // Normalize: legacy localStorage entries may be plain strings;
+            // cast widens the type so the runtime check is reachable.
+            const raw = score.improvements as unknown as Array<
+              { title: string; detail?: string; fix?: string } | string
+            >;
+            const items = raw.map((imp) =>
+              typeof imp === "string" ? { title: imp } : imp
+            );
+            const main = items[0];
+            const secondaries = items.slice(1);
+            return (
+              <div className="space-y-4">
+                {main && (
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-accent mb-1">
+                      Main issue
+                    </div>
+                    <div className="text-[15px] font-semibold leading-snug text-ink mb-1.5">
+                      {main.title}
+                    </div>
+                    {main.detail && (
+                      <p className="text-[13.5px] leading-relaxed text-ink-light mb-2">
+                        {main.detail}
+                      </p>
+                    )}
+                    {main.fix && (
+                      <div className="text-[13.5px] leading-relaxed text-ink-light">
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-lighter mr-2">
+                          Fix
+                        </span>
+                        {main.fix}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {secondaries.length > 0 && (
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-lighter mb-1.5">
+                      Also worth noting
+                    </div>
+                    <ul className="space-y-1.5 list-disc list-inside marker:text-ink-lighter">
+                      {secondaries.map((imp, i) => (
+                        <li
+                          key={i}
+                          className="text-[13.5px] leading-relaxed text-ink"
+                        >
+                          {imp.title}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
