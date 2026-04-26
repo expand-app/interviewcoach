@@ -141,6 +141,17 @@ const RESTATEMENT_COOLDOWN_MS = 10000;
  *  questions through (topically related but distinct Qs cluster near
  *  0.2-0.3). */
 const RESTATEMENT_JACCARD_THRESHOLD = 0.5;
+/** Cooldown for candidate-question (reverse-Q&A) dedup. Mirrors the
+ *  lead-question RESTATEMENT_COOLDOWN_MS but applies to the candidate's
+ *  questions: while the candidate is still asking ("are there any
+ *  restrictions on the remote position?"), the classifier ticks every
+ *  2-3s and re-emits the same intent with slightly varied wording each
+ *  tick. Without dedup, each variant fires a fresh cand-q-cmt API call,
+ *  yanking the previous commentary off screen before the user can read
+ *  it. 10s is long enough to cover the typical multi-tick window for
+ *  one logical question yet short enough that a genuine second question
+ *  on the same topic gets through. */
+const CAND_Q_DEDUP_COOLDOWN_MS = 10000;
 
 /** Number of consecutive classify results in the same direction
  *  required before a non-question state transition is committed.
@@ -291,6 +302,18 @@ export class LiveOrchestrator {
    *  do token-level similarity checking and drop the restatement. */
   private lastLeadCommitAt = 0;
   private lastCommittedQText = "";
+
+  /** Timestamp + text of the most-recently-fired candidate-question
+   *  commentary call. Mirrors `lastLeadCommitAt` / `lastCommittedQText`
+   *  but for the reverse-Q&A path. While the candidate is asking, the
+   *  classifier emits the same logical question with varied wording on
+   *  each 2-3s tick — without dedup we'd fire 4+ cand-q-cmt API calls
+   *  for a single question and the commentary would be yanked off
+   *  screen before the user can read it. We update these AT FIRE TIME
+   *  (not only on stream completion) so subsequent variants within the
+   *  cooldown window are deduped even while the API is still returning. */
+  private lastCandQCommitAt = 0;
+  private lastCommittedCandQText = "";
 
   /** Hysteresis state for non-question moment transitions. A single
    *  classify call proposing a new state (e.g. chitchat → interviewer_
@@ -1027,6 +1050,8 @@ export class LiveOrchestrator {
     this.rejectedQTexts.clear();
     this.lastLeadCommitAt = 0;
     this.lastCommittedQText = "";
+    this.lastCandQCommitAt = 0;
+    this.lastCommittedCandQText = "";
     this.momentHysteresisPending = null;
     this.lastCommentAt.clear();
     this.commentCountPerQ.clear();
@@ -2011,18 +2036,76 @@ export class LiveOrchestrator {
       // re-emit the same question text many times in a row. Only fire
       // a fresh commentary when the question text genuinely changes.
       const prevCq = (store.liveMomentState.candidateQuestion || "").trim();
+      // Always update the moment state's candidateQuestion text — the
+      // store's text reflects the latest classifier output even when we
+      // dedup or defer the commentary fire. Spec: "只静默更新内部 candQ
+      // 文本" — UI's currently-displayed commentary stays put.
       store.setMomentState({
         state: "candidate_questioning",
         summary,
         candidateQuestion: cq,
       });
-      if (cq !== prevCq) {
-        // New question — clear prior commentary text and fire a fresh
-        // generation. (Same pattern as warmup commentary.)
-        useStore.getState().setLiveCandidateQuestionCommentary("");
-        log("candidate-q", "new", { text: preview(cq, 80) });
-        void this.generateCandidateQuestionCommentary(cq);
+      if (cq === prevCq) return;
+
+      // === Layer A: Jaccard-similarity dedup ===
+      // Mirrors the lead-question `restated-Q` filter. The classifier
+      // re-emits a single logical question 2-4 times during the
+      // candidate's monologue with slightly varied wording each tick
+      // ("are there any restrictions or on-site requirements...",
+      //  "I just want to make sure that you saw, like, any restrictions...",
+      //  "can you clarify any restrictions on the remote position...").
+      // All share enough tokens that Jaccard ≫ 0.5; we treat them as
+      // one question and silently skip the fresh API call. The store's
+      // `candidateQuestion` text was already updated above, so the UI
+      // shows the latest text — only the *commentary* is preserved.
+      const sinceLastCandQCommit = Date.now() - this.lastCandQCommitAt;
+      if (
+        this.lastCommittedCandQText &&
+        sinceLastCandQCommit < CAND_Q_DEDUP_COOLDOWN_MS &&
+        this.isSemanticallySimilar(cq, this.lastCommittedCandQText)
+      ) {
+        log("candidate-q", "dedup", {
+          text: preview(cq, 60),
+          sinceLastMs: sinceLastCandQCommit,
+          prev: preview(this.lastCommittedCandQText, 60),
+        });
+        return;
       }
+
+      // === Layer B: read-gate ===
+      // Don't replace an actively-displayed commentary while it's still
+      // inside its content-length-derived min-display window. A 472-char
+      // cand-q-cmt needs ~70s of reading time; firing a new one 6s
+      // later (because the classifier emitted a slightly different
+      // wording of the same intent that slipped past Jaccard, or even
+      // a genuinely different question that arrived too fast) yanks
+      // it off screen mid-read. Drop, don't queue — by the time the
+      // gate clears, the conversation has moved on; queued commentary
+      // would be stale.
+      if (this.lastCommentaryReadyAt > 0 && this.lastCommentaryText) {
+        const required = computeMinDisplayMs(this.lastCommentaryText);
+        const elapsed = Date.now() - this.lastCommentaryReadyAt;
+        if (elapsed < required) {
+          log("cand-q-cmt", "deferred-reading", {
+            elapsedMs: elapsed,
+            requiredMs: required,
+            prev: preview(this.lastCommentaryText, 60),
+            droppedCq: preview(cq, 60),
+          });
+          return;
+        }
+      }
+
+      // Cleared both gates — fire a fresh generation.
+      // Update the dedup state AT FIRE TIME (not only on stream
+      // completion) so subsequent variants emitted during the API call
+      // are also deduped against this commit, not just against whatever
+      // committed before this one.
+      this.lastCandQCommitAt = Date.now();
+      this.lastCommittedCandQText = cq;
+      useStore.getState().setLiveCandidateQuestionCommentary("");
+      log("candidate-q", "new", { text: preview(cq, 80) });
+      void this.generateCandidateQuestionCommentary(cq);
       return;
     }
 
