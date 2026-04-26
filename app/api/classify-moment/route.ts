@@ -22,7 +22,6 @@ async function logClassification(entry: Record<string, unknown>) {
 }
 
 type MomentStateKind =
-  | "chitchat"
   | "interviewer_speaking"
   | "question_finalized"
   | "candidate_questioning"
@@ -82,7 +81,7 @@ export async function POST(req: Request) {
   const utterances = (body.utterances || []).filter((u) => u.text?.trim());
   if (utterances.length === 0) {
     return NextResponse.json({
-      state: "chitchat",
+      state: "interviewer_speaking",
       summary: "",
       question: "",
       questionRelation: null,
@@ -217,16 +216,20 @@ This system tracks two kinds of interview questions, both ONLY from Interviewer 
 
 The following are NOT Lead or Probe questions — they should NOT finalize and should keep the currently locked-in question on screen:
 - Administrative / conversational asks from the interviewer, even if grammatically questions: "Do you have any questions before we start?", "Ready to begin?", "Can you hear me OK?", "Should we get started?", "Any issues with the setup?", "Does that make sense so far?", "Want to take a short break?". These are real utterances but they are not substantive interview questions.
-- CANDIDATE-initiated clarification mid-answer: "Can you clarify what you mean by scale?", "Is it OK if I sketch this out?", "What kind of data can I use?" — these belong to "chitchat" (a small clarifying ask doesn't shift the phase). The Probe Question panel is STRICTLY interviewer → candidate.
+- CANDIDATE-initiated clarification mid-answer: "Can you clarify what you mean by scale?", "Is it OK if I sketch this out?", "What kind of data can I use?" — keep state at "interviewer_speaking" (a small clarifying ask doesn't shift the phase). The Probe Question panel is STRICTLY interviewer → candidate.
 - Meta-process chatter: "let me switch tabs", "one sec", "got it", "uh-huh".
 
 NOTE: A SEPARATE state (candidate_questioning, see below) covers the reverse-Q&A tail of the interview, where the interviewer has finished their questions and explicitly hands the floor over ("any questions for me?") and the candidate now asks substantive questions about the team/role/process.
 
-When in doubt about a non-question utterance, return state = "chitchat" so no question card is created.
+When in doubt about a non-question utterance, return state = "interviewer_speaking" so no question card is created. Small talk, greetings, audio checks, brief acknowledgments, and administrative chatter all classify as "interviewer_speaking" — the question field stays empty and the orchestrator simply doesn't lock anything.
 
 == STATES ==
-- "chitchat": nothing to surface. Small talk, greetings, intros, audio test, screen sharing chatter, administrative interviewer asks (see above), and isolated candidate-initiated clarifications mid-answer. NOT this if the candidate is delivering a substantive self-introduction in response to a "tell me about yourself" prompt.
-- "interviewer_speaking": the interviewer is mid-question. Started but not finished. Any of these signal NOT YET DONE:
+- "interviewer_speaking": the interviewer is mid-question OR engaged in any non-substantive speech that shouldn't surface as a Question card. This is the catch-all for "speech happening, but no Question to lock yet". Includes:
+    • Small talk, greetings, intros, audio test, screen sharing chatter
+    • Administrative interviewer asks (see above) — "ready to begin?", "can you hear me?"
+    • Isolated candidate-initiated clarifications mid-answer
+    • Brief mutual acknowledgments ("yeah", "got it", "right") that don't rise to closing
+    • The interviewer is genuinely mid-question but not yet done — any of these signal NOT YET FINALIZED:
     • silence < 3 seconds
     • the latest interviewer utterance ends with "so", "and", "um", "uh", "let me think", "actually", "wait", or any other transition word
     • the accumulated interviewer text doesn't yet form a complete question (no clear interrogative or imperative request for information)
@@ -236,7 +239,7 @@ When in doubt about a non-question utterance, return state = "chitchat" so no qu
     2. the accumulated interviewer text forms a complete, coherent question (interrogative or clear imperative ask), AND
     3. the question does NOT trail off into a transition word.
 
-  CLOSING-STYLE SUBSTANTIVE QUESTIONS — these ARE question_finalized, do NOT mis-route to chitchat or candidate_questioning. They appear at the end of an interview but ASK THE CANDIDATE to share something:
+  CLOSING-STYLE SUBSTANTIVE QUESTIONS — these ARE question_finalized, do NOT mis-route to interviewer_speaking or candidate_questioning. They appear at the end of an interview but ASK THE CANDIDATE to share something:
     • "Anything in particular that stood out about [Company]?" / "什么让你对我们 First Citizens 感兴趣?"
     • "What attracted you to this role / team?"
     • "What excites you most about this opportunity?"
@@ -257,7 +260,7 @@ When in doubt about a non-question utterance, return state = "chitchat" so no qu
 - "candidate_questioning": the reverse Q&A near the end of the interview. ALL of these must hold:
     1. The interviewer has clearly handed the floor over — explicit cue like "do you have any questions for me?", "any questions for us?", "anything you want to ask?", or "we have time for your questions" within the last few turns. OR the candidate has asked TWO consecutive substantive questions about the team/role/process and the interviewer has been answering them.
     2. The candidate's most recent utterance IS a substantive question to the interviewer about the role / team / company / process — NOT a one-off clarification embedded in their own answer. Examples: "What does the team look like?", "How does the team measure success?", "What's the day-to-day for this role?", "What are the biggest challenges the team is facing?", "How is the on-call rotation set up?", "What's the next step after this interview?".
-    3. NOT a clarification of an interview question they're trying to answer ("Can you give me an example of what you mean by scale?" while mid-answer — that's chitchat).
+    3. NOT a clarification of an interview question they're trying to answer ("Can you give me an example of what you mean by scale?" while mid-answer — that stays interviewer_speaking).
 
 == STICKINESS RULE for candidate_questioning (CRITICAL) ==
 If currentState is "candidate_questioning", the DEFAULT is to STAY in candidate_questioning. The interviewer answering the candidate's question — even at length, even with multiple paragraphs of detail — is the EXPECTED behavior in this phase, NOT a signal to exit. Do not exit just because the interviewer has been speaking for a while.
@@ -266,7 +269,7 @@ Only exit candidate_questioning when ONE of these is unambiguous in the recent t
 
 (1) NEW INTERVIEWER QUESTION TO CANDIDATE — interviewer explicitly opens a NEW substantive ask with cues like "let me ask you", "my next question is", "one more thing I want to ask you", "before we wrap up, can you tell me about", "actually one more question about your background", AND the question text is a real interview question (not a clarification or logistics ask). → state = question_finalized, questionRelation = "new_topic", populate the question field with the new ask. Do NOT exit on a vague "and/so/well" — needs an explicit re-asking cue.
 
-(2) CANDIDATE EXPLICITLY ENDS Q&A — candidate says "no more questions" / "that's all from me" / "I think that's it" / "no further questions" / "I'm good, thanks". → state = "chitchat" (will progress to closing on its own as goodbyes follow).
+(2) CANDIDATE EXPLICITLY ENDS Q&A — candidate says "no more questions" / "that's all from me" / "I think that's it" / "no further questions" / "I'm good, thanks". → state = "interviewer_speaking" (will progress to closing on its own as goodbyes follow).
 
 (3) CANDIDATE ASKS A NEW QUESTION — candidate's most recent substantive utterance is itself a new question to the interviewer (about role / team / process / company). → STAY in candidate_questioning, just update the candidateQuestion field to the new text. This is NOT an exit; it's a refresh inside the same phase.
 
@@ -304,7 +307,7 @@ If currentMainQuestionText (the current Lead Question) is non-empty, classify th
      - Interviewer next: "What features did you engineer for that PD model?" → follow_up (deeper into the SAME PD model — passes the "nonsensical without context" bar).
      - Interviewer next: "How did you validate the PD model's calibration?" → follow_up (same model, deeper).
 
-3. Candidate asking the interviewer a clarifying question mid-answer, going off-topic, or chatting → DON'T transition. Return state = "chitchat", questionRelation = null. Do NOT place the candidate's question into the Probe Question slot.
+3. Candidate asking the interviewer a clarifying question mid-answer, going off-topic, or chatting → DON'T transition. Return state = "interviewer_speaking", questionRelation = null. Do NOT place the candidate's question into the Probe Question slot.
 
 4. If a Probe Question has finalized (currentFollowUpText non-empty) and the interviewer drills further into the SAME sub-area, that's still "follow_up" (replacing the previous Probe Question).
 
@@ -312,7 +315,7 @@ If currentMainQuestionText (the current Lead Question) is non-empty, classify th
 
 == OUTPUT (JSON only, no prose) ==
 {
-  "state": "chitchat" | "interviewer_speaking" | "question_finalized" | "candidate_questioning" | "closing",
+  "state": "interviewer_speaking" | "question_finalized" | "candidate_questioning" | "closing",
   "summary": "<one short human-readable line for the UI top bar>",
   "question": "<cleaned question text — only when state=question_finalized, otherwise empty>",
   "candidateQuestion": "<cleaned candidate question text — only when state=candidate_questioning, otherwise empty>",
@@ -335,8 +338,7 @@ Summary writing style:
 - Bad:  "Interviewer asking about his project"
 - Good: "Interviewer asking about the project"
 - Good: "Asking about the recommendation model goal"
-- chitchat: "Greeting and audio check"
-- interviewer_speaking: short topic phrase, e.g. "asking about the recommendation model goal"
+- interviewer_speaking: short topic phrase. Examples: "asking about the recommendation model goal" (mid-question), "Greeting and audio check" (small talk), "Acknowledging response" (brief ack)
 - question_finalized: omit or echo the question
 - candidate_questioning: short topic phrase, e.g. "asking about team structure", "asking about next steps"
 
@@ -439,14 +441,19 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
       }
     }
 
+    // Backward-compat: accept legacy "chitchat" output from any
+    // pre-merge classifier responses still in flight; map it to
+    // "interviewer_speaking" (the merge target — see types/session.ts
+    // MomentStateKind comment). Fallback default is also interviewer_speaking.
+    const rawState =
+      parsed.state === "chitchat" ? "interviewer_speaking" : parsed.state;
     const state: MomentStateKind =
-      parsed.state === "chitchat" ||
-      parsed.state === "interviewer_speaking" ||
-      parsed.state === "question_finalized" ||
-      parsed.state === "candidate_questioning" ||
-      parsed.state === "closing"
-        ? parsed.state
-        : "chitchat";
+      rawState === "interviewer_speaking" ||
+      rawState === "question_finalized" ||
+      rawState === "candidate_questioning" ||
+      rawState === "closing"
+        ? rawState
+        : "interviewer_speaking";
     const summary = (parsed.summary || "").trim();
     const question =
       state === "question_finalized" ? (parsed.question || "").trim() : "";
@@ -504,7 +511,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
           typeof errBody === "object"
             ? JSON.stringify(errBody).slice(0, 400)
             : String(errBody ?? ""),
-        state: "chitchat",
+        state: "interviewer_speaking",
         summary: "",
         question: "",
         candidateQuestion: "",

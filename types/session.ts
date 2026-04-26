@@ -15,11 +15,21 @@ export interface User {
 }
 
 /** State of the current moment — what's happening in the room right now.
- *  Drives the top bar in the live view. */
+ *  Drives the top bar in the live view.
+ *
+ *  NOTE: a former "chitchat" state was merged into "interviewer_speaking"
+ *  after the 5-state UI consolidation. The UI no longer rendered chitchat
+ *  distinctly (collapsed into "Interview Ongoing"), and chitchat didn't
+ *  gate any commentary trigger differently from interviewer_speaking —
+ *  classifier wobble between the two used to lose candidate utterances
+ *  from `pendingAnswerBuffer` (only accumulated under interviewer_speaking).
+ *  Merging the two fixed that wobble bug. */
 export type MomentStateKind =
   | "idle"                  // session just started, nothing classified yet
-  | "chitchat"              // small talk, intros, audio check
-  | "interviewer_speaking"  // interviewer is mid-question, not yet finalized
+  | "interviewer_speaking"  // interviewer is mid-question OR small-talk /
+                              // intros / audio check / brief acknowledgments —
+                              // any "non-substantive interviewer speech" not
+                              // yet forming a complete question
   | "question_finalized"    // a complete question is ready; commentary can flow
   | "candidate_questioning" // reverse Q&A: candidate is asking the interviewer
                               // questions ("what does the team look like?",

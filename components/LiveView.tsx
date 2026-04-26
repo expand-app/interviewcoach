@@ -499,11 +499,16 @@ export function LiveView() {
   // Map timeline phase → MomentStateKind so existing subcomponents can
   // render without knowing about timeline mode. When no timeline,
   // straight-through from store moment.state.
+  // Note: PhaseKind's "chitchat" and "between_questions" both map to
+  // MomentStateKind's "interviewer_speaking" — chitchat was merged into
+  // interviewer_speaking in the live state machine; the upload-mode
+  // PhaseKind enum kept the chitchat label for post-hoc segmentation but
+  // it routes to the same UI state ("Interview Ongoing" via the 5-state
+  // collapse) when there's no active mainQuestion.
   const phaseToMomentState = (p?: { kind: string }): MomentStateKind => {
     switch (p?.kind) {
       case "chitchat":
       case "between_questions":
-        return "chitchat";
       case "interviewer_asking_first":
       case "interviewer_probing":
         return "interviewer_speaking";

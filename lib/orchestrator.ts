@@ -2287,7 +2287,7 @@ export class LiveOrchestrator {
     if (wasCandidateQuestioning) {
       useStore.getState().setLiveCandidateQuestionCommentary("");
     }
-    if (next === "interviewer_speaking" || next === "chitchat") {
+    if (next === "interviewer_speaking") {
       this.pendingAnswerBuffer = "";
     }
     // Closing-state side effect: arm the 3-second silence timer so we
