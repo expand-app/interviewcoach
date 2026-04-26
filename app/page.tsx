@@ -936,7 +936,18 @@ function ReviewPanel() {
 function SpeakerIdentityPrompt() {
   const prompt = useStore((s) => s.liveSpeakerPrompt);
   const resolve = useStore((s) => s.resolveSpeakerPrompt);
+  // Gate on live view. The modal is mounted at the app root so it can
+  // appear from anywhere, but it should NEVER show while the user is
+  // looking at a past session — that's a privacy / UX violation. If a
+  // previous live session is still actively capturing in the background
+  // and trips the new-speaker detection, the prompt would otherwise
+  // pop on top of past-session view content. Bug repro: start live,
+  // click a past session in the sidebar, watch the modal appear when
+  // Deepgram next labels a new speaker. selectPast also clears any
+  // pending prompt as a defensive measure.
+  const onPastView = useStore((s) => s.selectedPastId) !== null;
 
+  if (onPastView) return null;
   if (!prompt) return null;
 
   // Cap the preview text so a long first utterance doesn't blow out

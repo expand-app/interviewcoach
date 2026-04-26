@@ -243,7 +243,17 @@ export const useStore = create<StoreState>()(
   setCommentLang: (commentLang) => set({ commentLang }),
 
   selectedPastId: null,
-  selectPast: (id) => set({ selectedPastId: id }),
+  selectPast: (id) =>
+    set((s) => ({
+      selectedPastId: id,
+      // Defensive: when navigating to a past session, clear any
+      // pending speaker-identity prompt from a still-running live
+      // session. Otherwise the modal would render on top of the past-
+      // session view (the SpeakerIdentityPrompt component is mounted
+      // at the app root). We also gate the modal itself on Live view
+      // in app/page.tsx, so this is double-cover.
+      liveSpeakerPrompt: id !== null ? null : s.liveSpeakerPrompt,
+    })),
 
   pastSessions: [],
   addPastSession: (s) =>

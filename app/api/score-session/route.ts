@@ -402,11 +402,36 @@ Case B — normal scoring (with or without per-dimension N/As):
 improvements rules:
 - Up to 5 entries TOTAL. The FIRST entry is the candidate's single biggest problem and is the only one with detail + fix populated. Entries 2-5 are secondary issues, just title.
 - Be selective. Most sessions have 2-3 secondary issues worth flagging, not 5. Only fill all 5 if there are genuinely 5 distinct problems.
-- The MAIN issue's detail must reference SPECIFIC moments (question numbers, phrases the candidate used, gaps that stood out). The MAIN issue's fix must be concrete and rehearsable.
-- Secondary titles also reference moments where possible, but fit in one short line.
-- Generic advice like "be more specific" is not acceptable for any entry — it must tie to something that actually happened in this transcript.
 
-Justifications under 25 words each.`;
+REFERENCING MOMENTS — strict rules (this is the most common failure mode in these outputs):
+- DO NOT use abbreviations like "Q1", "Q2", "Q3" or "the second question". The reader is reviewing the full session and these are useless to them.
+- DO reference moments by the TOPIC of the question or a short paraphrase of its INTENT. Examples:
+    GOOD: "在被问到 PD model techniques 时,候选人..."
+    GOOD: "讲到 hedge fund vs banking 的转换动机时..."
+    GOOD: "面试官追问 'how did you choose XGBoost over a logistic baseline' 时,候选人..."
+    BAD : "Q1 答得不够具体"
+    BAD : "在第二个 follow-up 里"
+- DO quote what the candidate ACTUALLY said when calling out specific weaknesses. Short verbatim phrases are most damning ("说了 'feature engineering' 4 次但没 name 一个 feature").
+- DO NOT manufacture quotes. If the transcript doesn't have a clear phrase to quote, paraphrase WITHOUT quote marks.
+
+DETAIL field rules (main issue only):
+- 2-4 sentences. State the issue, name 2+ concrete transcript moments where it surfaced, explain WHY it materially hurt the interviewer's read.
+- Tie the issue to a hireability cost: "这会让 hiring committee 怀疑..." / "This signals to the panel that..." / etc.
+
+FIX field rules (main issue only):
+- 1-3 sentences. Concrete and rehearsable. Tell them what to PREPARE / SCRIPT / DRILL before the next interview, not just what to "be".
+- Bad fix: "回答得更具体一些" / "Be more specific"
+- Good fix: "在下次面试前,把 PD model 的 RF / LogReg / LightGBM 三个模型分别用一段话写出来,每段必须包含:为什么选它、用了哪些 feature、怎么 calibrate、怎么 benchmark。把这三段背到能在 90 秒内不卡壳地讲出来。"
+- Good fix: "Drill the 'why this trade-off' framing on 5 of your past projects: pick a decision (X over Y), name the constraint (latency / data scarcity / compliance), explain the test (A/B / shadow / offline eval) — practice until you can deliver each in <60s."
+
+SECONDARY title rules (entries 2-5):
+- One short line. Same moment-referencing rules as above (no Q1/Q2; topic-referenced).
+- Examples:
+    "讲到 ML interpretability 时一直说 'I 100% agree' 但没接出自己的具体经验"
+    "Tech stack 问题答得 generic — 没提到具体 Python 包或 SQL warehouse 名"
+    "反问 phrasing 太软,'I just want to make sure...' 削弱了候选人的 ownership 感"
+
+Justifications (the dimension justification field, separate from improvements) under 25 words each.`;
 
   const schemaLine = isLegacySchema
     ? "Schema: LEGACY (coach notes only — grade directly from observations; do NOT mark insufficient just because ANSWER lines are absent)"
