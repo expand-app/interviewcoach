@@ -119,6 +119,20 @@ interface StoreState {
   liveLockedCandidateQuestion: string | null;
   setLiveLockedCandidateQuestion: (text: string | null) => void;
 
+  /** Currently-locked Probe Question text. Set by the orchestrator when
+   *  `addFollowUpAndStart` commits a probe (4-layer filter passed) and
+   *  cleared when a NEW Lead locks (interviewer pivoted to a different
+   *  topic) or when reverse-Q&A starts. Mirrors the Lead-Q lock pattern:
+   *  the Phase bar's "Probe Question" sub-row should persist as long as
+   *  the probe is the active sub-question, even if the moment-state
+   *  machine briefly oscillates (interviewer_speaking ↔ question_finalized
+   *  during a long answer flap). Without this lock, the existing
+   *  `currentQuestionId`-based display would also work in steady state,
+   *  but the lock survives the brief intermediate-frame flicker between
+   *  setCurrentQuestionId(null) and addQuestion(newLead) calls. */
+  liveLockedProbeQuestion: string | null;
+  setLiveLockedProbeQuestion: (text: string | null) => void;
+
   /** Session-elapsed seconds at which the moment-state machine first
    *  transitioned into `candidate_questioning`. Marks the start of the
    *  reverse Q&A phase for diagnostic logging. Null until the first
@@ -292,6 +306,9 @@ export const useStore = create<StoreState>()(
   liveLockedCandidateQuestion: null,
   setLiveLockedCandidateQuestion: (liveLockedCandidateQuestion) =>
     set({ liveLockedCandidateQuestion }),
+  liveLockedProbeQuestion: null,
+  setLiveLockedProbeQuestion: (liveLockedProbeQuestion) =>
+    set({ liveLockedProbeQuestion }),
   liveCandidateQuestioningSince: null,
   setLiveCandidateQuestioningSince: (liveCandidateQuestioningSince) =>
     set({ liveCandidateQuestioningSince }),
@@ -334,6 +351,7 @@ export const useStore = create<StoreState>()(
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
       liveLockedCandidateQuestion: null,
+      liveLockedProbeQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
@@ -456,6 +474,7 @@ export const useStore = create<StoreState>()(
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
       liveLockedCandidateQuestion: null,
+      liveLockedProbeQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
@@ -483,6 +502,7 @@ export const useStore = create<StoreState>()(
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
       liveLockedCandidateQuestion: null,
+      liveLockedProbeQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,

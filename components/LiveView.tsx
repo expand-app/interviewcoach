@@ -182,6 +182,7 @@ export function LiveView() {
   const lockedCandidateQuestion = useStore(
     (s) => s.liveLockedCandidateQuestion
   );
+  const lockedProbeQuestion = useStore((s) => s.liveLockedProbeQuestion);
   const timeline = useStore((s) => s.liveTimeline);
   const playbackTime = useStore((s) => s.livePlaybackTime);
   const isUploadMode = useStore((s) => s.liveIsUploadMode);
@@ -626,6 +627,9 @@ export function LiveView() {
               lockedCandidateQuestionText={
                 rolesConfirmed ? lockedCandidateQuestion ?? undefined : undefined
               }
+              lockedProbeQuestionText={
+                rolesConfirmed ? lockedProbeQuestion ?? undefined : undefined
+              }
               labels={{
                 leadHeader: t("Lead Question", "主问题"),
                 interviewOngoingHeader: t(
@@ -876,9 +880,12 @@ function deriveCandidateAskingText(
  *      Row 2: candidate's question text (locked > live > timeline)
  *   4. Lead Question — `mainQuestion` is currently locked.
  *      Row 1: "LEAD QUESTION" + question text
- *      Row 2 (optional): "PROBE QUESTION" + probe text (when followUp set)
+ *      Row 2 (optional): "PROBE QUESTION" + probe text. Text source:
+ *        followUp.text (resolved via currentQuestionId) ?? lockedProbeQuestionText
+ *        (lock survives intermediate-frame flicker between state updates
+ *         and oscillations between interviewer_speaking and question_finalized)
  *      Row 2 (optional): "INTERVIEWER IS ASKING A PROBE QUESTION…" +
- *        summary, when state===interviewer_speaking and no followUp yet
+ *        summary, when state===interviewer_speaking AND no followUp/lock yet
  *   5. Interview Ongoing — fallthrough. Covers all transitional states
  *      (warm-up, between-Leads, post-reverse-Q&A wrap-up). Shows the
  *      moment summary so the user sees what's happening even when no
@@ -903,6 +910,7 @@ function CurrentQuestionBar({
   candidateAskingText,
   liveCandidateQuestionText,
   lockedCandidateQuestionText,
+  lockedProbeQuestionText,
   labels,
 }: {
   state: MomentStateKind;
@@ -930,6 +938,15 @@ function CurrentQuestionBar({
    *  if the moment state has briefly transited out of candidate_
    *  questioning (interviewer mid-answer). */
   lockedCandidateQuestionText?: string;
+  /** Live-mode only: the locked Probe Question text. Set by orchestrator
+   *  in addFollowUpAndStart (probe formally committed) and cleared on
+   *  new-Lead lock or candidate_questioning entry. Used as a fallback
+   *  source for the Probe sub-row when the `followUp` Question object
+   *  is briefly unresolved (e.g. in the intermediate frame between
+   *  state updates during Lead transitions). The lock survives state
+   *  oscillations between interviewer_speaking and question_finalized
+   *  during long answer flaps, so the Probe sub-row doesn't flicker. */
+  lockedProbeQuestionText?: string;
   labels: {
     leadHeader: string;
     interviewOngoingHeader: string;
@@ -1000,8 +1017,15 @@ function CurrentQuestionBar({
     );
   }
 
+  // "Interviewer is asking a probe…" placeholder shows ONLY when there
+  // isn't yet a locked probe. Once we have either a real followUp or a
+  // locked probe text, the sub-row above shows the actual probe content
+  // and this placeholder is redundant.
   const showAskingFollowUp =
-    !followUp && state === "interviewer_speaking" && !!mainQuestion;
+    !followUp &&
+    !lockedProbeQuestionText &&
+    state === "interviewer_speaking" &&
+    !!mainQuestion;
 
   // Question phase (Lead locked). Typography NO LONGER clamped — the
   // full Lead and Probe text wrap naturally. The Phase region uses
@@ -1017,13 +1041,24 @@ function CurrentQuestionBar({
           {mainQuestion.text}
         </div>
 
-        {followUp && (
+        {/* Probe Question sub-row. Shown whenever EITHER:
+            (a) followUp Question object is resolved from currentQuestionId
+                (the canonical source — works in steady state)
+            (b) lockedProbeQuestionText is set (the lock — survives any
+                transient null-frame between state updates during Lead
+                transitions, and stays put across moment-state oscillations
+                while the Lead is still active)
+            Text source: followUp.text (fresher) > lockedProbeQuestionText.
+            Cleared only by archiveCurrentMainAndStartNew (new Lead) or
+            candidate_questioning entry — both clear lockedProbeQuestion
+            in the orchestrator, so the sub-row goes away then. */}
+        {(followUp || lockedProbeQuestionText) && (
           <div className="mt-2 pl-3 border-l-2 border-rule">
             <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
               {labels.probeHeader}
             </div>
             <div className="font-serif text-[14px] leading-snug text-ink-light">
-              {followUp.text}
+              {followUp?.text ?? lockedProbeQuestionText}
             </div>
           </div>
         )}

@@ -2053,6 +2053,9 @@ export class LiveOrchestrator {
       useStore.getState().setLiveWarmupCommentary("");
       store.setDisplayedComment(null);
       store.setAnswerInProgress(false);
+      // Clear any locked Probe Q — reverse Q&A starts; the prior
+      // Lead/Probe context is closed.
+      useStore.getState().setLiveLockedProbeQuestion(null);
       this.pendingCommentaryFor = null;
 
       // First-entry timestamp — once Q&A reverse phase starts, the
@@ -2698,6 +2701,11 @@ export class LiveOrchestrator {
       comments: [],
     };
     store.addQuestion(q);
+    // Defensive: clear any locked Probe Q. Pre-anchored path means
+    // there was no current Lead before, so no probe could be locked —
+    // but if a prior session's state somehow leaked through, this is
+    // the right moment to reset.
+    store.setLiveLockedProbeQuestion(null);
     store.setMomentState({ state: "question_finalized", summary });
     log("question", "lead", {
       qid: q.id,
@@ -2739,6 +2747,19 @@ export class LiveOrchestrator {
       parentQuestionId: parentId,
     };
     store.addQuestion(q);
+    // Lock the Probe Q text. Mirrors the Lead-Q lock pattern: the Phase
+    // bar's Probe sub-row should persist as long as this probe is the
+    // active sub-question of the current Lead, even when the moment
+    // state machine briefly oscillates (interviewer_speaking ↔
+    // question_finalized during a long answer flap). The
+    // currentQuestionId-based display already works in steady state but
+    // the lock survives any transient null-frame between state updates.
+    // Cleared by:
+    //   - archiveCurrentMainAndStartNew (interviewer pivots to new Lead)
+    //   - pre-anchored first-Lead path (defensive — no probe was active)
+    //   - candidate_questioning entry (reverse Q&A starts)
+    //   - session reset
+    store.setLiveLockedProbeQuestion(text);
     log("question", "probe", {
       qid: q.id,
       parent: parentId,
@@ -2766,9 +2787,14 @@ export class LiveOrchestrator {
 
   private archiveCurrentMainAndStartNew(text: string, summary: string) {
     const store = useStore.getState();
-    // Archive: just clear currentQuestionId — old questions stay in the array
-    // and the UI's "Earlier in this interview" filter picks them up.
-    store.setCurrentQuestionId(null);
+    // NOTE: do NOT call setCurrentQuestionId(null) here before addQuestion.
+    // addQuestion atomically sets currentQuestionId = newQ.id, so the
+    // explicit pre-clear was redundant — and it caused a one-frame flicker
+    // where currentQuestionId was null between the two store updates,
+    // briefly dropping the Phase bar to "Interview Ongoing" before
+    // re-rendering with the new Lead. Archiving is implicit: old Qs stay
+    // in liveQuestions array; the "Earlier in this interview" filter
+    // picks them up via parentQuestionId / askedAtSeconds.
     const q: Question = {
       id: rand("q"),
       text,
@@ -2776,6 +2802,9 @@ export class LiveOrchestrator {
       comments: [],
     };
     store.addQuestion(q);
+    // Clear the locked Probe Q text — interviewer pivoted to a new Lead,
+    // any prior probe is now stale.
+    store.setLiveLockedProbeQuestion(null);
     log("question", "lead", {
       qid: q.id,
       text: preview(text, 80),
