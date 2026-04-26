@@ -207,6 +207,19 @@ When in doubt about a non-question utterance, return state = "chitchat" so no qu
     1. msSinceLastTranscript >= 3000 OR the candidate has substantively started answering (>= 20 chars of first-person speech in the most recent turn), AND
     2. the accumulated interviewer text forms a complete, coherent question (interrogative or clear imperative ask), AND
     3. the question does NOT trail off into a transition word.
+
+  CLOSING-STYLE SUBSTANTIVE QUESTIONS — these ARE question_finalized, do NOT mis-route to chitchat or candidate_questioning. They appear at the end of an interview but ASK THE CANDIDATE to share something:
+    • "Anything in particular that stood out about [Company]?" / "什么让你对我们 First Citizens 感兴趣?"
+    • "What attracted you to this role / team?"
+    • "What excites you most about this opportunity?"
+    • "Any final thoughts you want to share?" / "Is there anything else you want us to know?"
+    • "How did you hear about / come across the position?"
+    • "What questions do you still have about the role / company?" — note: this is asking the candidate to articulate what they're curious about, which is a substantive ask. Distinguish from the pure hand-off "do you have any questions for me?".
+
+  Critical distinction:
+    • "Anything that stood out about us / what attracted you" → question_finalized. The candidate is supposed to ANSWER with their reasons / impressions. (Even if mixed with a hand-off offer like "or anything you want to ask" at the tail — pick the substantive ask, ignore the appended hand-off.)
+    • "Do you have any questions for me?" / "Any questions for us?" → hand-off, leads into candidate_questioning when the candidate starts asking back. NOT question_finalized.
+    • A monologue containing BOTH ("anything stood out + or any questions") → question_finalized with the "stood out" ask as the question text. The hand-off appendix is just the interviewer giving the candidate freedom to also raise questions.
 - "closing": the interview is wrapping up — both sides are saying goodbye, thanking each other, or one side has clearly concluded ("that's about all the time we have", "thanks for your time, we'll be in touch", "have a good day"). Triggers when ANY of these patterns appear in the last few turns:
     • Mutual goodbye / thanks: interviewer says "thank you for your time" or "great conversation" or "we'll be in touch" or "have a good day" AND candidate says "thank you" / "have a good week" / "goodbye" / "talk to you later".
     • Explicit conclusion from interviewer: "that's all the time we have", "we're at time", "I'll let you go", "we have your contact info, we'll follow up".
