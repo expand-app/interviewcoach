@@ -136,10 +136,18 @@ export async function POST(req: Request) {
         0
       ) >= 60
   ).length;
+  // Threshold is "coach evidence STRICTLY BEATS answer evidence" rather
+  // than a fixed ≥3, so a session with 2 substantive coach-noted Qs
+  // and 0-1 answered Qs (e.g. the user's First Citizens session: Q1
+  // PD-techniques 625 chars notes, Q2 projects 1021 chars notes, Q3
+  // First Citizens 0 notes / 319 char answer) still gets routed
+  // legacy. The downstream INSUFFICIENT gate (≥3 Qs with ≥60 chars,
+  // ≥1000 total) still applies — bucketing-bug back-fill just chooses
+  // which evidence channel to grade from, it doesn't bypass the bar.
   const looksBucketingBugged =
     !naivelyLegacy &&
-    qsWithAnswerEvidence < 3 &&
-    qsWithCommentEvidence >= 3;
+    qsWithAnswerEvidence < qsWithCommentEvidence &&
+    qsWithCommentEvidence >= 2;
   const isLegacySchema = naivelyLegacy || looksBucketingBugged;
   if (looksBucketingBugged) {
     console.log(
