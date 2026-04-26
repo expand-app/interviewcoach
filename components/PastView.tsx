@@ -3,7 +3,6 @@
 import { useState, useRef } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
-import { AudioPlayer, PlayerControls } from "./AudioPlayer";
 import type { Session, SessionScore } from "@/types/session";
 
 function fmt(sec: number) {
@@ -444,9 +443,19 @@ function ScoreCard({
 function VideoSection({
   videoUrl,
   sessionTitle,
+  videoRef,
+  onTimeUpdate,
 }: {
   videoUrl: string;
   sessionTitle: string;
+  /** Forwarded from PastView so the Interview Transcript entries can
+   *  drive `videoRef.current.currentTime = ts` to seek the recording
+   *  on click. Same ref also gives PastView read-access to currentTime
+   *  for the "currently playing" entry highlight. */
+  videoRef?: React.RefObject<HTMLVideoElement | null>;
+  /** Called on every video time update so the parent can derive which
+   *  Q&A entry is currently playing. */
+  onTimeUpdate?: (currentTime: number) => void;
 }) {
   // Sanitize the title into a filesystem-safe filename — strip
   // characters Windows / macOS will choke on or that browsers will
@@ -475,9 +484,13 @@ function VideoSection({
         </a>
       </div>
       <video
+        ref={videoRef}
         src={videoUrl}
         controls
         preload="metadata"
+        onTimeUpdate={(e) => {
+          onTimeUpdate?.((e.target as HTMLVideoElement).currentTime);
+        }}
         className="w-full bg-black"
       />
       <div className="px-5 py-2 text-[11px] text-ink-lighter italic border-t border-rule">
@@ -579,10 +592,14 @@ export function PastView() {
     (s) => s.setPastSessionScoreError
   );
   const session = pastSessions.find((s) => s.id === selectedPastId);
+  // currentTime is updated by the video element's onTimeUpdate via
+  // VideoSection. Drives "currently playing" highlight on the
+  // Interview Transcript entries. videoRef gives the entry click
+  // handlers a way to set currentTime (= seek the video).
   const [currentTime, setCurrentTime] = useState(0);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
-  const controlsRef = useRef<PlayerControls | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
   // Re-fire /api/score-session against the same Session payload. Keeps
   // the existing score visible until the new one lands (no flicker to
@@ -713,6 +730,8 @@ export function PastView() {
             <VideoSection
               videoUrl={session.videoUrl}
               sessionTitle={session.title}
+              videoRef={videoRef}
+              onTimeUpdate={setCurrentTime}
             />
           )}
 
@@ -753,7 +772,20 @@ export function PastView() {
             return (
               <div
                 key={q.id}
-                onClick={() => controlsRef.current?.seekTo(q.askedAtSeconds)}
+                onClick={() => {
+                  // Seek the video to this question's timestamp. If
+                  // there's no video on this session (legacy session
+                  // without a screen recording, or session was saved
+                  // pre-video-feature), the click is a no-op — we
+                  // intentionally don't fall back to audio anymore
+                  // since the AudioPlayer has been removed.
+                  if (videoRef.current) {
+                    videoRef.current.currentTime = q.askedAtSeconds;
+                    void videoRef.current.play().catch(() => {
+                      /* ignore — autoplay blocked, user can press play */
+                    });
+                  }
+                }}
                 className={`flex gap-4 py-5 border-t border-rule first:border-t-0 -mx-3 px-3 rounded-md cursor-pointer transition-colors ${
                   isPlaying ? "bg-accent-bg" : "hover:bg-paper-subtle"
                 }`}
@@ -832,14 +864,6 @@ export function PastView() {
           })}
         </div>
       </div>
-
-      <AudioPlayer
-        audioUrl={session.audioUrl}
-        durationSec={session.durationSeconds}
-        questions={session.questions}
-        onTimeChange={setCurrentTime}
-        onReady={(c) => (controlsRef.current = c)}
-      />
     </>
   );
 }
