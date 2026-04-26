@@ -4,7 +4,7 @@ import { useState, useRef } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
 import { AudioPlayer, PlayerControls } from "./AudioPlayer";
-import type { SessionScore } from "@/types/session";
+import type { Session, SessionScore } from "@/types/session";
 
 function fmt(sec: number) {
   const mm = Math.floor(sec / 60).toString().padStart(2, "0");
@@ -488,6 +488,87 @@ function VideoSection({
   );
 }
 
+/**
+ * "Copy transcript" button — serializes the Interview Transcript
+ * section into a plain-text representation and writes it to the
+ * clipboard. Useful for pasting into a notes doc, email, or another
+ * coaching review tool. Includes for each Q&A pair: timestamp, phase
+ * label, question text, candidate's answer (full, not truncated),
+ * and the AI commentary text (HTML stripped).
+ *
+ * Briefly flips the label to "Copied" so the user gets visual
+ * feedback that the click took effect.
+ */
+function CopyTranscriptButton({ session }: { session: Session }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = async () => {
+    // Strip HTML tags from commentary text — they're <strong>...</strong>
+    // and <em>...</em> highlights useful in the rendered UI but noise
+    // in plain text.
+    const stripHtml = (s: string) =>
+      s.replace(/<[^>]+>/g, "").replace(/&[a-z]+;/gi, " ").trim();
+    const lines: string[] = [];
+    lines.push(`# ${session.title}`);
+    lines.push(
+      `${new Date(session.startedAt).toLocaleString()} · ${fmt(
+        session.durationSeconds
+      )}`
+    );
+    lines.push("");
+    for (const q of session.questions) {
+      const phase = q.parentQuestionId ? "Probe Question" : "Lead Question";
+      lines.push(`## [${fmt(q.askedAtSeconds)}] ${phase}`);
+      lines.push(q.text);
+      lines.push("");
+      if (q.answerText && q.answerText.trim()) {
+        lines.push(`Candidate's answer:`);
+        lines.push(q.answerText.trim());
+        lines.push("");
+      }
+      if (q.comments.length > 0) {
+        lines.push(`AI commentary:`);
+        for (const c of q.comments) {
+          const text = stripHtml(c.text);
+          if (text) lines.push(text);
+        }
+        lines.push("");
+      }
+    }
+    const text = lines.join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Clipboard access can be denied (HTTP context, permission). Fall
+      // back to a textarea + execCommand("copy") via a hidden node.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1800);
+      } catch {
+        /* user-visible failure — keep silent here, button just doesn't flash */
+      }
+      document.body.removeChild(ta);
+    }
+  };
+  return (
+    <button
+      onClick={onCopy}
+      className="text-[11.5px] font-medium text-accent hover:underline inline-flex items-center gap-1 disabled:opacity-50"
+      disabled={session.questions.length === 0}
+    >
+      {copied ? "✓ Copied" : "⎘ Copy transcript"}
+    </button>
+  );
+}
+
 export function PastView() {
   const t = useTranslations();
   const selectedPastId = useStore((s) => s.selectedPastId);
@@ -644,16 +725,19 @@ export function PastView() {
               they actually said without replaying audio. Click an entry
               to seek the recording (audio for now; switches to video
               in a follow-up commit). */}
-          <div className="mt-8 mb-3 flex items-baseline justify-between">
+          <div className="mt-8 mb-3 flex items-baseline justify-between gap-3">
             <h2 className="text-[15px] font-semibold uppercase tracking-wider text-ink">
               {t("Interview Transcript", "面试记录")}
             </h2>
-            <span className="text-[11px] text-ink-lighter">
-              {session.questions.length}{" "}
-              {session.questions.length === 1
-                ? t("entry", "条")
-                : t("entries", "条")}
-            </span>
+            <div className="flex items-baseline gap-3">
+              <span className="text-[11px] text-ink-lighter">
+                {session.questions.length}{" "}
+                {session.questions.length === 1
+                  ? t("entry", "条")
+                  : t("entries", "条")}
+              </span>
+              <CopyTranscriptButton session={session} />
+            </div>
           </div>
           {session.questions.map((q) => {
             const isPlaying = q.id === activeQId;
