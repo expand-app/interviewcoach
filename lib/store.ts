@@ -82,20 +82,11 @@ interface StoreState {
   liveListeningHint: string;
   setLiveListeningHint: (hint: string) => void;
 
-  /** Warm-up commentary shown when the candidate is speaking before any
-   *  Lead Question has been locked — typically their self-introduction
-   *  in response to the interviewer's opening chitchat/background. The
-   *  model coaches on how they're presenting themselves, in light of
-   *  what the interviewer has said so far. Streams like listening hint
-   *  but anchored on the candidate's warm-up speech. */
-  liveWarmupCommentary: string;
-  setLiveWarmupCommentary: (text: string) => void;
-
   /** Commentary shown when the candidate is asking the interviewer
    *  questions in the reverse-Q&A phase ("any questions for me?").
    *  The model evaluates the QUALITY of the candidate's question
-   *  rather than judging an answer. Streams in like listeningHint /
-   *  warmupCommentary; the UI renders this in the commentary pane while
+   *  rather than judging an answer. Streams in like listeningHint;
+   *  the UI renders this in the commentary pane while
    *  momentState === "candidate_questioning". */
   liveCandidateQuestionCommentary: string;
   setLiveCandidateQuestionCommentary: (text: string) => void;
@@ -297,9 +288,6 @@ export const useStore = create<StoreState>()(
   liveAnswerInProgress: false,
   liveListeningHint: "",
   setLiveListeningHint: (liveListeningHint) => set({ liveListeningHint }),
-  liveWarmupCommentary: "",
-  setLiveWarmupCommentary: (liveWarmupCommentary) =>
-    set({ liveWarmupCommentary }),
   liveCandidateQuestionCommentary: "",
   setLiveCandidateQuestionCommentary: (liveCandidateQuestionCommentary) =>
     set({ liveCandidateQuestionCommentary }),
@@ -348,7 +336,6 @@ export const useStore = create<StoreState>()(
       liveDisplayedComment: null,
       liveAnswerInProgress: false,
       liveListeningHint: "",
-      liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
       liveLockedCandidateQuestion: null,
       liveLockedProbeQuestion: null,
@@ -471,7 +458,6 @@ export const useStore = create<StoreState>()(
       liveDisplayedComment: null,
       liveAnswerInProgress: false,
       liveListeningHint: "",
-      liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
       liveLockedCandidateQuestion: null,
       liveLockedProbeQuestion: null,
@@ -499,7 +485,6 @@ export const useStore = create<StoreState>()(
       liveDisplayedComment: null,
       liveAnswerInProgress: false,
       liveListeningHint: "",
-      liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
       liveLockedCandidateQuestion: null,
       liveLockedProbeQuestion: null,

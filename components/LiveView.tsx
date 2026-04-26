@@ -105,8 +105,8 @@ function computePaneMinDisplayMs(text: string): number {
   return Math.min(CEIL, Math.max(FLOOR, readingMs + BUFFER));
 }
 
-/** Shared renderer for the four commentary slot variants (Q-A, listen
- *  hint, warmup, candidate-question). Splits the streamed text on the
+/** Shared renderer for the three commentary slot variants (Q-A, listen
+ *  hint, candidate-question). Splits the streamed text on the
  *  `---SAY---` marker so the LLM-emitted English suggested-answer
  *  shows below the main observation in italic. The user's spec:
  *  observation in standard prose, then a thin divider + 12.5px italic
@@ -175,7 +175,6 @@ export function LiveView() {
   const moment = useStore((s) => s.liveMomentState);
   const displayedComment = useStore((s) => s.liveDisplayedComment);
   const listeningHint = useStore((s) => s.liveListeningHint);
-  const warmupCommentary = useStore((s) => s.liveWarmupCommentary);
   const candidateQuestionCommentary = useStore(
     (s) => s.liveCandidateQuestionCommentary
   );
@@ -666,7 +665,6 @@ export function LiveView() {
               currentQuestion={rolesConfirmed ? commentaryOwnerQ : undefined}
               displayed={rolesConfirmed ? effectiveDisplayed : null}
               listeningHint={rolesConfirmed ? effectiveListeningHint : ""}
-              warmupCommentary={rolesConfirmed ? warmupCommentary : ""}
               candidateQuestionCommentary={
                 rolesConfirmed ? candidateQuestionCommentary : ""
               }
@@ -1127,7 +1125,6 @@ function CommentarySection({
   currentQuestion,
   displayed,
   listeningHint,
-  warmupCommentary,
   candidateQuestionCommentary,
   overrideText,
   labels,
@@ -1142,15 +1139,11 @@ function CommentarySection({
    *  here has to re-check that gate. */
   displayed: { id: string; questionId?: string; displayedAt: number; minMs: number } | null;
   listeningHint: string;
-  /** Warm-up coaching commentary streamed in while candidate is speaking
-   *  before any Lead Question is locked. Takes the commentary pane when
-   *  a Q-A commentary isn't active AND no listening hint is streaming. */
-  warmupCommentary: string;
   /** Reverse-Q&A commentary streamed in while state === "candidate_questioning".
    *  Evaluates the candidate's question quality (specific vs. generic, ties
    *  to earlier discussion, suggests follow-up). Takes the commentary pane
-   *  in the candidate_questioning phase, beating Q-A / hint / warm-up which
-   *  don't apply at that point in the interview. */
+   *  in the candidate_questioning phase, beating Q-A / hint which don't
+   *  apply at that point in the interview. */
   candidateQuestionCommentary: string;
   /** Timeline-mode override: when set, render this text directly and
    *  skip the `displayed.id` → `currentQuestion.comments` lookup. Needed
@@ -1274,33 +1267,20 @@ function CommentarySection({
   // Listening-hint takes the commentary slot whenever it's still fresh
   // (i.e. within its content-length-derived min-display window). Priority:
   //   candidate-question commentary > fresh Q-A commentary >
-  //   fresh listening-hint > warm-up > idle
+  //   fresh listening-hint > idle
   const showListeningHint =
     !showCandidateQuestionCommentary && !isShowing && listeningHintFresh;
 
-  // Warm-up commentary takes the pane when candidate is speaking in
-  // warm-up phase (no Lead Q locked, no Q-A commentary active, no
-  // listening hint streaming). This is coaching on the self-intro.
-  const showWarmupCommentary =
-    !showCandidateQuestionCommentary &&
-    !isShowing &&
-    !showListeningHint &&
-    warmupCommentary.trim().length > 0 &&
-    !currentQuestion;
-
   // Any moment the pane has nothing concrete to show (no Q-A commentary,
-  // no listening hint, no warm-up commentary, no candidate-question
-  // commentary) we unify on a single "AI is observing…" placeholder
-  // with animated dots. Previously we split into five different messages
-  // (identifying / waiting-first / waiting-answer / between-Qs /
-  // observing) — too noisy, each transition felt like the AI changed
-  // its mind. The dots + single short line keeps the pane visually
-  // alive and semantically consistent across every idle state.
+  // no listening hint, no candidate-question commentary) we unify on a
+  // single "AI is observing…" placeholder with animated dots. Previously
+  // we split into five different messages (identifying / waiting-first
+  // / waiting-answer / between-Qs / observing) — too noisy, each
+  // transition felt like the AI changed its mind. The dots + single
+  // short line keeps the pane visually alive and semantically
+  // consistent across every idle state.
   const isIdle =
-    !showCandidateQuestionCommentary &&
-    !isShowing &&
-    !showListeningHint &&
-    !showWarmupCommentary;
+    !showCandidateQuestionCommentary && !isShowing && !showListeningHint;
 
   // ============================================================
   // Consume-once: each piece of content shows ONCE; once it's been
@@ -1319,19 +1299,16 @@ function CommentarySection({
   // ============================================================
   const setDisplayedComment = useStore((s) => s.setDisplayedComment);
   const setLiveListeningHint = useStore((s) => s.setLiveListeningHint);
-  const setLiveWarmupCommentary = useStore((s) => s.setLiveWarmupCommentary);
   const setLiveCandidateQuestionCommentary = useStore(
     (s) => s.setLiveCandidateQuestionCommentary
   );
-  type ShownKind = "qa" | "hint" | "warmup" | "candidate-q" | "idle";
+  type ShownKind = "qa" | "hint" | "candidate-q" | "idle";
   const showingKind: ShownKind = showCandidateQuestionCommentary
     ? "candidate-q"
     : showListeningHint
     ? "hint"
     : isShowing
     ? "qa"
-    : showWarmupCommentary
-    ? "warmup"
     : "idle";
   const prevShownKindRef = useRef<ShownKind>("idle");
   useEffect(() => {
@@ -1342,7 +1319,6 @@ function CommentarySection({
       // post-render so we don't fight React's render pipeline.
       if (prev === "qa") setDisplayedComment(null);
       else if (prev === "hint") setLiveListeningHint("");
-      else if (prev === "warmup") setLiveWarmupCommentary("");
       else if (prev === "candidate-q") setLiveCandidateQuestionCommentary("");
     }
     prevShownKindRef.current = showingKind;
@@ -1350,7 +1326,6 @@ function CommentarySection({
     showingKind,
     setDisplayedComment,
     setLiveListeningHint,
-    setLiveWarmupCommentary,
     setLiveCandidateQuestionCommentary,
   ]);
 
@@ -1387,8 +1362,6 @@ function CommentarySection({
           // glance this is in-the-moment coaching ("listen for X") vs
           // post-answer evaluative commentary.
           <CommentaryBody html={listeningHint} tone="hint" />
-        ) : showWarmupCommentary ? (
-          <CommentaryBody html={warmupCommentary} tone="commentary" />
         ) : isShowing && displayedComment ? (
           <CommentaryBody
             html={displayedComment.text || "…"}
@@ -1396,9 +1369,9 @@ function CommentarySection({
           />
         ) : isIdle ? (
           // Unified idle state: dots + "AI is observing…" across all
-          // sub-cases (role-identification, warm-up, between-Qs,
-          // waiting-for-answer, candidate-mid-answer). Same visual for
-          // all so transitions feel smooth.
+          // sub-cases (role-identification, between-Qs, waiting-for-
+          // answer, candidate-mid-answer). Same visual for all so
+          // transitions feel smooth.
           <div className="m-auto inline-flex items-center gap-2 text-ink-lighter italic text-sm">
             <span className="inline-flex gap-[3px]">
               <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot" />

@@ -89,12 +89,6 @@ const COMMENT_BUFFER_MS     = 1500;    // padding on top of computed reading tim
 const LISTENING_HINT_TRIGGER_CHARS = 250;
 const LISTENING_HINT_MIN_GAP_MS    = 10000;
 
-// Warm-up commentary triggers — fire when candidate accumulates
-// self-intro text before any Lead Question has been locked. Same
-// watermark + cooldown idiom as listening hints.
-const WARMUP_COMMENTARY_TRIGGER_CHARS = 250;
-const WARMUP_COMMENTARY_MIN_GAP_MS    = 10000;
-
 // Identification thresholds
 const IDENTIFY_MIN_DISTINCT_SPEAKERS = 2;
 const IDENTIFY_MIN_TOTAL_UTTERANCES  = 3;
@@ -239,24 +233,16 @@ export class LiveOrchestrator {
   private interviewerMonologueBuffer = "";
   private pendingListeningHint = false;
   private lastListeningHintAt = 0;
-  /** Candidate warm-up speech buffer. Accumulates candidate text while
-   *  no Lead Question is locked (typical: self-introduction responding
-   *  to the interviewer's opening chitchat). Used to trigger warm-up
-   *  coaching commentary — separate from answer-judging commentary. */
-  private candidateWarmupBuffer = "";
-  private pendingWarmupCommentary = false;
-  private lastWarmupCommentAt = 0;
-  private lastWarmupBufferSize = 0;
 
-  /** Shared across ALL commentary types (Q-A, listening hint, warm-up).
+  /** Shared across ALL commentary types (Q-A, listening hint, cand-q).
    *  Every commentary that successfully streams in records its final
    *  text + the moment it finished streaming here. Before firing a
-   *  listening hint or warm-up commentary we consult this to ensure
-   *  the previous piece has been on screen long enough for a typical
-   *  reader to finish — no point slamming a new hint in while the old
-   *  one is still being read. Q-A commentary itself is NOT gated by
-   *  this (it has its own minMs drop-on-overlap mechanism), but Q-A
-   *  DOES update these fields so subsequent hints/warmups respect the
+   *  listening hint or candidate-question commentary we consult this
+   *  to ensure the previous piece has been on screen long enough for a
+   *  typical reader to finish — no point slamming a new hint in while
+   *  the old one is still being read. Q-A commentary itself is NOT
+   *  gated by this (it has its own minMs drop-on-overlap mechanism),
+   *  but Q-A DOES update these fields so subsequent hints respect the
    *  time the user needs to absorb a Q-A observation. */
   private lastCommentaryReadyAt = 0;
   private lastCommentaryText = "";
@@ -1066,10 +1052,6 @@ export class LiveOrchestrator {
     this.lastListeningHintBufferSize = 0;
     this.pendingListeningHint = false;
     this.lastListeningHintAt = 0;
-    this.candidateWarmupBuffer = "";
-    this.lastWarmupBufferSize = 0;
-    this.pendingWarmupCommentary = false;
-    this.lastWarmupCommentAt = 0;
     this.lastCommentaryReadyAt = 0;
     this.lastCommentaryText = "";
     this.pendingCommentaryFor = null;
@@ -1388,22 +1370,10 @@ export class LiveOrchestrator {
         (this.pendingAnswerBuffer ? " " : "") + clean;
     }
 
-    // === Warm-up commentary trigger ===
-    // Candidate is speaking and NO Lead Question has been locked yet.
-    // Typically the self-introduction phase after the interviewer's
-    // opening background talk. Accumulate their text and coach on how
-    // they're presenting themselves, independent of any Q-A pair.
-    if (!hasLockedQ) {
-      this.candidateWarmupBuffer +=
-        (this.candidateWarmupBuffer ? " " : "") + clean;
-      if (this.shouldTriggerWarmupCommentary()) {
-        void this.generateWarmupCommentary();
-      }
-    }
   }
 
   /** Compute how long a piece of commentary should stay on screen
-   *  before the next one of its kind (or the next hint/warmup) is
+   *  before the next one of its kind (or the next hint) is
    *  allowed to replace it. Based on a typical mixed-language reading
    *  pace + a baseline reaction window.
    *
@@ -1453,53 +1423,11 @@ export class LiveOrchestrator {
     this.lastCommentaryReadyAt = Date.now();
   }
 
-  /** True when we should fire a warm-up commentary generation right now.
-   *
-   *  Semantic constraint: warm-up is a **one-time phase** at the very
-   *  start of a session. Once ANY Lead Question has locked (even if it
-   *  later gets archived by a new_topic pivot), we're permanently out
-   *  of warm-up — the candidate has entered the Q-A flow. During the
-   *  brief "between-questions" gap (previous Lead archived, new Lead
-   *  not yet locked), currentQuestionId is null but it's NOT a return
-   *  to warm-up, so warm-up commentary must not fire here. */
-  private shouldTriggerWarmupCommentary(): boolean {
-    if (this.pendingWarmupCommentary) return false;
-    // One-time gate: any Lead ever in this session → never fire warm-up again.
-    const hasEverHadLead = useStore
-      .getState()
-      .liveQuestions.some((q) => !q.parentQuestionId);
-    if (hasEverHadLead) return false;
-    const newChars =
-      this.candidateWarmupBuffer.length - this.lastWarmupBufferSize;
-    // Log the reading-protection block ONLY when other conditions would
-    // otherwise let the fire go through — so we don't spam the log on
-    // every utterance arrival.
-    if (
-      newChars >= WARMUP_COMMENTARY_TRIGGER_CHARS &&
-      Date.now() - this.lastWarmupCommentAt >= WARMUP_COMMENTARY_MIN_GAP_MS &&
-      this.isStillBeingRead()
-    ) {
-      const required = this.computeReadingTimeMs(this.lastCommentaryText);
-      const elapsed = Date.now() - this.lastCommentaryReadyAt;
-      log("read-gate", "hold-wu", {
-        elapsedMs: elapsed,
-        requiredMs: required,
-        prev: preview(this.lastCommentaryText, 60),
-      });
-      return false;
-    }
-    if (this.isStillBeingRead()) return false;
-    if (newChars < WARMUP_COMMENTARY_TRIGGER_CHARS) return false;
-    if (Date.now() - this.lastWarmupCommentAt < WARMUP_COMMENTARY_MIN_GAP_MS)
-      return false;
-    return true;
-  }
-
   /**
    * Shared SSE streaming helper with exponential-backoff retry.
    *
-   * Called by the three commentary generators (Q-A, listening hint,
-   * warm-up). Handles the fetch → stream → parse-SSE loop and retries
+   * Called by the commentary generators (Q-A, listening hint,
+   * cand-q-cmt). Handles the fetch → stream → parse-SSE loop and retries
    * on network errors / 5xx / 429 up to 3 total attempts with
    * 500ms / 1500ms backoffs. The UI's displayed text resets and
    * re-streams on retry — brief flash, but far better than a silently-
@@ -1518,7 +1446,7 @@ export class LiveOrchestrator {
   private async streamCommentarySSE(
     body: unknown,
     onDelta: (accumulated: string) => void,
-    kind: "commentary" | "listen-hint" | "warmup-cmt" | "cand-q-cmt",
+    kind: "commentary" | "listen-hint" | "cand-q-cmt",
     onApiError?: (err: string) => void
   ): Promise<string | null> {
     const BACKOFFS_MS = [500, 1500]; // delay before attempt #2 and attempt #3
@@ -1590,55 +1518,6 @@ export class LiveOrchestrator {
       }
     }
     return null;
-  }
-
-  /** Fire a warm-up commentary call. Streams into `liveWarmupCommentary`
-   *  so the Commentary pane can render it while no Lead Q is locked. */
-  private async generateWarmupCommentary() {
-    this.pendingWarmupCommentary = true;
-    const warmupText = this.candidateWarmupBuffer;
-    const { liveJd, liveResume, commentLang, setLiveWarmupCommentary } =
-      useStore.getState();
-
-    setLiveWarmupCommentary(""); // clear previous — streaming starts fresh
-    log("warmup-cmt", "request", {
-      bufLen: warmupText.length,
-      preview: preview(warmupText, 80),
-    });
-
-    try {
-      let sawApiError = false;
-      const accumulated = await this.streamCommentarySSE(
-        {
-          jd: liveJd,
-          resume: liveResume,
-          question: "",
-          answer: "",
-          mode: "warmup",
-          candidateWarmup: warmupText,
-          recentDialogue: this.dialogueBuffer.slice(-12),
-          lang: commentLang,
-        },
-        (acc) => useStore.getState().setLiveWarmupCommentary(acc),
-        "warmup-cmt",
-        () => {
-          sawApiError = true;
-        }
-      );
-      this.lastWarmupCommentAt = Date.now();
-      // Watermark so next fire needs genuinely new candidate content.
-      this.lastWarmupBufferSize = this.candidateWarmupBuffer.length;
-      if (accumulated !== null && !sawApiError && accumulated.length > 0) {
-        this.markCommentaryDisplayed(accumulated);
-        log("warmup-cmt", "done", {
-          chars: accumulated.length,
-          readMs: this.computeReadingTimeMs(accumulated),
-          preview: preview(accumulated, 100),
-        });
-      }
-    } finally {
-      this.pendingWarmupCommentary = false;
-    }
   }
 
   /** Fire a candidate-question commentary call. Reverse-Q&A phase: the
@@ -1724,8 +1603,8 @@ export class LiveOrchestrator {
     // still inside its content-length-based min-display window. We
     // reuse `lastCommentaryReadyAt` + `lastCommentaryText` which are
     // already set by markCommentaryDisplayed at the end of every hint
-    // generation (and by Q-A / warmup successes too). If the previous
-    // commentary slot is still being read, defer.
+    // generation (and by Q-A / cand-q-cmt successes too). If the
+    // previous commentary slot is still being read, defer.
     if (this.lastCommentaryReadyAt > 0 && this.lastCommentaryText) {
       const required = computeMinDisplayMs(this.lastCommentaryText);
       const elapsed = Date.now() - this.lastCommentaryReadyAt;
@@ -2048,9 +1927,6 @@ export class LiveOrchestrator {
       this.interviewerMonologueBuffer = "";
       this.lastListeningHintBufferSize = 0;
       useStore.getState().setLiveListeningHint("");
-      this.candidateWarmupBuffer = "";
-      this.lastWarmupBufferSize = 0;
-      useStore.getState().setLiveWarmupCommentary("");
       store.setDisplayedComment(null);
       store.setAnswerInProgress(false);
       // Clear any locked Probe Q — reverse Q&A starts; the prior
@@ -2726,10 +2602,6 @@ export class LiveOrchestrator {
     this.interviewerMonologueBuffer = "";
     this.lastListeningHintBufferSize = 0;
     useStore.getState().setLiveListeningHint("");
-    // Warm-up ended — clear its buffer + clear the pane text.
-    this.candidateWarmupBuffer = "";
-    this.lastWarmupBufferSize = 0;
-    useStore.getState().setLiveWarmupCommentary("");
     this.pendingCommentaryFor = null;
     store.setAnswerInProgress(this.answerBuffer.length > 0);
     if (this.shouldTriggerComment(q.id)) {

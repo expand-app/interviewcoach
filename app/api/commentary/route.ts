@@ -30,23 +30,16 @@ interface CommentaryBody {
    *  "listening" — the interviewer is monologuing (describing team /
    *  context / setup), coach the candidate on what to listen for and
    *  how to pick up the thread.
-   *  "warmup" — candidate is speaking before any Lead Question is
-   *  locked (typical: self-introduction in response to opening
-   *  chitchat). Coach on how they're presenting themselves given what
-   *  the interviewer has already said.
    *  "candidate_question" — reverse Q&A near interview end: the
    *  candidate is asking the interviewer questions about the team /
    *  role / process. Evaluate the QUALITY of the candidate's question
    *  (generic vs. specific to what was discussed, signals genuine
    *  interest, leverages information the interviewer revealed earlier,
    *  etc.). */
-  mode?: "answer" | "listening" | "warmup" | "candidate_question";
+  mode?: "answer" | "listening" | "candidate_question";
   /** When mode === "listening", the accumulated interviewer monologue
    *  text that we're coaching the candidate to process. */
   interviewerMonologue?: string;
-  /** When mode === "warmup", the candidate's self-intro / warm-up
-   *  speech accumulated so far. */
-  candidateWarmup?: string;
   /** When mode === "candidate_question", the candidate's question to
    *  the interviewer (e.g. "What does the team look like?"). */
   candidateQuestion?: string;
@@ -80,7 +73,6 @@ export async function POST(req: Request) {
     lang,
     mode = "answer",
     interviewerMonologue = "",
-    candidateWarmup = "",
     candidateQuestion = "",
   } = body;
 
@@ -89,9 +81,6 @@ export async function POST(req: Request) {
   }
   if (mode === "listening" && !interviewerMonologue.trim()) {
     return new Response("Missing interviewerMonologue", { status: 400 });
-  }
-  if (mode === "warmup" && !candidateWarmup.trim()) {
-    return new Response("Missing candidateWarmup", { status: 400 });
   }
   if (mode === "candidate_question" && !candidateQuestion.trim()) {
     return new Response("Missing candidateQuestion", { status: 400 });
@@ -121,7 +110,6 @@ Rules for the SAY block:
 - Calibrated to the moment:
     * In a Q-A commentary on a thin answer → the script REPAIRS / extends the answer with one concrete pivot ("Actually let me anchor this — at <strong>Fidelity</strong> I... and we measured this with <strong>p99 latency</strong>...").
     * In a listening-hint mid-monologue → the script gives the candidate the next anchor when the interviewer pauses ("That tracks with what we did at... — was your team also dealing with <strong>thin-data portfolios</strong>?").
-    * In a warm-up commentary → the script tightens the self-intro toward the JD anchor ("Most relevant: I'm finishing a <strong>counterparty PD</strong> model at Fidelity...").
     * In a candidate-question commentary → the script is a SHARPER follow-up question, since the candidate is in asking mode.
 - May use <strong>...</strong> for 1-2 key terms (technical or numerical). No markdown. Keep quotes around the phrase.
 - The marker \`---SAY---\` MUST be on its own line, exactly as written, before the Try: line.`;
@@ -374,75 +362,6 @@ Examples:
 
 Don't phrase this as a judgment. It's a tip, not a score.${SAY_BLOCK}`;
 
-  // == Warm-up mode: candidate is talking BEFORE any Lead Question is locked ==
-  // Typically their self-introduction responding to the interviewer's
-  // opening chitchat / background talk. Coach on how they're presenting
-  // themselves in light of what the interviewer has revealed so far
-  // (tone, what they emphasize, what they care about). This is not a
-  // Q&A judgement — there's no question yet — it's framing advice for
-  // the ongoing intro.
-  const systemWarmupEn = `You are a senior interview coach observing a live interview during the WARM-UP phase — the interviewer has been doing intro / chitchat / background talk, and the candidate is now speaking (typically a self-introduction) before any formal question has been asked.
-
-=== JOB DESCRIPTION ===
-${jd}
-=== END JD ===
-
-${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}
-
-Your job: give ONE short coaching observation on HOW the candidate is presenting themselves in this warm-up window, cross-checked against what the interviewer has already said.
-
-Output:
-- 3–4 sentences (strict upper bound: ~70 words / ~450 characters). Fits in a fixed display pane.
-- ENGLISH, with technical terms preserved.
-- You may use <strong>...</strong> to highlight 1–2 key terms. No markdown.
-- No preamble — just the observation.
-
-Angles (pick what's most relevant):
-- ALIGNMENT with what the interviewer revealed: did the interviewer emphasize <strong>cross-team collaboration</strong> or <strong>scrappy execution</strong> in their intro, and is the candidate naming experiences that land on that anchor? If not, flag it.
-- SPECIFICITY: is the intro concrete (names, numbers, decisions) or vague boilerplate? A warm-up intro is the FIRST signal — recruiters make snap judgments here.
-- JD/resume fit: is the candidate bringing forward the parts of their background most relevant to THIS role, or giving a generic bio they'd give for anything?
-- Tone calibration: interviewer was warm → candidate matches energy? Interviewer was brisk → candidate keeping it tight?
-- Opening-signal risks: rambling past 90s, naming irrelevant employers first, leading with weaknesses, overly scripted cadence.
-
-Examples:
-- "Intro is naming his title and company but no <strong>outcome metrics</strong> yet. Interviewer flagged 'shipping at scale' twice in the setup — a concrete scale number (QPS, users, $ impact) in the next 30s would anchor him to the JD's anchor."
-- "Good that he's pulling forward the <strong>payments infrastructure</strong> thread — that matches what the interviewer emphasized about the team's 2026 roadmap. Keep building on that."
-- "Running long. He's 90s in still on high school. Recruiters make the fit call in the first 2 minutes — cut to the most JD-relevant project fast."
-- "Naming employers but not <strong>roles</strong> — unclear if he was an IC or lead. Interviewer's 'we're looking for someone who can mentor' setup will want that clarity."
-
-Be calibrated, not harsh. This is the warm-up — coach toward what to adjust, don't roast. Skip piling on — if the intro is going fine, say something balanced/observational.${SAY_BLOCK}`;
-
-  const systemWarmupZh = `你是一位资深面试教练,正在旁观一场真实面试的 WARM-UP 阶段 —— 面试官刚做完开场寒暄 / 公司背景介绍,候选人现在开始说话(通常是自我介绍),还没有正式问题 finalize。
-
-=== 岗位描述 (JD) ===
-${jd}
-=== JD 结束 ===
-
-${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
-
-你的任务:给一条简短的 coaching 观察,看候选人在这段 warm-up 里**如何在自我呈现**,对照面试官之前说的内容。
-
-输出:
-- 3-4 句(严格上限:主体 150 字以内,英文术语不计入)。要放进固定大小的展示框。
-- 中文为主 + 英文关键词(recommendation model, scale, tradeoff 等保留英文)。
-- 可以用 <strong>...</strong> 标 1-2 个关键词。不要用 markdown。
-- 不要开场白,直接给观察。
-
-观察角度(挑最相关的一个):
-- 和面试官 setup 的对齐:面试官强调的是 <strong>cross-team</strong> / scrappy 之类,候选人现在讲的事是不是打在这个 anchor 上?如果没有,点出来。
-- 具体性:intro 有没有具体数字 / 项目名 / 决策 ,还是空话 boilerplate?Warm-up 是**第一印象**,在这里就开始打分了。
-- JD / resume fit:候选人有没有把最相关的那段经历先拿出来,还是讲了段可以套在任何岗位的通用 bio。
-- 节奏 / 能量匹配:面试官暖 → 候选人接住能量?面试官干脆 → 候选人也简洁?
-- 开场风险:讲太久超过 90 秒、先讲不相关的雇主、先讲弱点、过度剧本化。
-
-示例:
-- "intro 讲了 title 和公司,但没带 <strong>outcome metric</strong>。面试官 setup 里两次提到 'shipping at scale',接下来 30 秒甩一个具体规模数字(QPS, 用户量, $ impact)会锚回 JD。"
-- "他把 <strong>payments infrastructure</strong> 提到前面很对 —— 面试官讲团队 2026 roadmap 时强调过这个。继续展开。"
-- "Intro 在拖。已经 90 秒了还在讲高中。Recruiter 前 2 分钟就打 fit 判断,要尽快切到 JD 最相关的项目。"
-- "讲了雇主但没讲 <strong>role</strong> —— 不清楚他是 IC 还是 lead。面试官 setup 里 'we're looking for someone who can mentor' 这个信号需要这个清晰度。"
-
-基调要 calibrated,不要 roast。这是 warm-up,指出该调整什么,不要小题大做。如果 intro 进行得不错,给一句中性观察就够。${SAY_BLOCK}`;
-
   // == Candidate-question mode: reverse Q&A near interview end ==
   // The candidate has been handed the floor and is asking the
   // interviewer questions about the team / role / process. We're
@@ -541,10 +460,6 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
       ? lang === "zh"
         ? `面试官目前在说的一段(还没有 finalize 成问题):\n"""\n${interviewerMonologue}\n"""${dialogueBlock}\n\n给候选人一条听力提示。`
         : `Interviewer's current monologue (no question finalized yet):\n"""\n${interviewerMonologue}\n"""${dialogueBlock}\n\nGive the candidate one listening tip.`
-      : mode === "warmup"
-      ? lang === "zh"
-        ? `候选人目前的 warm-up 讲话(还没有正式问题 finalize):\n"""\n${candidateWarmup}\n"""${dialogueBlock}\n\n给一条 warm-up coaching 观察。`
-        : `Candidate's warm-up speech so far (no question finalized yet):\n"""\n${candidateWarmup}\n"""${dialogueBlock}\n\nGive one warm-up coaching observation.`
       : mode === "candidate_question"
       ? lang === "zh"
         ? `候选人现在向面试官问的问题:\n"""\n${candidateQuestion}\n"""${dialogueBlock}\n\n评价这个问题的质量,并(如果合适)建议一个追问方向。`
@@ -558,10 +473,6 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
       ? lang === "zh"
         ? systemListening
         : systemListeningEn
-      : mode === "warmup"
-      ? lang === "zh"
-        ? systemWarmupZh
-        : systemWarmupEn
       : mode === "candidate_question"
       ? lang === "zh"
         ? systemCandidateQuestionZh
