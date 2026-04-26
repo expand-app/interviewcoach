@@ -306,6 +306,15 @@ questionRelation guidance:
 - When state is candidate_questioning: questionRelation = null always.
 
 Summary writing style:
+- Format: short gerund / verb phrase, max ~8 words. NO pronouns
+  ("their", "his", "her", "the candidate's"). When a subject is needed
+  for clarity, use "Candidate" or "Interviewer" as a bare noun.
+- Bad:  "Candidate introducing their background"
+- Good: "Candidate introducing background and credentials"
+- Good: "Self-introduction in progress"
+- Bad:  "Interviewer asking about his project"
+- Good: "Interviewer asking about the project"
+- Good: "Asking about the recommendation model goal"
 - chitchat: "Greeting and audio check"
 - interviewer_speaking: short topic phrase, e.g. "asking about the recommendation model goal"
 - question_finalized: omit or echo the question
