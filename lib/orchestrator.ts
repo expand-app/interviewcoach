@@ -161,15 +161,25 @@ function rand(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now()}`;
 }
 
-/** Reading time for a piece of commentary text. Mixed Chinese + English uses
- *  the slower of the two rates so neither side gets cut off. */
+/** Reading time for a piece of commentary text.
+ *  Strip HTML tags first so the pre-rendered `<strong>X</strong>`
+ *  markup doesn't inflate the count (was previously counting the tag
+ *  as an English word and over-shooting by 1-2x). For mixed Chinese
+ *  + English, the times ADD — you have to read both halves, not the
+ *  longer one. Math.max(...) was the bug that made 200-char hints
+ *  with embedded English terms get visually truncated. */
 function computeMinDisplayMs(text: string): number {
   if (!text) return COMMENT_MIN_DISPLAY_MS;
-  const cjk = (text.match(/[一-鿿]/g) || []).length;
-  const englishWords = text.split(/\s+/).filter((w) => /[a-zA-Z]/.test(w)).length;
-  const cjkSec = cjk / 4;        // 4 chars/sec
-  const enSec = englishWords / 2; // 2 words/sec
-  const readingMs = Math.max(cjkSec, enSec) * 1000;
+  const stripped = text
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z]+;/gi, " ")
+    .trim();
+  if (!stripped) return COMMENT_MIN_DISPLAY_MS;
+  const cjk = (stripped.match(/[一-鿿]/g) || []).length;
+  const englishWords = stripped
+    .split(/\s+/)
+    .filter((w) => /[a-zA-Z]/.test(w)).length;
+  const readingMs = (cjk / 4 + englishWords / 2) * 1000;
   return Math.min(
     COMMENT_MAX_DISPLAY_MS,
     Math.max(COMMENT_MIN_DISPLAY_MS, readingMs + COMMENT_BUFFER_MS)
@@ -1616,14 +1626,20 @@ export class LiveOrchestrator {
 
   /** True when we should fire a listening-hint generation right now.
    *
-   *  Listen-hints are "quick flash" aids during interviewer monologues
-   *  — they intentionally do NOT go through the reading-protection
-   *  gate (that's for Q-A / warm-up commentary, which are
-   *  content-dense observations that need time to absorb). A new hint
-   *  replaces the previous one immediately. This keeps hint cadence
-   *  aligned with how fast the interviewer is actually revealing new
-   *  information, rather than throttled behind whichever piece of
-   *  commentary last ran.
+   *  Gating, in priority order:
+   *    (1) No generation already pending.
+   *    (2) Enough NEW monologue content since the last hint
+   *        (LISTENING_HINT_TRIGGER_CHARS, watermarked by buffer size,
+   *        so a stagnant 500-char buffer doesn't re-fire on a timer).
+   *    (3) Past the LISTENING_HINT_MIN_GAP_MS cooldown.
+   *    (4) Previous hint has been on screen long enough — i.e. its
+   *        length-derived min-display window has elapsed. Without
+   *        this, a new hint generation calls setLiveListeningHint("")
+   *        which yanks a still-being-read 200-char hint off screen
+   *        and replaces it with streaming-in tokens of the next one.
+   *        We were seeing this in the 32-min log: 21:43 hint (147
+   *        chars, ~38s of reading) was clobbered by the 22:04
+   *        generation, which is well within its window.
    */
   private shouldTriggerListeningHint(): boolean {
     if (this.pendingListeningHint) return false;
@@ -1636,6 +1652,24 @@ export class LiveOrchestrator {
     if (newCharsSinceLastHint < LISTENING_HINT_TRIGGER_CHARS) return false;
     if (Date.now() - this.lastListeningHintAt < LISTENING_HINT_MIN_GAP_MS)
       return false;
+    // Reading-protection: don't clobber the previous hint while it's
+    // still inside its content-length-based min-display window. We
+    // reuse `lastCommentaryReadyAt` + `lastCommentaryText` which are
+    // already set by markCommentaryDisplayed at the end of every hint
+    // generation (and by Q-A / warmup successes too). If the previous
+    // commentary slot is still being read, defer.
+    if (this.lastCommentaryReadyAt > 0 && this.lastCommentaryText) {
+      const required = computeMinDisplayMs(this.lastCommentaryText);
+      const elapsed = Date.now() - this.lastCommentaryReadyAt;
+      if (elapsed < required) {
+        log("listen-hint", "deferred-reading", {
+          elapsedMs: elapsed,
+          requiredMs: required,
+          prev: preview(this.lastCommentaryText, 60),
+        });
+        return false;
+      }
+    }
     return true;
   }
 
