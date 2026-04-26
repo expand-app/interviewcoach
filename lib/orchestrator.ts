@@ -2050,26 +2050,26 @@ export class LiveOrchestrator {
         return;
       }
       if (next === "interviewer_speaking" && rel === "new_topic") {
-        // Interviewer pivoting to a new topic — archive immediately so the bar
-        // visibly shifts to "Interviewer is asking…" for the new main.
+        // Interviewer pivoting to a new topic. We used to archive the
+        // current Lead immediately here so the Phase bar would shift
+        // to "Between Questions · Interviewer Transitioning" while the
+        // next question was forming. Per the user's spec ("interview
+        // 期间无非两种情况:面试官问问题 or 候选人问问题, 完全去掉
+        // Between Questions phase"), we now KEEP the current Lead
+        // visible right up until the new one actually locks via
+        // archiveCurrentMainAndStartNew. Net: one phase, not two —
+        // the bar goes Lead-A → Lead-B atomically with no empty gap
+        // in between, and Live Commentary doesn't get yanked into
+        // an "AI is observing…" idle state during the interviewer's
+        // pivot monologue.
         //
-        // DO NOT clear interviewerMonologueBuffer here: the interviewer is
-        // STILL mid-monologue (that's why state is interviewer_speaking),
-        // just pivoting topics. Clearing would wipe the context the hint
-        // is supposed to coach on. The buffer is drained at question-
-        // finalization instead, which is the real semantic boundary.
-        //
-        // The listening hint UI text IS cleared so a stale old-topic hint
-        // doesn't linger while the new topic's hint is being built.
-        store.setCurrentQuestionId(null);
+        // We still refresh the summary line and clear the listening-
+        // hint slot (so a stale old-topic hint isn't reused), but the
+        // currentQuestionId / displayedComment / answer buffers stay
+        // intact so the previous Q&A context lives until the new
+        // commit point.
         store.setMomentState({ state: "interviewer_speaking", summary });
-        store.setDisplayedComment(null);
-        store.setAnswerInProgress(false);
-        this.answerBuffer = "";
-        this.pendingAnswerBuffer = "";
-        this.dialogueBuffer = [];
         useStore.getState().setLiveListeningHint("");
-        this.pendingCommentaryFor = null;
         return;
       }
       // Anything else (interviewer follow-up speaking, chitchat, candidate

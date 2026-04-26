@@ -99,6 +99,33 @@ export async function POST(req: Request) {
 
   const client = getAnthropicClient();
 
+  // ==== SUGGESTED-ANSWER BLOCK (shared across all 4 modes / 6 prompts) ====
+  // The user wants every commentary / hint to end with a tiny English
+  // model-script the candidate can actually utter — sits visually below
+  // the observation as italic guidance. Keeps it speakable, calibrated
+  // to the moment, with `...` to elide middle parts so the line fits in
+  // the pane. The `---SAY---` marker is an exact-string sentinel the UI
+  // splits on; do not change it without updating LiveView's parser.
+  const SAY_BLOCK = `
+
+== SUGGESTED-ANSWER BLOCK (REQUIRED, after your observation above) ==
+ALWAYS append this exact format on a NEW line at the very end of your output:
+
+---SAY---
+Try: "<short English script the candidate can speak right now>"
+
+Rules for the SAY block:
+- ALWAYS in ENGLISH, regardless of the language used above. The user reads this as their script.
+- ONE line, ~15-30 words inside the quotes. Use "..." inside the quotes to elide middle parts the candidate would naturally say but isn't worth scripting.
+- Concrete and SPEAKABLE — a phrase the candidate could actually utter, not a description like "explain X". Bad: \`Try: "Talk about the modeling tradeoff."\` Good: \`Try: "I'd start with logistic regression as the baseline because it's auditable... and only add XGBoost where the lift on validation justifies the interpretability cost."\`
+- Calibrated to the moment:
+    * In a Q-A commentary on a thin answer → the script REPAIRS / extends the answer with one concrete pivot ("Actually let me anchor this — at <strong>Fidelity</strong> I... and we measured this with <strong>p99 latency</strong>...").
+    * In a listening-hint mid-monologue → the script gives the candidate the next anchor when the interviewer pauses ("That tracks with what we did at... — was your team also dealing with <strong>thin-data portfolios</strong>?").
+    * In a warm-up commentary → the script tightens the self-intro toward the JD anchor ("Most relevant: I'm finishing a <strong>counterparty PD</strong> model at Fidelity...").
+    * In a candidate-question commentary → the script is a SHARPER follow-up question, since the candidate is in asking mode.
+- May use <strong>...</strong> for 1-2 key terms (technical or numerical). No markdown. Keep quotes around the phrase.
+- The marker \`---SAY---\` MUST be on its own line, exactly as written, before the Try: line.`;
+
   const systemEn = `You are a senior interview coach silently observing a live interview. Write ONE short, pointed observation about how the answer is going.
 
 === JOB DESCRIPTION ===
@@ -179,7 +206,7 @@ The "question" text above was picked by an upstream classifier and may occasiona
 - If the candidate's answer is very short / inconclusive and you can't tell whether it's on-topic, hedge — don't confidently judge either way.
 This prevents Commentary from confidently critiquing based on a possibly-misheard question.
 
-If prior comments exist for this same answer, don't repeat — add a NEW angle, or switch register (if you've been critical, find something real to praise, and vice versa).`;
+If prior comments exist for this same answer, don't repeat — add a NEW angle, or switch register (if you've been critical, find something real to praise, and vice versa).${SAY_BLOCK}`;
 
   const systemZh = `你是一位资深面试教练,正在旁观一场真实面试。你在看候选人回答一个具体问题,就这段回答的进行情况给出一句简短、有针对性的观察。
 
@@ -265,7 +292,7 @@ DRIFT DETECTION(重要):
 - 如果候选人答得太短没法判断,就 hedge 一下,不要武断评价。
 这个设计是为了防止 Commentary 对着听错的 question 自信地瞎评。
 
-如果之前已经就这段回答给过评论了,不要重复已经说过的点 —— 换角度,或者换 register(上一条批评过,这一条找一个真实的点夸一下;反过来亦然)。`;
+如果之前已经就这段回答给过评论了,不要重复已经说过的点 —— 换角度,或者换 register(上一条批评过,这一条找一个真实的点夸一下;反过来亦然)。${SAY_BLOCK}`;
 
   const priorBlock = priorComments.length
     ? `\n\nComments you've already made on THIS answer (don't repeat these points):\n${priorComments.map((c, i) => `${i + 1}. ${c}`).join("\n")}`
@@ -317,7 +344,7 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
 - "Setup 很长,说明这个 problem 他 care。建议先说一句 '让我先 reflect 一下再问几个 clarifying questions',避免急着答。"
 - "他提到了 <strong>CCAR</strong> 和 regulatory timeline —— 候选人简历里有 regulatory modeling 经验,接下来答题时可以主动 link 过去。"
 
-不要把话说成评价。这是提示,不是评分。`;
+不要把话说成评价。这是提示,不是评分。${SAY_BLOCK}`;
 
   const systemListeningEn = `You are a senior interview coach observing a live interview. The interviewer is currently monologuing — describing the team / product / case background, or setting up a problem, or giving context. Your job is NOT to judge an answer. It's to help the candidate READ this monologue: what to catch, what the interviewer cares about, how to pick up the thread.
 
@@ -345,7 +372,7 @@ Examples:
 - "Long setup = he cares about this problem. Acknowledge first, then ask 2–3 scoped clarifying questions before diving in."
 - "He name-dropped <strong>CCAR</strong> and regulatory timelines — the resume has regulatory modeling experience, tie it in proactively."
 
-Don't phrase this as a judgment. It's a tip, not a score.`;
+Don't phrase this as a judgment. It's a tip, not a score.${SAY_BLOCK}`;
 
   // == Warm-up mode: candidate is talking BEFORE any Lead Question is locked ==
   // Typically their self-introduction responding to the interviewer's
@@ -383,7 +410,7 @@ Examples:
 - "Running long. He's 90s in still on high school. Recruiters make the fit call in the first 2 minutes — cut to the most JD-relevant project fast."
 - "Naming employers but not <strong>roles</strong> — unclear if he was an IC or lead. Interviewer's 'we're looking for someone who can mentor' setup will want that clarity."
 
-Be calibrated, not harsh. This is the warm-up — coach toward what to adjust, don't roast. Skip piling on — if the intro is going fine, say something balanced/observational.`;
+Be calibrated, not harsh. This is the warm-up — coach toward what to adjust, don't roast. Skip piling on — if the intro is going fine, say something balanced/observational.${SAY_BLOCK}`;
 
   const systemWarmupZh = `你是一位资深面试教练,正在旁观一场真实面试的 WARM-UP 阶段 —— 面试官刚做完开场寒暄 / 公司背景介绍,候选人现在开始说话(通常是自我介绍),还没有正式问题 finalize。
 
@@ -414,7 +441,7 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
 - "Intro 在拖。已经 90 秒了还在讲高中。Recruiter 前 2 分钟就打 fit 判断,要尽快切到 JD 最相关的项目。"
 - "讲了雇主但没讲 <strong>role</strong> —— 不清楚他是 IC 还是 lead。面试官 setup 里 'we're looking for someone who can mentor' 这个信号需要这个清晰度。"
 
-基调要 calibrated,不要 roast。这是 warm-up,指出该调整什么,不要小题大做。如果 intro 进行得不错,给一句中性观察就够。`;
+基调要 calibrated,不要 roast。这是 warm-up,指出该调整什么,不要小题大做。如果 intro 进行得不错,给一句中性观察就够。${SAY_BLOCK}`;
 
   // == Candidate-question mode: reverse Q&A near interview end ==
   // The candidate has been handed the floor and is asking the
@@ -470,7 +497,7 @@ Examples:
 - "Good question — ties straight back to the EMR → OpenSearch migration he just mentioned. Strong listening signal. Follow up with 'and how does that affect on-call burden?' to surface the actual pain."
 - "Generic 'culture' question after a 20-min real conversation. Interviewer will give a polished pitch. A sharper one: 'You said the team ships weekly — what's the most recent thing that DIDN'T ship on time, and why?'"
 - "Asking the hiring manager about IC tooling is fine but a bit narrow for this round. Bigger lever: ask what's keeping HIM up at night about the team in the next 6 months."
-- "Soft question — invites a soft answer. After he replies, follow up with 'and what would make a new hire actually move the needle on that in the first 3 months?'"`;
+- "Soft question — invites a soft answer. After he replies, follow up with 'and what would make a new hire actually move the needle on that in the first 3 months?'"${SAY_BLOCK}`;
 
   const systemCandidateQuestionZh = `你是一位资深面试教练,正在旁观一场真实面试的 REVERSE Q&A 阶段 —— 面试官的问题问完了,把发言权交给了候选人("你有什么想问我的?"),候选人现在在问面试官问题。你的工作是评价**候选人这个问题的质量**,以及在哪里可以追问。
 
@@ -507,7 +534,7 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
 - "好问题 —— 直接锚在他刚说的 EMR → OpenSearch 迁移上,strong listening signal。可以追:'那 on-call 负担是不是也跟着重了?',能逼出真实 pain。"
 - "在 20 分钟实质对话之后还问 'culture 怎么样' 比较 generic,只能拿到 polished pitch。更 sharp 的版本:'你说团队每周 ship —— 最近一次没按时 ship 的是什么,为什么?'"
 - "问 hiring manager IC 的 tooling 没问题但 narrow。更大杠杆:问他未来 6 个月最让他焦虑的事是什么。"
-- "软球 —— 招来软答。等他回答之后追一句:'那新人前 3 个月做什么能真的 move the needle?'"`;
+- "软球 —— 招来软答。等他回答之后追一句:'那新人前 3 个月做什么能真的 move the needle?'"${SAY_BLOCK}`;
 
   const userMsg =
     mode === "listening"

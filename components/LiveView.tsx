@@ -34,6 +34,30 @@ const CAPTIONS_HEADING_HEIGHT_PX = 28;
  *  caption font also shrunk — same line-count visible per lane. */
 const CAPTIONS_LANE_HEIGHT_PX = 60;
 
+/** Split commentary text on the `---SAY---` marker that the model
+ *  emits at the end of every commentary / hint, separating the
+ *  observation from the English suggested-answer script. The marker is
+ *  exact-string; surrounding whitespace varies. Returns the leading
+ *  commentary HTML and the suggested-answer text (after `Try:` prefix
+ *  if present). Streaming-safe: when the marker hasn't arrived yet, the
+ *  whole input is treated as commentary and `suggestion` is empty. */
+function splitCommentary(text: string): {
+  commentary: string;
+  suggestion: string;
+} {
+  if (!text) return { commentary: "", suggestion: "" };
+  const marker = /\s*---SAY---\s*/;
+  const parts = text.split(marker);
+  if (parts.length < 2) return { commentary: text, suggestion: "" };
+  const commentary = parts[0].trim();
+  // Everything after the marker is the suggested answer. Strip a leading
+  // `Try:` / `Try ` prefix if the model included one (it's redundant
+  // with the UI label).
+  let suggestion = parts.slice(1).join(" ").trim();
+  suggestion = suggestion.replace(/^Try[:\s]+/i, "");
+  return { commentary, suggestion };
+}
+
 /** Length-based reading time for a piece of pane content. Per the
  *  user's spec:
  *    CJK chars  at 4/sec → 250ms each
@@ -62,8 +86,12 @@ function computePaneMinDisplayMs(text: string): number {
   const BUFFER = 1500;
   if (!text) return FLOOR;
   // Strip HTML tags + collapse whitespace so the pre-rendered <strong>
-  // markup doesn't inflate the word count.
-  const stripped = text
+  // markup doesn't inflate the word count. Also strip the SAY-block
+  // suggested-answer (everything after `---SAY---`) since it gets
+  // counted separately in its own visual region — counting it twice
+  // makes the min-display almost double what's reasonable.
+  const beforeSay = text.split(/\s*---SAY---\s*/)[0] ?? text;
+  const stripped = beforeSay
     .replace(/<[^>]+>/g, " ")
     .replace(/&[a-z]+;/gi, " ")
     .trim();
@@ -74,6 +102,67 @@ function computePaneMinDisplayMs(text: string): number {
     .filter((w) => /[a-zA-Z]/.test(w)).length;
   const readingMs = (cjk / 4 + englishWords / 2) * 1000;
   return Math.min(CEIL, Math.max(FLOOR, readingMs + BUFFER));
+}
+
+/** Shared renderer for the four commentary slot variants (Q-A, listen
+ *  hint, warmup, candidate-question). Splits the streamed text on the
+ *  `---SAY---` marker so the LLM-emitted English suggested-answer
+ *  shows below the main observation in italic. The user's spec:
+ *  observation in standard prose, then a thin divider + 12.5px italic
+ *  English script the candidate can actually utter, with `...` for
+ *  elision.
+ *
+ *  `tone="hint"` adds the 💡 icon column + accent-blue left border;
+ *  `tone="commentary"` is the plain 14.5px-black layout. Both use the
+ *  same SAY-block rendering. */
+function CommentaryBody({
+  html,
+  tone,
+}: {
+  html: string;
+  tone: "commentary" | "hint";
+}) {
+  const { commentary, suggestion } = splitCommentary(html);
+  // Until the model has emitted any commentary text yet, render the
+  // raw streaming buffer as-is so the user sees tokens appearing.
+  const mainHtml = commentary || html || "…";
+
+  const SuggestionBlock = suggestion ? (
+    <div className="mt-2 pt-2 border-t border-accent/30 text-[12.5px] leading-relaxed text-ink-light">
+      <span className="font-semibold text-accent text-[11px] uppercase tracking-wider mr-1.5">
+        💬 Try
+      </span>
+      <em
+        className="not-italic"
+        // Re-italicize via inline style so <strong> tags inside the
+        // suggestion stay non-italic per typographic convention while
+        // the plain text reads italic.
+        style={{ fontStyle: "italic" }}
+        dangerouslySetInnerHTML={{ __html: suggestion }}
+      />
+    </div>
+  ) : null;
+
+  if (tone === "hint") {
+    return (
+      <div className="w-full h-full flex border-l-[3px] border-accent bg-accent-bg/40 animate-appear">
+        <div className="pl-3 pr-1 pt-3 text-[15px] leading-none shrink-0 select-none">
+          💡
+        </div>
+        <div className="flex-1 min-w-0 pr-4 py-3 overflow-y-auto no-scrollbar text-[13.5px] leading-relaxed text-ink prose-live">
+          <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
+          {SuggestionBlock}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear">
+      <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
+      {SuggestionBlock}
+    </div>
+  );
 }
 
 export function LiveView() {
@@ -486,14 +575,21 @@ export function LiveView() {
               summary={moment.summary}
               mainQuestion={rolesConfirmed ? currentMainQ : undefined}
               followUp={rolesConfirmed ? currentFollowUpQ : undefined}
+              // Fallback Lead — the most recently archived Lead. Used by
+              // the bar when `currentMainQ` is undefined (e.g. just
+              // exited candidate_questioning, or briefly between
+              // archive-and-new-lock). Per spec, the Phase region only
+              // ever shows "Lead Question" or "Candidate's Question"
+              // during the interview proper — no "Between Questions"
+              // gap. archivedMains is chronological; last entry is the
+              // most recent.
+              fallbackArchivedLead={
+                rolesConfirmed && archivedMains.length > 0
+                  ? archivedMains[archivedMains.length - 1]
+                  : undefined
+              }
               rolesConfirmed={rolesConfirmed}
               hasUtterances={hasUtterances}
-              // One-time-warmup constraint: the session is still in
-              // warm-up ONLY before any Lead has ever locked. After the
-              // first Lead commits, `!mainQuestion` means "between
-              // questions" (interviewer pivoting), not warm-up. The
-              // top bar reflects this distinction so it doesn't regress
-              // to "WARM-UP" labels mid-interview.
               hasEverHadLead={
                 currentMainQ !== undefined || archivedMains.length > 0
               }
@@ -743,6 +839,7 @@ function CurrentQuestionBar({
   summary,
   mainQuestion,
   followUp,
+  fallbackArchivedLead,
   rolesConfirmed,
   hasUtterances,
   hasEverHadLead,
@@ -755,11 +852,19 @@ function CurrentQuestionBar({
   summary: string;
   mainQuestion: Question | undefined;
   followUp: Question | undefined;
+  /** Most recently archived Lead — used as the visual fallback when
+   *  `mainQuestion` is undefined and we're past warmup. Per the user's
+   *  spec, the Phase region must only ever show "Lead Question" or
+   *  "Candidate's Question" during the interview, never an empty
+   *  "Between Questions" frame. So when there's a transient gap (e.g.
+   *  candidate_questioning just ended, or interviewer is mid-pivot
+   *  between Leads) we fall back to displaying the previous Lead. */
+  fallbackArchivedLead?: Question;
   rolesConfirmed: boolean;
   hasUtterances: boolean;
   /** True once ANY Lead has been locked in this session (including
    *  Leads that have since been archived). Controls warm-up vs
-   *  between-questions labeling when mainQuestion is undefined. */
+   *  fallback-lead labeling when mainQuestion is undefined. */
   hasEverHadLead: boolean;
   /** Upload-mode only: the kind of the phase segment at the current
    *  playback time. When this is "candidate_asking" we render the
@@ -879,17 +984,36 @@ function CurrentQuestionBar({
     );
   }
 
-  // No Lead currently locked. Two sub-cases:
-  //   - hasEverHadLead === false → still in initial warm-up
-  //   - hasEverHadLead === true  → between Qs (interviewer transitioning)
-  // Visually the same layout, just different header copy.
-  const headerText = hasEverHadLead
-    ? labels.betweenQuestionsHeader
-    : labels.warmupHeader;
+  // No Lead currently locked. Per the user's spec, the Phase region
+  // only ever shows a Lead Question or a Candidate's Question during
+  // the interview — no "Between Questions" middle state. When we land
+  // here:
+  //   - hasEverHadLead === true: there's a transient gap (just exited
+  //     candidate_questioning, or interviewer is mid-pivot before the
+  //     next Lead has actually locked). Render the most recently
+  //     archived Lead so the bar stays continuous and the user
+  //     doesn't see an empty frame. Visually identical to the locked-
+  //     Lead branch above.
+  //   - hasEverHadLead === false: genuine warm-up phase before the
+  //     first Lead has ever locked. Show the warm-up placeholder.
+  if (hasEverHadLead && fallbackArchivedLead) {
+    return (
+      <BarShell>
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
+          {labels.leadHeader}
+        </div>
+        <div className="font-serif text-[17px] leading-snug text-ink font-medium">
+          {fallbackArchivedLead.text}
+        </div>
+      </BarShell>
+    );
+  }
+  // Warm-up — no Lead has ever locked, before the interview proper has
+  // started. Show a neutral header + summary if available.
   return (
     <BarShell>
       <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
-        {headerText}
+        {labels.warmupHeader}
       </div>
       {summary ? (
         <div className="font-serif text-[15px] leading-snug text-ink-light italic">
@@ -1193,43 +1317,26 @@ function CommentarySection({
 
       <div className="flex-1 min-h-0 mx-5 mb-3 border border-rule bg-paper-subtle rounded-md overflow-hidden flex">
         {showCandidateQuestionCommentary ? (
-          // Candidate-question commentary: same 14.5px black-text
-          // commentary look as the regular Q-A commentary (since both
-          // are evaluative observations, just on different objects —
-          // an answer vs. a question). No special icon / border —
-          // visually distinct from the listen-hint pane (💡 + blue),
-          // and contextualized by the Phase bar above showing
-          // "Candidate's Question".
-          <div
-            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
-            dangerouslySetInnerHTML={{
-              __html: candidateQuestionCommentary || "…",
-            }}
+          // Candidate-question commentary: same 14.5px black-text look
+          // as Q-A commentary. Visually distinct from the listen-hint
+          // pane (no 💡 / blue border); contextualized by the Phase bar
+          // above showing "Candidate's Question".
+          <CommentaryBody
+            html={candidateQuestionCommentary || "…"}
+            tone="commentary"
           />
         ) : showListeningHint ? (
           // Listening hint visual treatment: 💡 icon column + accent-blue
           // left border + smaller 13.5px font so the user can tell at a
           // glance this is in-the-moment coaching ("listen for X") vs
-          // post-answer evaluative commentary (14.5px black, no border).
-          // Same pane, fade-in via `animate-appear`.
-          <div className="w-full h-full flex border-l-[3px] border-accent bg-accent-bg/40 animate-appear">
-            <div className="pl-3 pr-1 pt-3 text-[15px] leading-none shrink-0 select-none">
-              💡
-            </div>
-            <div
-              className="flex-1 min-w-0 pr-4 py-3 overflow-y-auto no-scrollbar text-[13.5px] leading-relaxed text-ink prose-live"
-              dangerouslySetInnerHTML={{ __html: listeningHint }}
-            />
-          </div>
+          // post-answer evaluative commentary.
+          <CommentaryBody html={listeningHint} tone="hint" />
         ) : showWarmupCommentary ? (
-          <div
-            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
-            dangerouslySetInnerHTML={{ __html: warmupCommentary }}
-          />
+          <CommentaryBody html={warmupCommentary} tone="commentary" />
         ) : isShowing && displayedComment ? (
-          <div
-            className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear"
-            dangerouslySetInnerHTML={{ __html: displayedComment.text || "…" }}
+          <CommentaryBody
+            html={displayedComment.text || "…"}
+            tone="commentary"
           />
         ) : isIdle ? (
           // Unified idle state: dots + "AI is observing…" across all
