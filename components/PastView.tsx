@@ -79,13 +79,46 @@ function RefreshScoreButton({
  */
 function ScoreCard({
   score,
+  scoreError,
   onRefresh,
   isRefreshing,
 }: {
   score?: SessionScore;
+  scoreError?: string;
   onRefresh?: () => void;
   isRefreshing?: boolean;
 }) {
+  // Failure state — distinguishes "still scoring" (no error, no score)
+  // from "scoring permanently failed" (error set). Without this branch
+  // the user sees an indefinite loading strip after a failed scoring
+  // request with no way to retry except hard-refreshing.
+  if (!score && scoreError) {
+    return (
+      <div className="mb-10 rounded-xl border border-rose-200 bg-rose-50 overflow-hidden">
+        <div className="p-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="inline-block text-[11px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded bg-rose-100 text-rose-800">
+              Scoring failed
+            </div>
+            {onRefresh && (
+              <RefreshScoreButton
+                onClick={onRefresh}
+                isRefreshing={!!isRefreshing}
+              />
+            )}
+          </div>
+          <p className="mt-2.5 text-[14.5px] leading-relaxed text-rose-900 font-mono break-all">
+            {scoreError}
+          </p>
+          <p className="mt-3 text-[12.5px] leading-relaxed text-rose-700">
+            The scoring request didn&apos;t complete. The transcript is
+            preserved below — click <strong>Re-score</strong> above to
+            retry.
+          </p>
+        </div>
+      </div>
+    );
+  }
   if (!score) {
     return (
       <div className="mb-8 rounded-xl border border-rule bg-paper-subtle px-5 py-4 text-sm text-ink-lighter italic animate-pulse-dot">
@@ -275,6 +308,9 @@ export function PastView() {
   const pastSessions = useStore((s) => s.pastSessions);
   const setPastSessionScore = useStore((s) => s.setPastSessionScore);
 
+  const setPastSessionScoreError = useStore(
+    (s) => s.setPastSessionScoreError
+  );
   const session = pastSessions.find((s) => s.id === selectedPastId);
   const [currentTime, setCurrentTime] = useState(0);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -284,26 +320,54 @@ export function PastView() {
   // Re-fire /api/score-session against the same Session payload. Keeps
   // the existing score visible until the new one lands (no flicker to
   // the loading strip). On failure, surfaces a small error line under
-  // the card and leaves the prior score intact. Mirrors the original
-  // post-end-of-session call in app/page.tsx but without the toast
-  // dependency — we render the error inline so the user sees it next
-  // to the button they clicked.
+  // the card AND writes the error onto the Session's `scoreError` so
+  // the persistent failure UI renders even if the user navigates away
+  // and back. Mirrors the original post-end-of-session call in
+  // app/page.tsx with matching error handling.
   const refreshScore = async () => {
     if (!session || isRefreshing) return;
     setIsRefreshing(true);
     setRefreshError(null);
+    console.log("[scoring] refresh", {
+      sessionId: session.id,
+      questions: session.questions.length,
+    });
     try {
-      const resp = await fetch("/api/score-session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jd: session.jd,
-          resume: session.resume,
-          questions: session.questions,
-          durationSeconds: session.durationSeconds,
-        }),
-      });
-      if (!resp.ok) throw new Error(`Score request failed: ${resp.status}`);
+      const ctrl = new AbortController();
+      const timeoutId = setTimeout(() => ctrl.abort(), 90_000);
+      let resp: Response;
+      try {
+        resp = await fetch("/api/score-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jd: session.jd,
+            resume: session.resume,
+            questions: session.questions,
+            durationSeconds: session.durationSeconds,
+          }),
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+      if (!resp.ok) {
+        let detail = "";
+        try {
+          const errBody = (await resp.json()) as {
+            error?: string;
+            body?: string;
+          };
+          detail = errBody.error || errBody.body || "";
+        } catch {
+          /* not json */
+        }
+        throw new Error(
+          detail
+            ? `Score request failed (HTTP ${resp.status}): ${detail}`
+            : `Score request failed (HTTP ${resp.status})`
+        );
+      }
       const data = (await resp.json()) as { score?: SessionScore };
       if (data.score) {
         setPastSessionScore(session.id, data.score);
@@ -311,7 +375,12 @@ export function PastView() {
         throw new Error("No score returned from server");
       }
     } catch (e) {
-      setRefreshError(e instanceof Error ? e.message : "Re-score failed");
+      const msg = e instanceof Error ? e.message : "Re-score failed";
+      console.error("[scoring] refresh failed:", msg);
+      setRefreshError(msg);
+      // Persist the failure on the Session so the failure card shows
+      // even after navigating away and back.
+      setPastSessionScoreError(session.id, msg);
     } finally {
       setIsRefreshing(false);
     }
@@ -351,6 +420,7 @@ export function PastView() {
         <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-40 max-[900px]:px-5">
           <ScoreCard
             score={session.score}
+            scoreError={session.scoreError}
             onRefresh={refreshScore}
             isRefreshing={isRefreshing}
           />

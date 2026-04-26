@@ -37,8 +37,15 @@ interface StoreState {
   addPastSession: (s: Session) => void;
   renamePastSession: (id: string, title: string) => void;
   deletePastSession: (id: string) => void;
-  /** Attach a computed overall score to a past session. */
+  /** Attach a computed overall score to a past session. Clears any
+   *  scoreError on the session as a side effect (success replaces a
+   *  prior failure). */
   setPastSessionScore: (id: string, score: SessionScore) => void;
+  /** Mark a past session's scoring as permanently failed. Mutually
+   *  exclusive with `score` — setting one clears the other. The UI
+   *  uses this to distinguish "still loading" (both undefined) from
+   *  "failed, retry-able" (scoreError set). */
+  setPastSessionScoreError: (id: string, error: string) => void;
 
   // === Live session in progress ===
   live: LiveState;
@@ -201,7 +208,13 @@ export const useStore = create<StoreState>()(
   setPastSessionScore: (id, score) =>
     set((state) => ({
       pastSessions: state.pastSessions.map((s) =>
-        s.id === id ? { ...s, score } : s
+        s.id === id ? { ...s, score, scoreError: undefined } : s
+      ),
+    })),
+  setPastSessionScoreError: (id, error) =>
+    set((state) => ({
+      pastSessions: state.pastSessions.map((s) =>
+        s.id === id ? { ...s, scoreError: error, score: undefined } : s
       ),
     })),
 

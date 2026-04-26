@@ -225,23 +225,86 @@ export default function Page() {
     void scoreSessionAsync(saved);
   };
 
+  const setPastSessionScoreError = useStore((s) => s.setPastSessionScoreError);
+
   const scoreSessionAsync = async (saved: ReturnType<typeof endLive>) => {
+    // Diagnostic log: how big is the payload going to the route? Lets us
+    // catch token-budget blowups (50min interviews, big JD/resume) before
+    // they manifest as silent failures.
+    console.log("[scoring] firing /api/score-session", {
+      sessionId: saved.id,
+      questions: saved.questions.length,
+      durationSec: saved.durationSeconds,
+      jdChars: saved.jd.length,
+      resumeChars: saved.resume.length,
+      qsWithAnswerText: saved.questions.filter(
+        (q) => typeof q.answerText === "string" && q.answerText.length > 0
+      ).length,
+    });
     try {
-      const resp = await fetch("/api/score-session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jd: saved.jd,
-          resume: saved.resume,
-          questions: saved.questions,
-          durationSeconds: saved.durationSeconds,
-        }),
-      });
-      if (!resp.ok) throw new Error(`score-session failed: ${resp.status}`);
-      const data = (await resp.json()) as { score?: Parameters<typeof setPastSessionScore>[1] };
-      if (data.score) setPastSessionScore(saved.id, data.score);
+      // 90-second hard timeout via AbortController. The route itself can
+      // take 30+ seconds when Sonnet is generating a full scorecard for
+      // a 32-min interview, but anything past 90s is almost certainly
+      // hung — better to surface a retryable error than leave the user
+      // staring at a forever-spinner.
+      const ctrl = new AbortController();
+      const timeoutId = setTimeout(() => ctrl.abort(), 90_000);
+      let resp: Response;
+      try {
+        resp = await fetch("/api/score-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jd: saved.jd,
+            resume: saved.resume,
+            questions: saved.questions,
+            durationSeconds: saved.durationSeconds,
+          }),
+          signal: ctrl.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+      if (!resp.ok) {
+        // Try to lift any structured error body the route returned so
+        // the failure card can show specifics (e.g. "model API
+        // overloaded" vs "prompt too long" vs "auth missing").
+        let detail = "";
+        try {
+          const errBody = (await resp.json()) as {
+            error?: string;
+            body?: string;
+          };
+          detail = errBody.error || errBody.body || "";
+        } catch {
+          /* response wasn't json */
+        }
+        throw new Error(
+          detail
+            ? `Scoring failed (HTTP ${resp.status}): ${detail}`
+            : `Scoring failed (HTTP ${resp.status})`
+        );
+      }
+      const data = (await resp.json()) as {
+        score?: Parameters<typeof setPastSessionScore>[1];
+      };
+      if (data.score) {
+        setPastSessionScore(saved.id, data.score);
+      } else {
+        // 200 OK but no score field — server contract was broken (route
+        // should always return either { score } or a non-2xx with
+        // { error }). Treat as failure so the UI shows a retry-able
+        // error card instead of an infinite loader.
+        throw new Error("Scoring returned no score payload");
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Scoring failed";
+      console.error("[scoring] failed:", msg);
+      // Mark the session's score as permanently failed (until retried).
+      // PastView's ScoreCard renders an error UI with a Re-score button
+      // when this is set, instead of the indefinite "Scoring this
+      // session…" loading state.
+      setPastSessionScoreError(saved.id, msg);
       setToast(msg);
     }
   };

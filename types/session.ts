@@ -217,8 +217,17 @@ export interface Session {
   durationSeconds: number;
   /** Raw audio blob URL (object URL, lost on refresh since we don't persist). */
   audioUrl?: string;
-  /** Overall assessment — undefined while scoring is in flight or if it failed. */
+  /** Overall assessment — undefined while scoring is in flight. Once
+   *  set, scoring is finalized (success or insufficient_data verdict).
+   *  See `scoreError` for the failure case. */
   score?: SessionScore;
+  /** Set when scoring failed at the network / server level (i.e. couldn't
+   *  even produce an insufficient_data verdict). Distinguishes "scoring
+   *  in flight" (both undefined) from "scoring permanently failed"
+   *  (scoreError set, score still undefined) — without this the UI
+   *  would render a forever-loading spinner. The user can retry via the
+   *  Re-score button which clears this and re-fires. */
+  scoreError?: string;
 }
 
 /** Transient state during a live recording. */

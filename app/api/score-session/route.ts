@@ -385,20 +385,50 @@ INSUFFICIENT gate: requires questionsWithEvidence < 3 AND totalEvidenceChars < 1
 
 Score the interview. Return JSON only.`;
 
+  // Diagnostic: log the rough prompt size before firing. Sonnet 4.5
+  // handles ~200K input tokens but the bigger risk is route latency at
+  // ~5K-tokens-per-1K-chars rates → 30s+ generation on huge prompts.
+  // Helps explain a hang as "too big" rather than "API down".
+  const systemChars = system.length;
+  const userChars = user.length;
+  const estTokens = Math.ceil((systemChars + userChars) / 3.5);
+  console.log("[score-session] calling Sonnet:", {
+    systemChars,
+    userChars,
+    estTokens,
+    schema: isLegacySchema ? "legacy" : "modern",
+  });
+
   try {
     const client = getAnthropicClient();
+    const t0 = Date.now();
     const resp = await client.messages.create({
       model: "claude-sonnet-4-5",
       max_tokens: 1500,
       system,
       messages: [{ role: "user", content: user }],
     });
+    console.log("[score-session] Sonnet returned in", Date.now() - t0, "ms");
 
     const text = resp.content
       .filter((c): c is Anthropic.TextBlock => c.type === "text")
       .map((c) => c.text)
       .join("")
       .trim();
+
+    if (!text) {
+      // Empty model output — would otherwise silently fall through to
+      // allNA and surface as "insufficient_data" with no diagnostic.
+      // Better to fail loudly so the client retries.
+      console.error("[score-session] empty model output");
+      return NextResponse.json(
+        {
+          error: "Scoring model returned empty output. Try Re-score.",
+          status: 502,
+        },
+        { status: 502 }
+      );
+    }
 
     let parsed: {
       insufficient?: boolean;
@@ -422,6 +452,16 @@ Score the interview. Return JSON only.`;
           /* fall through to error */
         }
       }
+    }
+    // Defensive: parsed.dimensions could come back as a non-array (model
+    // wrote prose, returned null, etc.). Normalize before downstream
+    // .find() / .every() which would crash.
+    if (parsed.dimensions !== undefined && !Array.isArray(parsed.dimensions)) {
+      console.warn(
+        "[score-session] parsed.dimensions is not array, ignoring:",
+        typeof parsed.dimensions
+      );
+      parsed.dimensions = undefined;
     }
 
     // Case A: model flagged the transcript as insufficient for any verdict.
