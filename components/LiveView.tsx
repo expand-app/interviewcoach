@@ -178,6 +178,9 @@ export function LiveView() {
   const candidateQuestionCommentary = useStore(
     (s) => s.liveCandidateQuestionCommentary
   );
+  const candidateQuestioningSince = useStore(
+    (s) => s.liveCandidateQuestioningSince
+  );
   const timeline = useStore((s) => s.liveTimeline);
   const playbackTime = useStore((s) => s.livePlaybackTime);
   const isUploadMode = useStore((s) => s.liveIsUploadMode);
@@ -575,18 +578,36 @@ export function LiveView() {
               summary={moment.summary}
               mainQuestion={rolesConfirmed ? currentMainQ : undefined}
               followUp={rolesConfirmed ? currentFollowUpQ : undefined}
-              // Fallback Lead — the most recently archived Lead. Used by
-              // the bar when `currentMainQ` is undefined (e.g. just
-              // exited candidate_questioning, or briefly between
-              // archive-and-new-lock). Per spec, the Phase region only
-              // ever shows "Lead Question" or "Candidate's Question"
-              // during the interview proper — no "Between Questions"
-              // gap. archivedMains is chronological; last entry is the
-              // most recent.
-              fallbackArchivedLead={
-                rolesConfirmed && archivedMains.length > 0
-                  ? archivedMains[archivedMains.length - 1]
-                  : undefined
+              // Fallback Lead — the most recently archived Lead, used
+              // by the bar when `currentMainQ` is undefined (interviewer
+              // mid-pivot before the next Lead has actually locked).
+              //
+              // CRITICAL: gated on `candidateQuestioningSince`. Once
+              // the session has entered the Q&A reverse phase, the
+              // prior Leads are CLOSED — the bar must not "jump back"
+              // to a Lead the candidate already moved past. Concretely,
+              // only fall back to an archived Lead whose askedAtSeconds
+              // is AFTER candidateQuestioningSince. If no Lead has
+              // locked since the Q&A started, fallback returns
+              // undefined and the bar renders the Q&A-wrap-up empty
+              // state instead of the stale Lead.
+              fallbackArchivedLead={(() => {
+                if (!rolesConfirmed || archivedMains.length === 0) {
+                  return undefined;
+                }
+                const last = archivedMains[archivedMains.length - 1];
+                if (
+                  candidateQuestioningSince != null &&
+                  last.askedAtSeconds < candidateQuestioningSince
+                ) {
+                  // Q&A has happened; this Lead is from before then —
+                  // treat as closed.
+                  return undefined;
+                }
+                return last;
+              })()}
+              candidateQuestioningEverEntered={
+                candidateQuestioningSince != null
               }
               rolesConfirmed={rolesConfirmed}
               hasUtterances={hasUtterances}
@@ -626,6 +647,10 @@ export function LiveView() {
                 candidateAskingHeader: t(
                   "Candidate's Question",
                   "候选人提问"
+                ),
+                qaWrapupHeader: t(
+                  "Q&A · Wrap-up",
+                  "Q&A · 收尾中"
                 ),
                 waitingForFirst: t(
                   "Waiting for the interview to begin…",
@@ -840,6 +865,7 @@ function CurrentQuestionBar({
   mainQuestion,
   followUp,
   fallbackArchivedLead,
+  candidateQuestioningEverEntered,
   rolesConfirmed,
   hasUtterances,
   hasEverHadLead,
@@ -853,13 +879,15 @@ function CurrentQuestionBar({
   mainQuestion: Question | undefined;
   followUp: Question | undefined;
   /** Most recently archived Lead — used as the visual fallback when
-   *  `mainQuestion` is undefined and we're past warmup. Per the user's
-   *  spec, the Phase region must only ever show "Lead Question" or
-   *  "Candidate's Question" during the interview, never an empty
-   *  "Between Questions" frame. So when there's a transient gap (e.g.
-   *  candidate_questioning just ended, or interviewer is mid-pivot
-   *  between Leads) we fall back to displaying the previous Lead. */
+   *  `mainQuestion` is undefined and we're past warmup. Already gated
+   *  by the parent against `candidateQuestioningSince`: once Q&A has
+   *  begun, this is undefined unless a NEW Lead has locked since. */
   fallbackArchivedLead?: Question;
+  /** True once the session has ever entered candidate_questioning.
+   *  Used to render a "Q&A wrap-up" empty state when there's no
+   *  fallbackArchivedLead AND we've left Q&A — instead of the
+   *  warmup placeholder, which would be wrong-phase. */
+  candidateQuestioningEverEntered?: boolean;
   rolesConfirmed: boolean;
   hasUtterances: boolean;
   /** True once ANY Lead has been locked in this session (including
@@ -883,6 +911,7 @@ function CurrentQuestionBar({
     warmupHeader: string;
     betweenQuestionsHeader: string;
     candidateAskingHeader: string;
+    qaWrapupHeader: string;
     waitingForFirst: string;
     awaitingIdentity: string;
     probeHeader: string;
@@ -1005,6 +1034,27 @@ function CurrentQuestionBar({
         <div className="font-serif text-[17px] leading-snug text-ink font-medium">
           {fallbackArchivedLead.text}
         </div>
+      </BarShell>
+    );
+  }
+  // Q&A wrap-up — Q&A reverse phase has been entered but state is no
+  // longer candidate_questioning AND no new Lead has locked since.
+  // Per spec, prior Leads are closed once Q&A starts, so we don't fall
+  // back to them. Show a neutral wrap-up frame instead of warmup
+  // (which would be wrong-phase).
+  if (candidateQuestioningEverEntered) {
+    return (
+      <BarShell>
+        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
+          {labels.qaWrapupHeader}
+        </div>
+        {summary ? (
+          <div className="font-serif text-[15px] leading-snug text-ink-light italic">
+            {summary}
+          </div>
+        ) : (
+          <div className="text-[13px] text-ink-lighter italic">—</div>
+        )}
       </BarShell>
     );
   }

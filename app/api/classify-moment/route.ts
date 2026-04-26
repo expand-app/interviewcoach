@@ -231,10 +231,22 @@ When in doubt about a non-question utterance, return state = "chitchat" so no qu
     2. The candidate's most recent utterance IS a substantive question to the interviewer about the role / team / company / process — NOT a one-off clarification embedded in their own answer. Examples: "What does the team look like?", "How does the team measure success?", "What's the day-to-day for this role?", "What are the biggest challenges the team is facing?", "How is the on-call rotation set up?", "What's the next step after this interview?".
     3. NOT a clarification of an interview question they're trying to answer ("Can you give me an example of what you mean by scale?" while mid-answer — that's chitchat).
 
-Once in candidate_questioning, STAY in it across multiple back-and-forths (interviewer answers, candidate asks another) until ONE of:
-    • the interviewer signals wrap-up: "well, that's about all the time we have", "thanks for your time", "we'll be in touch", "do you have any other questions?" followed by the candidate declining ("no, that's all", "no further questions"),
-    • or the candidate stops asking questions and says goodbye / thanks.
-At that wrap-up, return state = "chitchat".
+== STICKINESS RULE for candidate_questioning (CRITICAL) ==
+If currentState is "candidate_questioning", the DEFAULT is to STAY in candidate_questioning. The interviewer answering the candidate's question — even at length, even with multiple paragraphs of detail — is the EXPECTED behavior in this phase, NOT a signal to exit. Do not exit just because the interviewer has been speaking for a while.
+
+Only exit candidate_questioning when ONE of these is unambiguous in the recent transcript:
+
+(1) NEW INTERVIEWER QUESTION TO CANDIDATE — interviewer explicitly opens a NEW substantive ask with cues like "let me ask you", "my next question is", "one more thing I want to ask you", "before we wrap up, can you tell me about", "actually one more question about your background", AND the question text is a real interview question (not a clarification or logistics ask). → state = question_finalized, questionRelation = "new_topic", populate the question field with the new ask. Do NOT exit on a vague "and/so/well" — needs an explicit re-asking cue.
+
+(2) CANDIDATE EXPLICITLY ENDS Q&A — candidate says "no more questions" / "that's all from me" / "I think that's it" / "no further questions" / "I'm good, thanks". → state = "chitchat" (will progress to closing on its own as goodbyes follow).
+
+(3) CANDIDATE ASKS A NEW QUESTION — candidate's most recent substantive utterance is itself a new question to the interviewer (about role / team / process / company). → STAY in candidate_questioning, just update the candidateQuestion field to the new text. This is NOT an exit; it's a refresh inside the same phase.
+
+(4) MUTUAL GOODBYE — both sides are saying "thank you" / "have a good day" / "we'll be in touch". → state = "closing".
+
+OUTSIDE these four cases: regardless of how long the interviewer talks, regardless of disfluency or filler density, regardless of whether the interviewer changes sub-topic mid-answer (e.g. starts talking about loan size after answering remote-work) — the interviewer is STILL answering the candidate's question. Stay in candidate_questioning. Refresh the summary field if useful, keep the candidateQuestion text the same.
+
+Symptom of getting this wrong: a session in candidate_questioning where the interviewer is mid-explanation gets transit'd to "interviewer_speaking" with summary like "Asking about candidate's location" or "Discussing team flexibility" — those are NOT new questions, they're the interviewer continuing to answer.
 
 Compound questions ("Can you tell me about X, and also Y?") count as ONE question still being formed until the interviewer clearly stops.
 

@@ -100,6 +100,18 @@ interface StoreState {
   liveCandidateQuestionCommentary: string;
   setLiveCandidateQuestionCommentary: (text: string) => void;
 
+  /** Session-elapsed seconds at which the moment-state machine first
+   *  transitioned into `candidate_questioning`. Once set, indicates the
+   *  Q&A phase has begun — the UI uses this to gate "fallback to a
+   *  previous Lead Question": any archived Lead with askedAtSeconds
+   *  BEFORE this timestamp is considered closed and is no longer
+   *  surfaced as the Phase region's fallback. (Per spec: once Q&A
+   *  enters, the prior Leads must not "come back" as the displayed
+   *  Lead.) Null until the first entry; never reset within a session
+   *  even if state later moves out of candidate_questioning. */
+  liveCandidateQuestioningSince: number | null;
+  setLiveCandidateQuestioningSince: (sec: number | null) => void;
+
   /** Pending manual speaker-identification prompt for live mode. When a
    *  new dgSpeaker appears with no role assigned and no other role can
    *  be inferred, we set this so the UI renders a floating "Who is
@@ -253,6 +265,9 @@ export const useStore = create<StoreState>()(
   liveCandidateQuestionCommentary: "",
   setLiveCandidateQuestionCommentary: (liveCandidateQuestionCommentary) =>
     set({ liveCandidateQuestionCommentary }),
+  liveCandidateQuestioningSince: null,
+  setLiveCandidateQuestioningSince: (liveCandidateQuestioningSince) =>
+    set({ liveCandidateQuestioningSince }),
   liveSpeakerPrompt: null,
   setLiveSpeakerPrompt: (liveSpeakerPrompt) => set({ liveSpeakerPrompt }),
   resolveSpeakerPrompt: (role) =>
@@ -291,6 +306,7 @@ export const useStore = create<StoreState>()(
       liveListeningHint: "",
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
+      liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
       livePlaybackTime: 0,
@@ -400,6 +416,7 @@ export const useStore = create<StoreState>()(
       liveListeningHint: "",
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
+      liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
       livePlaybackTime: 0,
@@ -425,6 +442,7 @@ export const useStore = create<StoreState>()(
       liveListeningHint: "",
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
+      liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
       livePlaybackTime: 0,

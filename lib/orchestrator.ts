@@ -1991,6 +1991,20 @@ export class LiveOrchestrator {
       store.setAnswerInProgress(false);
       this.pendingCommentaryFor = null;
 
+      // First-entry timestamp — once Q&A reverse phase starts, the
+      // UI uses this to gate "fallback to a previous Lead Question":
+      // any archived Lead with askedAtSeconds BEFORE this timestamp is
+      // treated as closed and won't be displayed again. Only set on
+      // the FIRST entry; subsequent re-entries (state churned out
+      // briefly and back) keep the original timestamp so the gate
+      // logic stays stable.
+      if (store.liveCandidateQuestioningSince == null) {
+        store.setLiveCandidateQuestioningSince(store.live.elapsedSeconds);
+        log("candidate-q", "phase-started", {
+          atSec: store.live.elapsedSeconds,
+        });
+      }
+
       // Was the previous candidate question text the same as this one?
       // Classifier ticks every 2-3s; while the candidate is still
       // talking and the interviewer is answering, the classifier may
