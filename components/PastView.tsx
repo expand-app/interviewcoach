@@ -635,8 +635,37 @@ export function PastView() {
             />
           )}
 
+          {/* Interview Transcript — per-question entries listed in
+              chronological order. Each entry shows: timestamp, phase
+              chip (Lead vs Probe), the question text, the AI commentary
+              that fired against the answer (with embedded suggested
+              answer via the ---SAY--- block in CommentaryBody), and a
+              candidate-answer-text snippet so the user can recall what
+              they actually said without replaying audio. Click an entry
+              to seek the recording (audio for now; switches to video
+              in a follow-up commit). */}
+          <div className="mt-8 mb-3 flex items-baseline justify-between">
+            <h2 className="text-[15px] font-semibold uppercase tracking-wider text-ink">
+              {t("Interview Transcript", "面试记录")}
+            </h2>
+            <span className="text-[11px] text-ink-lighter">
+              {session.questions.length}{" "}
+              {session.questions.length === 1
+                ? t("entry", "条")
+                : t("entries", "条")}
+            </span>
+          </div>
           {session.questions.map((q) => {
             const isPlaying = q.id === activeQId;
+            const isProbe = !!q.parentQuestionId;
+            // Truncate the candidate answer to a snippet — full text is
+            // available via the recording / scrolling. ~280 chars covers
+            // a typical first paragraph; longer answers ellipsize.
+            const answerSnippet = (q.answerText || "").trim();
+            const answerPreview =
+              answerSnippet.length > 280
+                ? answerSnippet.slice(0, 280).trim() + "…"
+                : answerSnippet;
             return (
               <div
                 key={q.id}
@@ -654,9 +683,50 @@ export function PastView() {
                   </div>
                 </div>
                 <div className="flex-1 min-w-0">
+                  {/* Phase chip — distinguishes the main Lead Question
+                      from drill-down Probe Questions. The visual weight
+                      is small enough not to distract from the content. */}
+                  <div className="mb-2">
+                    <span
+                      className={`inline-block text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${
+                        isProbe
+                          ? "bg-paper-hover text-ink-light"
+                          : "bg-accent-bg text-accent"
+                      }`}
+                    >
+                      {isProbe
+                        ? t("Probe Question", "追问")
+                        : t("Lead Question", "主问题")}
+                    </span>
+                  </div>
                   <div className="font-serif text-base font-medium leading-snug mb-2.5 text-ink">
                     {q.text}
                   </div>
+                  {/* Candidate's answer snippet — what they actually
+                      said in response. Empty / italic placeholder for
+                      questions where no answer text was captured (e.g.
+                      session ended before they answered, or this is an
+                      old session saved before answerText was persisted). */}
+                  {answerPreview ? (
+                    <div className="mb-3 pl-3 border-l-2 border-rule">
+                      <div className="text-[10px] font-semibold uppercase tracking-wider text-ink-lighter mb-1">
+                        {t("Candidate's answer", "候选人回答")}
+                      </div>
+                      <p className="text-[13.5px] leading-relaxed text-ink-light italic">
+                        {answerPreview}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="mb-3 text-[12.5px] text-ink-lighter italic">
+                      {t(
+                        "No answer text captured for this question.",
+                        "本题未捕获到回答文本。"
+                      )}
+                    </div>
+                  )}
+                  {/* AI commentary on this Q&A pair — includes the
+                      suggested-answer block (---SAY---) inline via
+                      CommentaryBody when present. */}
                   <div className="text-[14.5px] leading-relaxed text-ink">
                     {q.comments.length === 0 ? (
                       <p className="text-ink-lighter italic">
