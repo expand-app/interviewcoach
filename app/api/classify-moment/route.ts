@@ -47,6 +47,14 @@ interface ClassifyBody {
   mode?: "classify" | "confirm";
   /** For mode=confirm: the question text proposed by the primary classifier. */
   candidateQuestion?: string;
+  /** For mode=confirm: true when the moment-state machine recently exited
+   *  candidate_questioning (interviewer is mid-answer to the candidate's
+   *  reverse Q). When set, the L2 verifier biases stricter — it knows
+   *  the interviewer's syntactic-question fragments are likely rhetorical
+   *  narration ("what are the default drivers?") rather than directed
+   *  questions to the candidate. Set by the orchestrator within
+   *  REVERSE_QA_LEAD_COOLDOWN_MS of the candidate_questioning exit. */
+  priorWasCandidateQuestioning?: boolean;
 }
 
 /**
@@ -86,6 +94,8 @@ export async function POST(req: Request) {
   const currentFollowUp = (body.currentFollowUpText || "").trim();
   const mode = body.mode === "confirm" ? "confirm" : "classify";
   const candidateQuestion = (body.candidateQuestion || "").trim();
+  const priorWasCandidateQuestioning =
+    body.priorWasCandidateQuestioning === true;
 
   const client = getAnthropicClient();
 
@@ -117,6 +127,23 @@ Be strict. A fragment that ends with "and", "so", "um", "uh", "let me think", "a
 Output (strict JSON, no prose):
 { "verdict": "done" | "still_setting_up" | "not_a_question", "reason": "<one short line>" }`;
 
+    const reverseQaBias = priorWasCandidateQuestioning
+      ? `
+
+CRITICAL CONTEXT — REVERSE-Q&A AFTERMATH:
+Just before this turn, the candidate was asking the interviewer questions ("any questions for me?" phase) and the interviewer is currently mid-answer. Be EXTRA STRICT:
+
+- Mid-answer interviewers commonly use rhetorical fragments that are syntactically questions but contextually narration. Examples:
+    "...so you have to wonder, what are the default drivers? Well, they're..."
+    "...and what makes a loan get approved? It's a mix of..."
+    "...the question is — what would they pay? Right? So..."
+  These are NOT questions to the candidate; they're the interviewer thinking out loud. → "not_a_question".
+
+- Only return "done" if the interviewer has clearly STOPPED answering (not just briefly paused), the proposed text is at the end of the interviewer's turn, and the candidate is being directed to respond. Specifically: the interviewer's NEXT utterance after the proposed question (if any in transcript) should NOT continue the prior topic — if it does, the interviewer was still narrating.
+
+- When the proposed question text is in the MIDDLE of a continuous interviewer monologue (more interviewer utterances follow it without candidate interjection), default to "not_a_question".`
+      : "";
+
     const confirmUser = `Proposed question (from primary classifier):
 """
 ${candidateQuestion}
@@ -127,7 +154,7 @@ Recent transcript:
 ${formatted}
 """
 
-Milliseconds since last transcript: ${msSinceLastTranscript}
+Milliseconds since last transcript: ${msSinceLastTranscript}${reverseQaBias}
 
 Verdict?`;
 
@@ -169,6 +196,7 @@ Verdict?`;
         verdict,
         reason,
         raw: text,
+        priorWasCandidateQuestioning,
       });
       return NextResponse.json({ verdict, reason });
     } catch (e) {

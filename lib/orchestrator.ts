@@ -152,6 +152,23 @@ const RESTATEMENT_JACCARD_THRESHOLD = 0.5;
  *  one logical question yet short enough that a genuine second question
  *  on the same topic gets through. */
 const CAND_Q_DEDUP_COOLDOWN_MS = 10000;
+/** After exiting candidate_questioning (interviewer just started
+ *  answering the candidate's reverse Q), how long to be EXTRA
+ *  conservative about locking a new Lead Question. Within this window,
+ *  the interviewer is mid-answer and may use rhetorical "what are X..."
+ *  phrasing that's syntactically a question but contextually narration.
+ *  We block Lead lock here unless the candidate has actually started
+ *  to answer (signal: pendingAnswerBuffer above the min-chars threshold
+ *  — interviewer's own talking doesn't fill that buffer, so its size
+ *  is a clean "candidate has spoken since exit" gauge). 15s covers the
+ *  typical mid-answer window where false-positive lock risk is highest;
+ *  past 15s we revert to standard 4-layer filtering. */
+const REVERSE_QA_LEAD_COOLDOWN_MS = 15000;
+/** Min candidate-side chars accumulated since exiting candidate_
+ *  questioning before a Lead can lock during the cooldown window. 30
+ *  chars filters out backchannel "yeah" / "okay" while letting through
+ *  any substantive answer start. */
+const REVERSE_QA_ANSWER_MIN_CHARS = 30;
 
 /** Number of consecutive classify results in the same direction
  *  required before a non-question state transition is committed.
@@ -314,6 +331,18 @@ export class LiveOrchestrator {
    *  cooldown window are deduped even while the API is still returning. */
   private lastCandQCommitAt = 0;
   private lastCommittedCandQText = "";
+
+  /** Timestamp (ms) of the most recent transition OUT of candidate_
+   *  questioning. Used by queueLeadValidation to apply REVERSE_QA_LEAD_
+   *  COOLDOWN_MS — within this window the interviewer is mid-answer
+   *  to the candidate's reverse Q and any new Lead-Q proposal needs
+   *  evidence the candidate actually started answering before locking.
+   *  Set in applyMomentInner whenever prevState === candidate_questioning
+   *  and next !== candidate_questioning (catches all exit paths,
+   *  including direct → question_finalized which bypasses the non-
+   *  finalize branch). 0 = never been in candidate_questioning yet
+   *  this session, no cooldown applies. */
+  private lastExitedCandidateQuestioningAt = 0;
 
   /** Hysteresis state for non-question moment transitions. A single
    *  classify call proposing a new state (e.g. chitchat → interviewer_
@@ -1052,6 +1081,7 @@ export class LiveOrchestrator {
     this.lastCommittedQText = "";
     this.lastCandQCommitAt = 0;
     this.lastCommittedCandQText = "";
+    this.lastExitedCandidateQuestioningAt = 0;
     this.momentHysteresisPending = null;
     this.lastCommentAt.clear();
     this.commentCountPerQ.clear();
@@ -1951,6 +1981,15 @@ export class LiveOrchestrator {
     candidateQuestion: string = ""
   ) {
     const store = useStore.getState();
+    // Mark reverse-Q&A exit BEFORE branching so all exit paths
+    // (including direct → question_finalized) get the timestamp.
+    // queueLeadValidation reads this to apply the post-reverse-Q&A
+    // cooldown that blocks rhetorical-Q false positives during
+    // interviewer mid-answer.
+    const prevState = store.liveMomentState.state;
+    if (prevState === "candidate_questioning" && next !== "candidate_questioning") {
+      this.lastExitedCandidateQuestioningAt = Date.now();
+    }
     const currentSubQ = store.liveQuestions.find(
       (q) => q.id === store.live.currentQuestionId
     );
@@ -2403,11 +2442,25 @@ export class LiveOrchestrator {
   /** Layer 2: focused second-opinion API call. Returns a verdict that
    *  the primary classifier's Q proposal has to be "done" for us to
    *  commit. Runs in PARALLEL with the Layer 3 timer so it doesn't
-   *  stack latency. */
+   *  stack latency.
+   *
+   *  When we're inside REVERSE_QA_LEAD_COOLDOWN_MS of exiting candidate_
+   *  questioning, pass `priorWasCandidateQuestioning: true` so the
+   *  verifier biases stricter against rhetorical-Q false positives in
+   *  the interviewer's mid-answer narration. Method-A's hard reject
+   *  catches the common case (candidate hasn't answered yet); Method-B
+   *  here is the deeper safeguard for cases where A passes (candidate
+   *  has spoken some but interviewer is still narrating). */
   private async runConfirmPass(
     questionText: string
   ): Promise<"done" | "still_setting_up" | "not_a_question"> {
     const sample = this.buildClassifySample();
+    const sinceExitMs =
+      this.lastExitedCandidateQuestioningAt > 0
+        ? Date.now() - this.lastExitedCandidateQuestioningAt
+        : Number.POSITIVE_INFINITY;
+    const priorWasCandidateQuestioning =
+      sinceExitMs < REVERSE_QA_LEAD_COOLDOWN_MS;
     try {
       const resp = await fetch("/api/classify-moment", {
         method: "POST",
@@ -2418,6 +2471,7 @@ export class LiveOrchestrator {
           msSinceLastTranscript: 0,
           mode: "confirm",
           candidateQuestion: questionText,
+          priorWasCandidateQuestioning,
         }),
       });
       if (!resp.ok) return "still_setting_up";
@@ -2444,6 +2498,32 @@ export class LiveOrchestrator {
     rel: QuestionRelation,
     parentMainId: string | undefined
   ): void {
+    // Pre-L0 gate: reverse-Q&A cooldown. The interviewer just exited
+    // candidate_questioning (was answering a candidate's reverse Q),
+    // and a Lead-Q proposal arriving within the cooldown window is
+    // highly suspicious — interviewer mid-answer often contains
+    // syntactic-question fragments ("what are the default drivers?")
+    // that are narration, not directed questions. We require evidence
+    // the candidate has actually started answering (pendingAnswerBuffer
+    // above min-chars) before allowing a Lead lock during this window.
+    // If past the window or candidate has spoken substantively, fall
+    // through to standard 4-layer filtering.
+    if (this.lastExitedCandidateQuestioningAt > 0) {
+      const sinceExitMs = Date.now() - this.lastExitedCandidateQuestioningAt;
+      if (
+        sinceExitMs < REVERSE_QA_LEAD_COOLDOWN_MS &&
+        this.pendingAnswerBuffer.length < REVERSE_QA_ANSWER_MIN_CHARS
+      ) {
+        log("filter", "reverse-qa-cooldown", {
+          sinceExitMs,
+          pendingAnswerLen: this.pendingAnswerBuffer.length,
+          requiredChars: REVERSE_QA_ANSWER_MIN_CHARS,
+          text: preview(text, 60),
+        });
+        return;
+      }
+    }
+
     // Restatement gate (pre-L0): if a Lead/Probe was just committed
     // within the cooldown window AND the new proposal is semantically
     // similar to it, drop it. Fixes the case where the classifier
