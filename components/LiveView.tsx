@@ -179,9 +179,6 @@ export function LiveView() {
   const candidateQuestionCommentary = useStore(
     (s) => s.liveCandidateQuestionCommentary
   );
-  const candidateQuestioningSince = useStore(
-    (s) => s.liveCandidateQuestioningSince
-  );
   const timeline = useStore((s) => s.liveTimeline);
   const playbackTime = useStore((s) => s.livePlaybackTime);
   const isUploadMode = useStore((s) => s.liveIsUploadMode);
@@ -575,48 +572,23 @@ export function LiveView() {
               Commentary and Captions are fixed heights; only Phase
               flexes. */}
           <div className="border border-rule rounded-md overflow-hidden bg-paper flex flex-col mb-6">
-            {/* (1) Current Question — fixed-height top bar. */}
+            {/* (1) Current Question — fixed-height top bar.
+                Five phase states (no fallback-Lead bridging):
+                  1. Awaiting Identity — pre-confirmation
+                  2. Waiting For First — pre-utterance
+                  3. Candidate's Question — reverse Q&A
+                  4. Lead Question — currentMainQ active
+                  5. Interview Ongoing — everything else (warm-up,
+                     between-Leads, wrap-up after reverse Q&A). Shows
+                     summary so user sees what's happening even when no
+                     Lead is locked. */}
             <CurrentQuestionBar
               state={effectiveState}
               summary={moment.summary}
               mainQuestion={rolesConfirmed ? currentMainQ : undefined}
               followUp={rolesConfirmed ? currentFollowUpQ : undefined}
-              // Fallback Lead — the most recently archived Lead, used
-              // by the bar when `currentMainQ` is undefined (interviewer
-              // mid-pivot before the next Lead has actually locked).
-              //
-              // CRITICAL: gated on `candidateQuestioningSince`. Once
-              // the session has entered the Q&A reverse phase, the
-              // prior Leads are CLOSED — the bar must not "jump back"
-              // to a Lead the candidate already moved past. Concretely,
-              // only fall back to an archived Lead whose askedAtSeconds
-              // is AFTER candidateQuestioningSince. If no Lead has
-              // locked since the Q&A started, fallback returns
-              // undefined and the bar renders the Q&A-wrap-up empty
-              // state instead of the stale Lead.
-              fallbackArchivedLead={(() => {
-                if (!rolesConfirmed || archivedMains.length === 0) {
-                  return undefined;
-                }
-                const last = archivedMains[archivedMains.length - 1];
-                if (
-                  candidateQuestioningSince != null &&
-                  last.askedAtSeconds < candidateQuestioningSince
-                ) {
-                  // Q&A has happened; this Lead is from before then —
-                  // treat as closed.
-                  return undefined;
-                }
-                return last;
-              })()}
-              candidateQuestioningEverEntered={
-                candidateQuestioningSince != null
-              }
               rolesConfirmed={rolesConfirmed}
               hasUtterances={hasUtterances}
-              hasEverHadLead={
-                currentMainQ !== undefined || archivedMains.length > 0
-              }
               timelinePhaseKind={timelineView?.phaseSeg?.kind}
               candidateAskingText={
                 timelineView?.phaseSeg?.kind === "candidate_asking"
@@ -639,21 +611,13 @@ export function LiveView() {
               }
               labels={{
                 leadHeader: t("Lead Question", "主问题"),
-                warmupHeader: t(
-                  "Warm-up",
-                  "热身"
-                ),
-                betweenQuestionsHeader: t(
-                  "Between Questions · Interviewer Transitioning",
-                  "问题间隙 · 面试官切换话题"
+                interviewOngoingHeader: t(
+                  "Interview Ongoing",
+                  "面试进行中"
                 ),
                 candidateAskingHeader: t(
                   "Candidate's Question",
                   "候选人提问"
-                ),
-                qaWrapupHeader: t(
-                  "Q&A · Wrap-up",
-                  "Q&A · 收尾中"
                 ),
                 waitingForFirst: t(
                   "Waiting for the interview to begin…",
@@ -876,42 +840,42 @@ function deriveCandidateAskingText(
 }
 
 /**
- * Top bar. Shows which of FOUR phases the interview is currently in:
+ * Top bar. Five phase states, evaluated in order (first match wins):
  *
- *   1. Warm-up / Interviewer Introduction — no Lead has EVER locked yet.
- *      Row 1: "WARM-UP · INTERVIEWER INTRODUCTION"
- *      Row 2: interim summary (what the interviewer is building toward)
- *   2. Between Questions — at least one Lead has locked, current one
- *      has been archived, new one hasn't locked yet. Interviewer is
- *      transitioning between topics.
- *      Row 1: "BETWEEN QUESTIONS · INTERVIEWER TRANSITIONING"
- *      Row 2: interim summary
- *   3. Question (面试中) — a Lead is currently active.
+ *   1. Awaiting Identity — `!rolesConfirmed && hasUtterances`
+ *      Pre-session prompt: user hasn't tagged interviewer/candidate yet.
+ *   2. Waiting For First — `!hasUtterances && !mainQuestion && !summary`
+ *      Pre-session: recording started but no utterance has landed.
+ *   3. Candidate's Question — `state === candidate_questioning &&
+ *      liveCandidateQuestionText`, OR `timelinePhaseKind ===
+ *      candidate_asking` (upload mode). Reverse Q&A.
+ *      Row 1: "CANDIDATE'S QUESTION"
+ *      Row 2: candidate's current question text
+ *   4. Lead Question — `mainQuestion` is currently locked.
  *      Row 1: "LEAD QUESTION" + question text
- *      Row 2: "PROBE QUESTION" + probe text (only if a probe is active)
- *   4. Candidate Q&A (候选人提问环节) — reverse Q&A tail, end of interview.
- *      Row 1: "CANDIDATE Q&A"
- *      Row 2: candidate's current question
+ *      Row 2 (optional): "PROBE QUESTION" + probe text (when followUp set)
+ *      Row 2 (optional): "INTERVIEWER IS ASKING A PROBE QUESTION…" +
+ *        summary, when state===interviewer_speaking and no followUp yet
+ *   5. Interview Ongoing — fallthrough. Covers all transitional states
+ *      (warm-up, between-Leads, post-reverse-Q&A wrap-up). Shows the
+ *      moment summary so the user sees what's happening even when no
+ *      Lead is locked. Replaces the older Warm-up / Between-Questions /
+ *      Q&A-Wrap-up trio plus the fallback-archived-Lead bridging logic
+ *      — those distinctions added complexity (and a "jump back to old
+ *      Lead" bug) without giving the user actionable extra information.
  *
- * Warm-up vs Between-Questions distinction enforces a one-time warm-up:
- * once the first Lead has locked, we never regress to "WARM-UP" even if
- * the current Lead is briefly archived during a topic pivot.
- *
- * Live mode (no timeline) infers the phase from momentState + Lead
- * history. Upload mode uses the timeline's phase.kind directly (so
- * "candidate_asking" only fires when the model has extracted the
- * reverse-Q&A phase, typically at the end of the recording).
+ * Live mode infers the phase from momentState + currentMainQ. Upload
+ * mode uses timelinePhaseKind for path 3 (so "candidate_asking" only
+ * fires when the model has extracted the reverse-Q&A phase from the
+ * full recording).
  */
 function CurrentQuestionBar({
   state,
   summary,
   mainQuestion,
   followUp,
-  fallbackArchivedLead,
-  candidateQuestioningEverEntered,
   rolesConfirmed,
   hasUtterances,
-  hasEverHadLead,
   timelinePhaseKind,
   candidateAskingText,
   liveCandidateQuestionText,
@@ -921,22 +885,8 @@ function CurrentQuestionBar({
   summary: string;
   mainQuestion: Question | undefined;
   followUp: Question | undefined;
-  /** Most recently archived Lead — used as the visual fallback when
-   *  `mainQuestion` is undefined and we're past warmup. Already gated
-   *  by the parent against `candidateQuestioningSince`: once Q&A has
-   *  begun, this is undefined unless a NEW Lead has locked since. */
-  fallbackArchivedLead?: Question;
-  /** True once the session has ever entered candidate_questioning.
-   *  Used to render a "Q&A wrap-up" empty state when there's no
-   *  fallbackArchivedLead AND we've left Q&A — instead of the
-   *  warmup placeholder, which would be wrong-phase. */
-  candidateQuestioningEverEntered?: boolean;
   rolesConfirmed: boolean;
   hasUtterances: boolean;
-  /** True once ANY Lead has been locked in this session (including
-   *  Leads that have since been archived). Controls warm-up vs
-   *  fallback-lead labeling when mainQuestion is undefined. */
-  hasEverHadLead: boolean;
   /** Upload-mode only: the kind of the phase segment at the current
    *  playback time. When this is "candidate_asking" we render the
    *  Candidate Q&A layout regardless of mainQuestion state. */
@@ -951,10 +901,8 @@ function CurrentQuestionBar({
   liveCandidateQuestionText?: string;
   labels: {
     leadHeader: string;
-    warmupHeader: string;
-    betweenQuestionsHeader: string;
+    interviewOngoingHeader: string;
     candidateAskingHeader: string;
-    qaWrapupHeader: string;
     waitingForFirst: string;
     awaitingIdentity: string;
     probeHeader: string;
@@ -1056,57 +1004,19 @@ function CurrentQuestionBar({
     );
   }
 
-  // No Lead currently locked. Per the user's spec, the Phase region
-  // only ever shows a Lead Question or a Candidate's Question during
-  // the interview — no "Between Questions" middle state. When we land
-  // here:
-  //   - hasEverHadLead === true: there's a transient gap (just exited
-  //     candidate_questioning, or interviewer is mid-pivot before the
-  //     next Lead has actually locked). Render the most recently
-  //     archived Lead so the bar stays continuous and the user
-  //     doesn't see an empty frame. Visually identical to the locked-
-  //     Lead branch above.
-  //   - hasEverHadLead === false: genuine warm-up phase before the
-  //     first Lead has ever locked. Show the warm-up placeholder.
-  if (hasEverHadLead && fallbackArchivedLead) {
-    return (
-      <BarShell>
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
-          {labels.leadHeader}
-        </div>
-        <div className="font-serif text-[17px] leading-snug text-ink font-medium">
-          {fallbackArchivedLead.text}
-        </div>
-      </BarShell>
-    );
-  }
-  // Q&A wrap-up — Q&A reverse phase has been entered but state is no
-  // longer candidate_questioning AND no new Lead has locked since.
-  // Per spec, prior Leads are closed once Q&A starts, so we don't fall
-  // back to them. Show a neutral wrap-up frame instead of warmup
-  // (which would be wrong-phase).
-  if (candidateQuestioningEverEntered) {
-    return (
-      <BarShell>
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
-          {labels.qaWrapupHeader}
-        </div>
-        {summary ? (
-          <div className="font-serif text-[15px] leading-snug text-ink-light italic">
-            {summary}
-          </div>
-        ) : (
-          <div className="text-[13px] text-ink-lighter italic">—</div>
-        )}
-      </BarShell>
-    );
-  }
-  // Warm-up — no Lead has ever locked, before the interview proper has
-  // started. Show a neutral header + summary if available.
+  // Interview Ongoing — no active Lead, not in reverse Q&A. Single
+  // catch-all for warm-up, between-Leads transitions, and the wrap-up
+  // tail after reverse Q&A. Shows the moment summary so the user
+  // always knows what's happening, even when the classifier hasn't
+  // locked a fresh Lead yet (e.g. interviewer mid-setup, or new Lead
+  // failing the 4-layer filter). Replaces the older Warm-up /
+  // Between-Questions / Q&A-Wrap-up trio plus the fallback-archived-
+  // Lead bridge — those distinctions weren't actionable for the user
+  // and the time-gated fallback caused "jump back to old Lead" bugs.
   return (
     <BarShell>
       <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
-        {labels.warmupHeader}
+        {labels.interviewOngoingHeader}
       </div>
       {summary ? (
         <div className="font-serif text-[15px] leading-snug text-ink-light italic">
