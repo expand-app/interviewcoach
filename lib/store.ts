@@ -151,6 +151,16 @@ interface StoreState {
   startLive: (jd: string, resume: string) => void;
   addQuestion: (q: Question) => void;
   addCommentToQuestion: (questionId: string, c: Comment) => void;
+  /** Append a chunk of candidate speech to the running `answerText` of
+   *  a question. Called from the orchestrator on every candidate
+   *  utterance that lands while a Lead/Probe is locked (state ===
+   *  question_finalized). CRITICAL: this is the ONLY reliable way to
+   *  accumulate per-question answer text — `liveUtterances` is a
+   *  rolling 30-entry window for the captions UI and gets evicted long
+   *  before endLive runs on a 20+ min session. Persisting onto the
+   *  Question itself decouples the answer-text record from the UI
+   *  buffer so scoring sees the full transcript. */
+  appendCandidateAnswerText: (questionId: string, chunk: string) => void;
   addUtterance: (u: Utterance) => void;
   /** Replace the entire live utterance list. Used by upload mode to
    *  pre-load ALL transcribed utterances up front (no rolling-window
@@ -314,6 +324,19 @@ export const useStore = create<StoreState>()(
       };
     }),
 
+  appendCandidateAnswerText: (questionId, chunk) => {
+    const trimmed = chunk.trim();
+    if (!trimmed) return;
+    set((s) => ({
+      liveQuestions: s.liveQuestions.map((q) => {
+        if (q.id !== questionId) return q;
+        const prev = (q.answerText ?? "").trim();
+        const joined = prev ? `${prev} ${trimmed}` : trimmed;
+        return { ...q, answerText: joined };
+      }),
+    }));
+  },
+
   replaceLiveUtterances: (utterances) => set({ liveUtterances: utterances }),
 
   mergeSpeakerRoles: (roles) =>
@@ -338,48 +361,18 @@ export const useStore = create<StoreState>()(
 
   endLive: (title, audioUrl) => {
     const s = get();
-    // Hydrate each Question with its candidate-answer text BEFORE we wipe
-    // liveUtterances — the scoring endpoint needs the actual answer
-    // content, not just the in-flight coach commentary, to grade the
-    // rubric (Question Addressing / Specificity / Depth / Communication
-    // all reference what the candidate ACTUALLY said).
-    //
-    // Bucket: for each question Q at askedAt T, gather candidate
-    // utterances u where T <= u.atSeconds < nextQ.askedAtSeconds (or end
-    // of session for the last Q). "candidate" is resolved via
-    // liveSpeakerRoles[u.dgSpeaker]. Utterances with unresolved roles
-    // are skipped — better to omit than to mis-attribute interviewer
-    // speech as a candidate answer.
-    const sortedQs = [...s.liveQuestions].sort(
-      (a, b) => a.askedAtSeconds - b.askedAtSeconds
-    );
-    const sessionEndSec = s.live.elapsedSeconds;
-    const questionsWithAnswers = sortedQs.map((q, i) => {
-      const startSec = q.askedAtSeconds;
-      const endSec =
-        i + 1 < sortedQs.length ? sortedQs[i + 1].askedAtSeconds : sessionEndSec;
-      const answerParts: string[] = [];
-      for (const u of s.liveUtterances) {
-        if (u.atSeconds < startSec || u.atSeconds >= endSec) continue;
-        if (u.dgSpeaker === undefined) continue;
-        const role = s.liveSpeakerRoles[u.dgSpeaker];
-        if (role !== "candidate") continue;
-        const t = u.text.trim();
-        if (!t) continue;
-        answerParts.push(t);
-      }
-      return { ...q, answerText: answerParts.join(" ").trim() };
-    });
-    // Re-key by id to preserve original insertion order (Question objects
-    // are stored chronologically already; sort above was just for the
-    // bucketing pass — restore the original order to keep ids stable
-    // for any past UI that lookups by index).
-    const idToWithAnswer = new Map(
-      questionsWithAnswers.map((q) => [q.id, q])
-    );
-    const finalQuestions = s.liveQuestions.map(
-      (q) => idToWithAnswer.get(q.id) ?? q
-    );
+    // No more end-of-session bucketing: candidate answer text has been
+    // accumulated onto each Question's `answerText` field LIVE (via the
+    // orchestrator's `appendCandidateAnswerText` calls during
+    // question_finalized + at each lock's pendingAnswerBuffer flush).
+    // The previous design bucketed `liveUtterances` here, but
+    // `liveUtterances` is a 30-entry rolling window for the captions
+    // UI — on a 20+ minute session, all but the final ~30 utterances
+    // had been evicted by endLive time, so only the LAST question got
+    // any answer text. This caused legitimate 27-min interviews with
+    // 3+ substantively-answered questions to score `insufficient_data`.
+    // Just snapshot whatever's already on the Question objects.
+    const finalQuestions = s.liveQuestions;
 
     const session: Session = {
       id: `sess-${Date.now()}`,

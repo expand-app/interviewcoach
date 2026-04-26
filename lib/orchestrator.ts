@@ -1308,8 +1308,21 @@ export class LiveOrchestrator {
     const hasLockedQ = !!liveState.currentQuestionId;
 
     if (momentState === "question_finalized" && hasLockedQ) {
-      const { liveQuestions, live, setAnswerInProgress } = useStore.getState();
+      const {
+        liveQuestions,
+        live,
+        setAnswerInProgress,
+        appendCandidateAnswerText,
+      } = useStore.getState();
       this.answerBuffer += (this.answerBuffer ? " " : "") + clean;
+      // Persist the candidate utterance onto the locked question's
+      // `answerText` IMMEDIATELY. We can't rely on bucketing
+      // `liveUtterances` at endLive — that array is a rolling 30-entry
+      // window for the captions UI and gets evicted long before a
+      // 20+ minute session ends. By appending here we ensure the full
+      // per-question answer text survives onto the Question object,
+      // which is what scoring reads.
+      appendCandidateAnswerText(live.currentQuestionId!, clean);
       setAnswerInProgress(true);
       if (this.shouldTriggerComment(live.currentQuestionId!)) {
         const currentQ = liveQuestions.find((q) => q.id === live.currentQuestionId);
@@ -2492,6 +2505,14 @@ export class LiveOrchestrator {
       kind: "first",
     });
     this.answerBuffer = this.pendingAnswerBuffer;
+    // Seed the new question's answerText with any candidate speech that
+    // landed BEFORE the lock (during the interviewer_speaking phase).
+    // Without this, the first ~3 seconds of the answer — which is what
+    // tipped the classifier over to question_finalized in the first
+    // place — would never reach the persistent question.answerText.
+    if (this.pendingAnswerBuffer) {
+      store.appendCandidateAnswerText(q.id, this.pendingAnswerBuffer);
+    }
     this.pendingAnswerBuffer = "";
     this.dialogueBuffer = [];
     this.interviewerMonologueBuffer = "";
@@ -2527,6 +2548,9 @@ export class LiveOrchestrator {
     // Carry over any candidate text accumulated while interviewer was asking
     // this follow-up.
     this.answerBuffer = this.pendingAnswerBuffer;
+    if (this.pendingAnswerBuffer) {
+      store.appendCandidateAnswerText(q.id, this.pendingAnswerBuffer);
+    }
     this.pendingAnswerBuffer = "";
     this.dialogueBuffer = [];
     this.interviewerMonologueBuffer = "";
@@ -2560,6 +2584,9 @@ export class LiveOrchestrator {
     store.setMomentState({ state: "question_finalized", summary });
     store.setDisplayedComment(null);
     this.answerBuffer = this.pendingAnswerBuffer;
+    if (this.pendingAnswerBuffer) {
+      store.appendCandidateAnswerText(q.id, this.pendingAnswerBuffer);
+    }
     this.pendingAnswerBuffer = "";
     this.dialogueBuffer = [];
     this.interviewerMonologueBuffer = "";

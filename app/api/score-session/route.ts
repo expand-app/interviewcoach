@@ -99,14 +99,57 @@ export async function POST(req: Request) {
     followUps.set(q.parentQuestionId, list);
   }
 
-  // Schema detection. Sessions saved before commit b2de823 don't have
-  // answerText on any Question — when they re-score, the prompt has to
-  // grade from COACH NOTES alone (the in-flight coach commentary). The
-  // earlier prompt treated ANSWER as primary ground truth, which made
-  // legacy sessions trip the "ANSWER chars < 200" insufficient-data
-  // gate even when the coach notes were rich enough to grade. Branch on
-  // schema explicitly so the model knows what evidence it has.
-  const isLegacySchema = mains.every((q) => typeof q.answerText !== "string");
+  // Schema detection. Two cases route to "legacy" (= grade from coach
+  // notes only):
+  //
+  //   (1) PURE LEGACY — sessions saved before commit b2de823, where no
+  //       Question has an `answerText` field at all. The model's only
+  //       evidence is the in-flight coach commentary.
+  //
+  //   (2) BUCKETING-BUG VICTIMS — sessions saved between b2de823 and
+  //       the live-append fix, which had `answerText` fields but the
+  //       end-of-session bucketing read from a rolling 30-entry
+  //       `liveUtterances` window. On a 20+ minute session, all but
+  //       the final ~30 candidate utterances had been evicted, so only
+  //       the LAST question got any answer text. We detect this by
+  //       comparing answer-evidence vs. coach-note-evidence: if coach
+  //       notes have substantive content (≥3 Qs with ≥60 chars each)
+  //       but answer text doesn't, the answer-text channel was broken
+  //       — fall back to legacy path so the session can score against
+  //       the rich coach notes instead of insufficient-ing on empty
+  //       answers.
+  //
+  // Without (2), users with bucketing-bugged sessions hit "Re-score"
+  // and get the same `insufficient_data` over and over even though
+  // the coach notes contain plenty of gradable signal.
+  const naivelyLegacy = mains.every(
+    (q) => typeof q.answerText !== "string"
+  );
+  const qsWithAnswerEvidence = questions.filter(
+    (q) =>
+      typeof q.answerText === "string" && q.answerText.trim().length >= 60
+  ).length;
+  const qsWithCommentEvidence = questions.filter(
+    (q) =>
+      q.comments.reduce(
+        (s, c) => s + stripTags(c.text).trim().length,
+        0
+      ) >= 60
+  ).length;
+  const looksBucketingBugged =
+    !naivelyLegacy &&
+    qsWithAnswerEvidence < 3 &&
+    qsWithCommentEvidence >= 3;
+  const isLegacySchema = naivelyLegacy || looksBucketingBugged;
+  if (looksBucketingBugged) {
+    console.log(
+      "[score-session] schema-mismatch detected — forcing legacy path:",
+      {
+        qsWithAnswerEvidence,
+        qsWithCommentEvidence,
+      }
+    );
+  }
 
   // Build the per-question block. Two formats:
   //   - Modern schema: ANSWER (verbatim candidate speech) is primary,
@@ -162,7 +205,8 @@ export async function POST(req: Request) {
   // judged by candidate-speech volume; legacy sessions by the volume of
   // substantive coach observations (since that IS the evidence). The
   // "questionsWithEvidence" stat is a single number the prompt can use
-  // to gate INSUFFICIENT regardless of schema.
+  // to gate INSUFFICIENT regardless of schema. Reuse the per-Q counts
+  // we computed above for schema detection.
   const totalAnswerChars = questions.reduce(
     (sum, q) =>
       sum + (typeof q.answerText === "string" ? q.answerText.trim().length : 0),
@@ -177,17 +221,8 @@ export async function POST(req: Request) {
       ),
     0
   );
-  const questionsWithAnswers = questions.filter(
-    (q) =>
-      typeof q.answerText === "string" && q.answerText.trim().length >= 60
-  ).length;
-  const questionsWithSubstantiveComments = questions.filter(
-    (q) =>
-      q.comments.reduce(
-        (s, c) => s + stripTags(c.text).trim().length,
-        0
-      ) >= 60
-  ).length;
+  const questionsWithAnswers = qsWithAnswerEvidence;
+  const questionsWithSubstantiveComments = qsWithCommentEvidence;
   // Single number the prompt's INSUFFICIENT gate keys on, regardless
   // of schema. For modern: how many Qs had a real answer. For legacy:
   // how many Qs had real coach notes.
