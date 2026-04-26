@@ -115,15 +115,7 @@ export function StartModal({ open, onCancel, onStart }: Props) {
                 <span className="text-ink-light">
                   {" "}
                   — pick up sound from a Zoom meeting, browser playback,
-                  or any other tab, and save a WebM screen recording of
-                  the shared tab/window. After clicking Start, your
-                  browser will ask which tab/window to share —{" "}
-                  <strong className="text-ink">
-                    check &quot;Share tab audio&quot;
-                  </strong>{" "}
-                  in that prompt or only the mic will be used. The
-                  recording is downloadable from the Past Session view
-                  but lives in browser memory — download to keep.
+                  or any other tab, alongside your mic.
                 </span>
               </span>
             </label>
