@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
 import { ModalShell } from "@/components/modals/ModalShell";
-import type { Comment, MomentStateKind, Question, Utterance } from "@/types/session";
+import type { MomentStateKind, Question, Utterance } from "@/types/session";
 
 /**
  * The three top sections (Interview Phase, Live Commentary, Live Captions)
@@ -457,26 +457,6 @@ export function LiveView() {
       : currentFollowUpQ ?? currentMainQ
     : questions.find((q) => q.id === live.currentQuestionId);
 
-  // Earlier-in-interview: every question that is NOT in the current main's
-  // tree. Group by main.
-  const archivedMains = useMemo(() => {
-    const currentMainId = currentMainQ?.id;
-    return questions.filter(
-      (q) => !q.parentQuestionId && q.id !== currentMainId
-    );
-  }, [questions, currentMainQ]);
-
-  const followUpsByParent = useMemo(() => {
-    const map = new Map<string, Question[]>();
-    for (const q of questions) {
-      if (!q.parentQuestionId) continue;
-      const list = map.get(q.parentQuestionId) ?? [];
-      list.push(q);
-      map.set(q.parentQuestionId, list);
-    }
-    return map;
-  }, [questions]);
-
   const hasStarted = live.status !== "idle" || questions.length > 0;
 
   if (!hasStarted) {
@@ -737,32 +717,14 @@ export function LiveView() {
             }}
           />
 
-          {/* Earlier in this interview — archived mains, with follow-ups.
-              Lives OUTSIDE the 16:9 video frame — a normal scrolling
-              list below the block. */}
-          {archivedMains.length > 0 && (
-            <>
-              <div className="mt-7 mb-3 text-[11px] text-ink-lighter font-semibold tracking-wide uppercase">
-                {t("Earlier in this interview", "本场之前的问题")}
-              </div>
-              {archivedMains
-                .slice()
-                .reverse()
-                .map((main, idx) => (
-                  <ArchivedMainBlock
-                    key={main.id}
-                    main={main}
-                    followUps={followUpsByParent.get(main.id) ?? []}
-                    num={archivedMains.length - idx}
-                    defaultOpen={idx === 0}
-                    labels={{
-                      followUp: t("Probe Question", "追问"),
-                      noCommentary: t("No commentary.", "暂无评论。"),
-                    }}
-                  />
-                ))}
-            </>
-          )}
+          {/* Note: the previous "Earlier in this interview" block was
+              removed. Live mode is now strictly forward-looking — the
+              current question / phase / commentary fills the frame and
+              past questions are surfaced after End → Save under the
+              "Interview Transcript" section in the Past Session view.
+              Keeps Live's cognitive load low (no scrolling history while
+              an active interview is running) and centralizes the
+              chronological view in one place tied to the recording. */}
         </div>
       </div>
     </>
@@ -2052,83 +2014,3 @@ function CaptionLane({
   );
 }
 
-function ArchivedMainBlock({
-  main,
-  followUps,
-  num,
-  defaultOpen = false,
-  labels,
-}: {
-  main: Question;
-  followUps: Question[];
-  num: number;
-  defaultOpen?: boolean;
-  labels: { followUp: string; noCommentary: string };
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  const pad = num.toString().padStart(2, "0");
-
-  return (
-    <div className="border-t border-rule pt-4 pb-2 first:border-t-0 first:pt-0 mb-1.5">
-      <button
-        className="w-full flex items-start gap-2.5 cursor-pointer py-1 text-left"
-        onClick={() => setOpen(!open)}
-      >
-        <div
-          className={`w-5 h-[26px] grid place-items-center text-ink-lighter text-[10px] shrink-0 pt-0.5 transition-transform ${
-            open ? "rotate-90" : ""
-          }`}
-        >
-          ▶
-        </div>
-        <div className="font-mono text-xs font-semibold text-ink-lighter pt-[5px] min-w-[26px]">
-          {pad}
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="font-serif text-base font-medium leading-snug text-ink hover:text-accent transition-colors">
-            {main.text}
-          </div>
-        </div>
-      </button>
-      {open && (
-        <div className="pl-14 pt-2 pr-1">
-          <CommentList comments={main.comments} emptyText={labels.noCommentary} />
-          {followUps.map((fu) => (
-            <div key={fu.id} className="mt-3 border-l-2 border-rule pl-3">
-              <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
-                {labels.followUp}
-              </div>
-              <div className="font-serif text-[15px] leading-snug text-ink-light mb-1.5">
-                {fu.text}
-              </div>
-              <CommentList comments={fu.comments} emptyText={labels.noCommentary} />
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CommentList({
-  comments,
-  emptyText,
-}: {
-  comments: Comment[];
-  emptyText: string;
-}) {
-  if (comments.length === 0) {
-    return <p className="text-sm text-ink-lighter italic">{emptyText}</p>;
-  }
-  return (
-    <>
-      {[...comments].reverse().map((c) => (
-        <p
-          key={c.id}
-          className="text-[14.5px] leading-relaxed text-ink mb-2.5 prose-live"
-          dangerouslySetInnerHTML={{ __html: c.text || "…" }}
-        />
-      ))}
-    </>
-  );
-}
