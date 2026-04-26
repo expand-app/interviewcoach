@@ -100,15 +100,30 @@ interface StoreState {
   liveCandidateQuestionCommentary: string;
   setLiveCandidateQuestionCommentary: (text: string) => void;
 
+  /** Currently-locked candidate question text. Set by the orchestrator
+   *  when a candidate-question commentary commit happens (Jaccard +
+   *  read-gate both pass) and cleared when a Lead Question locks. Acts
+   *  like the Lead-Question lock for the reverse-Q&A path: once a
+   *  candidate question is "established", the UI keeps showing it even
+   *  when the moment state machine briefly transits out of
+   *  candidate_questioning (interviewer mid-answer can flip state to
+   *  interviewer_speaking / chitchat). Without this lock, the Phase bar
+   *  would fall back to "Interview Ongoing" while the interviewer
+   *  answers — losing the question context that produced the answer.
+   *
+   *  Distinct from `liveMomentState.candidateQuestion` which mirrors the
+   *  classifier's latest output and flickers across rephrasings of the
+   *  same logical question (the classifier re-emits varied wording every
+   *  2-3s tick). The locked field only updates when a meaningfully new
+   *  question commits, so the UI display stays stable. */
+  liveLockedCandidateQuestion: string | null;
+  setLiveLockedCandidateQuestion: (text: string | null) => void;
+
   /** Session-elapsed seconds at which the moment-state machine first
-   *  transitioned into `candidate_questioning`. Once set, indicates the
-   *  Q&A phase has begun — the UI uses this to gate "fallback to a
-   *  previous Lead Question": any archived Lead with askedAtSeconds
-   *  BEFORE this timestamp is considered closed and is no longer
-   *  surfaced as the Phase region's fallback. (Per spec: once Q&A
-   *  enters, the prior Leads must not "come back" as the displayed
-   *  Lead.) Null until the first entry; never reset within a session
-   *  even if state later moves out of candidate_questioning. */
+   *  transitioned into `candidate_questioning`. Marks the start of the
+   *  reverse Q&A phase for diagnostic logging. Null until the first
+   *  entry; never reset within a session even if state later moves
+   *  out of candidate_questioning. */
   liveCandidateQuestioningSince: number | null;
   setLiveCandidateQuestioningSince: (sec: number | null) => void;
 
@@ -274,6 +289,9 @@ export const useStore = create<StoreState>()(
   liveCandidateQuestionCommentary: "",
   setLiveCandidateQuestionCommentary: (liveCandidateQuestionCommentary) =>
     set({ liveCandidateQuestionCommentary }),
+  liveLockedCandidateQuestion: null,
+  setLiveLockedCandidateQuestion: (liveLockedCandidateQuestion) =>
+    set({ liveLockedCandidateQuestion }),
   liveCandidateQuestioningSince: null,
   setLiveCandidateQuestioningSince: (liveCandidateQuestioningSince) =>
     set({ liveCandidateQuestioningSince }),
@@ -315,6 +333,7 @@ export const useStore = create<StoreState>()(
       liveListeningHint: "",
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
+      liveLockedCandidateQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
@@ -436,6 +455,7 @@ export const useStore = create<StoreState>()(
       liveListeningHint: "",
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
+      liveLockedCandidateQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,
@@ -462,6 +482,7 @@ export const useStore = create<StoreState>()(
       liveListeningHint: "",
       liveWarmupCommentary: "",
       liveCandidateQuestionCommentary: "",
+      liveLockedCandidateQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
       liveTimeline: null,

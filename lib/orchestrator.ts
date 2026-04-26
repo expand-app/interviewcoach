@@ -2103,6 +2103,22 @@ export class LiveOrchestrator {
       // committed before this one.
       this.lastCandQCommitAt = Date.now();
       this.lastCommittedCandQText = cq;
+      // Lock the candidate-question text for the Phase bar. Mirrors the
+      // Lead-Question lock semantics: once a candidate question is
+      // "established" (passed both gates), keep it on screen until a
+      // new candidate question commits or a Lead Question locks. Without
+      // this lock, two things go wrong:
+      //   (a) Within candidate_questioning the classifier re-emits
+      //       slightly varied wording each tick and the Phase bar
+      //       flickers between rephrasings of the same logical Q.
+      //   (b) When the interviewer is mid-answer, the moment-state
+      //       machine briefly transits to interviewer_speaking /
+      //       chitchat (hysteresis can flip on a long answer), and the
+      //       UI loses the candidate question — falling back to
+      //       "Interview Ongoing" while the answer to that exact
+      //       question is being delivered.
+      // Lock + UI-side `!mainQuestion` gate together solve both.
+      useStore.getState().setLiveLockedCandidateQuestion(cq);
       useStore.getState().setLiveCandidateQuestionCommentary("");
       log("candidate-q", "new", { text: preview(cq, 80) });
       void this.generateCandidateQuestionCommentary(cq);
@@ -2572,6 +2588,13 @@ export class LiveOrchestrator {
     // has moved on and any prior rejected hallucinations are stale
     // (some of them may even become legitimate in the new context).
     this.rejectedQTexts.clear();
+    // Clear any locked candidate question. Interviewer asking a fresh
+    // Lead supersedes whatever the candidate was previously asking —
+    // the Phase bar should now show the Lead, not the stale candidate
+    // question. (Locked candQ persists across moment-state transitions
+    // specifically so it survives interviewer mid-answer chitchat
+    // flicker; only a Lead-Question commit resets it.)
+    useStore.getState().setLiveLockedCandidateQuestion(null);
 
     const store = useStore.getState();
     const currentMainQ = parentMainId

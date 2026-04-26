@@ -179,6 +179,9 @@ export function LiveView() {
   const candidateQuestionCommentary = useStore(
     (s) => s.liveCandidateQuestionCommentary
   );
+  const lockedCandidateQuestion = useStore(
+    (s) => s.liveLockedCandidateQuestion
+  );
   const timeline = useStore((s) => s.liveTimeline);
   const playbackTime = useStore((s) => s.livePlaybackTime);
   const isUploadMode = useStore((s) => s.liveIsUploadMode);
@@ -599,15 +602,29 @@ export function LiveView() {
                     )
                   : undefined
               }
-              // Live-mode reverse-Q&A text. When the orchestrator's state
-              // machine is in `candidate_questioning`, moment carries the
-              // candidate's current question text on the MomentState
-              // itself (set atomically with the state transition). Pass
-              // it down so the Phase region renders the question.
+              // Live-mode reverse-Q&A text. Two sources, in priority order:
+              //   (1) lockedCandidateQuestion — set by orchestrator when a
+              //       cand-q-cmt commit happens (Jaccard + read-gate both
+              //       cleared). Stable across rephrasings AND across
+              //       moment-state flicker (interviewer mid-answer can
+              //       briefly transit out of candidate_questioning).
+              //       Cleared when a Lead Question locks.
+              //   (2) moment.candidateQuestion — fresh classifier output,
+              //       used during the brief window after entering
+              //       candidate_questioning but before the first commit
+              //       fires (or when read-gate has temporarily blocked
+              //       all commits). Reflects the live ticking output;
+              //       may flicker among rephrasings.
+              // The CurrentQuestionBar renders Candidate's Question
+              // phase whenever either source is non-empty AND no
+              // mainQuestion is currently locked.
               liveCandidateQuestionText={
                 rolesConfirmed && moment.state === "candidate_questioning"
                   ? moment.candidateQuestion
                   : undefined
+              }
+              lockedCandidateQuestionText={
+                rolesConfirmed ? lockedCandidateQuestion ?? undefined : undefined
               }
               labels={{
                 leadHeader: t("Lead Question", "主问题"),
@@ -846,11 +863,17 @@ function deriveCandidateAskingText(
  *      Pre-session prompt: user hasn't tagged interviewer/candidate yet.
  *   2. Waiting For First — `!hasUtterances && !mainQuestion && !summary`
  *      Pre-session: recording started but no utterance has landed.
- *   3. Candidate's Question — `state === candidate_questioning &&
- *      liveCandidateQuestionText`, OR `timelinePhaseKind ===
- *      candidate_asking` (upload mode). Reverse Q&A.
+ *   3. Candidate's Question — Reverse Q&A. Three sources:
+ *        (a) `timelinePhaseKind === candidate_asking` (upload mode)
+ *        (b) `state === candidate_questioning && liveCandidateQuestionText`
+ *            (live, fresh from classifier; may flicker)
+ *        (c) `lockedCandidateQuestionText && !mainQuestion` (live,
+ *            persisted lock — set on cand-q-cmt commit, cleared on
+ *            Lead-Q lock; survives interviewer mid-answer state flicker
+ *            so the Phase bar doesn't fall back to "Interview Ongoing"
+ *            while the answer is being delivered)
  *      Row 1: "CANDIDATE'S QUESTION"
- *      Row 2: candidate's current question text
+ *      Row 2: candidate's question text (locked > live > timeline)
  *   4. Lead Question — `mainQuestion` is currently locked.
  *      Row 1: "LEAD QUESTION" + question text
  *      Row 2 (optional): "PROBE QUESTION" + probe text (when followUp set)
@@ -879,6 +902,7 @@ function CurrentQuestionBar({
   timelinePhaseKind,
   candidateAskingText,
   liveCandidateQuestionText,
+  lockedCandidateQuestionText,
   labels,
 }: {
   state: MomentStateKind;
@@ -893,12 +917,19 @@ function CurrentQuestionBar({
   timelinePhaseKind?: string;
   /** Upload-mode only: text to show in Row 2 of Candidate Q&A phase. */
   candidateAskingText?: string;
-  /** Live-mode only: the candidate's current question to the interviewer
-   *  during the reverse-Q&A phase. Carried on liveMomentState
-   *  .candidateQuestion when state === "candidate_questioning". When
-   *  set, the Phase region renders "Candidate's Question" + this text,
-   *  parallel to the upload-mode candidate_asking path. */
+  /** Live-mode only: the candidate's current question text from the
+   *  moment-state machine. Set when state === "candidate_questioning";
+   *  reflects the classifier's freshest output and may flicker among
+   *  rephrasings of the same logical Q on each 2-3s tick. */
   liveCandidateQuestionText?: string;
+  /** Live-mode only: the locked candidate question. Set by orchestrator
+   *  on cand-q-cmt commit (gates passed) and cleared on Lead-Q lock.
+   *  Stable text, persists across moment-state flicker. Preferred over
+   *  liveCandidateQuestionText for display. When set AND no mainQuestion
+   *  is locked, the Phase bar renders Candidate's Question phase even
+   *  if the moment state has briefly transited out of candidate_
+   *  questioning (interviewer mid-answer). */
+  lockedCandidateQuestionText?: string;
   labels: {
     leadHeader: string;
     interviewOngoingHeader: string;
@@ -932,21 +963,31 @@ function CurrentQuestionBar({
     );
   }
 
-  // Candidate's Question phase. Two paths into this layout:
+  // Candidate's Question phase. Three paths into this layout:
   //   (a) Upload mode: timelinePhaseKind === "candidate_asking", text
   //       derived from utterances at current playback position.
-  //   (b) Live mode: state === "candidate_questioning", text carried
-  //       on the moment as `liveCandidateQuestionText` (set atomically
-  //       by the orchestrator when the classifier flips into reverse Q&A).
-  // Same visual; only the source of the text differs.
+  //   (b) Live mode (state-driven): state === "candidate_questioning"
+  //       and the moment carries the candidate's current question. This
+  //       fires from the moment of state transition, before the first
+  //       cand-q-cmt commit has happened — text is the freshest
+  //       classifier output and may briefly flicker among rephrasings
+  //       until the lock takes over.
+  //   (c) Live mode (lock-driven): orchestrator has locked a candidate
+  //       question (cand-q-cmt commit gates passed) AND no Lead is
+  //       currently locked. Persists across moment-state transitions
+  //       — covers interviewer mid-answer when state briefly flips to
+  //       interviewer_speaking / chitchat. Cleared by Lead-Q lock.
+  // Path (c) takes display priority over (b) once it activates, because
+  // the locked text is stable and de-flickered.
   const inCandidateQuestionPhase =
     timelinePhaseKind === "candidate_asking" ||
-    (state === "candidate_questioning" && !!liveCandidateQuestionText);
+    (state === "candidate_questioning" && !!liveCandidateQuestionText) ||
+    (!!lockedCandidateQuestionText && !mainQuestion);
   if (inCandidateQuestionPhase) {
     const text =
       timelinePhaseKind === "candidate_asking"
         ? candidateAskingText
-        : liveCandidateQuestionText;
+        : lockedCandidateQuestionText ?? liveCandidateQuestionText;
     return (
       <BarShell>
         <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
