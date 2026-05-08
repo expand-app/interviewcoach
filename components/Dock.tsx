@@ -28,36 +28,64 @@ export function Dock({ onStart, onPause, onEnd }: Props) {
 
   if (selectedPastId !== null) return null;
 
+  // Hide the entire dock during the "starting" phase (StartModal
+  // Continue clicked → ready-bar shown → user accepting Chrome's
+  // share dialog). Audio isn't flowing yet, so showing Pause / End
+  // buttons + a ticking timer would falsely advertise an active
+  // session. Once handleBeginRecording flips status to "recording",
+  // this guard releases and the cluster appears. Topbar logo,
+  // language toggle, sidebar, etc. are unaffected — this is the
+  // only piece that hides during "starting".
+  if (live.status === "starting") return null;
+
   const isRecording = live.status === "recording";
   const isPaused = live.status === "paused";
   const hasSession = isRecording || isPaused || questions.length > 0;
 
   const startLabel = isPaused ? t("Resume", "继续") : t("Start", "开始");
 
+  // Three-button control cluster. Per the design system rule "1
+  // primary action max per section", only Start is the primary
+  // (black) button. Pause and End are secondary (bordered, no fill)
+  // so the cluster reads as one control unit.
+  //
+  // Pause recording-tone: when recording is live, Pause takes a
+  // filled error-color background with a pulsing white dot so it
+  // visually reads as the active "stop me" affordance.
+  //
+  // Icons are inline SVGs (not Unicode glyphs) — Unicode chars like
+  // `▶` `⏸` `↺` were rendering as `;` on some font fallback stacks
+  // (Chinese system fonts in particular), creating a confusing
+  // top-left smudge on every protected-app page.
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="flex items-center gap-1.5">
       <button
         onClick={onStart}
         disabled={isRecording}
-        className="bg-accent hover:bg-[#1a73d1] disabled:opacity-40 disabled:cursor-not-allowed text-white px-2.5 py-[5px] rounded-md text-[12.5px] font-medium inline-flex items-center gap-1.5 transition-colors"
+        className="btn btn-primary btn-sm"
       >
-        <span>▶</span>
+        <PlayIcon />
         <span>{startLabel}</span>
       </button>
 
       <button
         onClick={onPause}
         disabled={!isRecording}
-        className={`px-2.5 py-[5px] rounded-md text-[12.5px] font-medium inline-flex items-center gap-1.5 transition-colors ${
+        className={isRecording ? "btn btn-sm" : "btn btn-secondary btn-sm"}
+        style={
           isRecording
-            ? "bg-live hover:bg-[#c73434] text-white"
-            : "text-ink hover:bg-paper-hover disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-        }`}
+            ? {
+                background: "var(--color-error)",
+                color: "var(--color-bg)",
+                borderColor: "var(--color-error)",
+              }
+            : undefined
+        }
       >
         {isRecording ? (
-          <span className="w-2 h-2 rounded-full bg-white animate-pulse-dot" />
+          <span className="w-2 h-2 rounded-full bg-bg animate-pulse-dot" />
         ) : (
-          <span>⏸</span>
+          <PauseIcon />
         )}
         <span>{t("Pause", "暂停")}</span>
       </button>
@@ -65,17 +93,48 @@ export function Dock({ onStart, onPause, onEnd }: Props) {
       <button
         onClick={onEnd}
         disabled={!hasSession}
-        className="text-ink hover:bg-paper-hover disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent px-2.5 py-[5px] rounded-md text-[12.5px] font-medium inline-flex items-center gap-1.5 transition-colors"
+        className="btn btn-secondary btn-sm"
       >
-        <span>↺</span>
+        <StopIcon />
         <span>{t("End", "结束")}</span>
       </button>
 
-      <div className="w-px h-5 bg-rule mx-1.5" />
+      <div className="w-px h-5 bg-border mx-2" />
 
-      <span className="font-mono text-xs text-ink-light tabular-nums min-w-[44px] text-center">
+      <span
+        className="text-xs text-text-muted tabular-nums min-w-[44px] text-center"
+        style={{ fontFamily: "var(--font-mono)" }}
+      >
         {formatTime(live.elapsedSeconds)}
       </span>
     </div>
+  );
+}
+
+/* Inline SVG icons. Stroke-width 1.5 + currentColor per the design
+   rule. Sized to match Lucide icons at 12px (smaller than the 16px
+   default since they sit in btn-sm pills). */
+function PlayIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+      <path d="M3 2v8l7-4z" />
+    </svg>
+  );
+}
+
+function PauseIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+      <rect x="3" y="2" width="2.5" height="8" rx="0.5" />
+      <rect x="6.5" y="2" width="2.5" height="8" rx="0.5" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+      <rect x="3" y="3" width="6" height="6" rx="0.5" />
+    </svg>
   );
 }

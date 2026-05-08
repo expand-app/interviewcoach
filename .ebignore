@@ -1,0 +1,41 @@
+# Files NOT to include in the Elastic Beanstalk deploy bundle.
+# When this file exists, EB's bundler uses it instead of .gitignore.
+# We need a separate list because:
+#   - .next/ IS shipped (build output, generated locally before deploy)
+#   - debug-logs/, dev.log, .claude/ etc must NEVER ship to prod
+#   - .env.local must never leak (secrets are set via EB env vars)
+
+# Build inputs / dev tooling
+node_modules/
+.next/cache/
+.git/
+.github/
+.vscode/
+.idea/
+.claude/
+
+# Local dev / debug artifacts
+debug-logs/
+debug-classifications.jsonl
+dev.log
+envcheck.log
+*.tsbuildinfo
+*.log
+
+# Local secrets — production reads from EB env vars
+.env
+.env.local
+.env*.local
+
+# EB CLI metadata (if ever installed)
+.elasticbeanstalk/
+
+# Editor swap files
+*.swp
+*.swo
+.DS_Store
+
+# Repo docs that don't need to be on the server
+README.md
+DEPLOY.md
+LICENSE

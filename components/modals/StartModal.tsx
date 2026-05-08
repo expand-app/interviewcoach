@@ -2,216 +2,195 @@
 
 import { useState, useEffect } from "react";
 import { ModalShell } from "./ModalShell";
-
-export type StartMode = "live" | "upload";
+import { Button, Field, Textarea } from "@/components/ui";
 
 interface Props {
   open: boolean;
   onCancel: () => void;
-  /** jd, resume: always present. file: present iff mode === "upload".
-   *  captureSystemAudio: only meaningful in live mode — when true, the
-   *  AudioSession will prompt for tab/window share with audio so Zoom
-   *  meetings, browser playback, etc. are picked up alongside the mic.
-   *  captureVideo: piggybacks on captureSystemAudio (no separate UI
-   *  toggle) — when system audio is on, the same share keeps its video
-   *  track and we save a WebM screen recording on the session. */
+  /** Live mic capture is the only entry point. Audio + screen capture
+   *  are NOT user-configurable: every session captures system audio
+   *  (tab share with audio) AND records the LiveView card via the
+   *  second share prompt. The AudioSession options are still threaded
+   *  so the orchestrator can pass canonical values, but the UI no
+   *  longer exposes toggles for them. */
   onStart: (args: {
-    mode: StartMode;
     jd: string;
     resume: string;
-    file?: File;
-    captureSystemAudio?: boolean;
-    captureVideo?: boolean;
+    captureSystemAudio: boolean;
+    captureVideo: boolean;
+    useMic: boolean;
+    /** Optional summary of the interviewer's background (typically
+     *  pasted from LinkedIn or written manually). Empty string when
+     *  not provided. Threaded into Live Commentary so the coach can
+     *  tailor framing to the interviewer's role. */
+    interviewerProfile?: string;
   }) => void;
 }
 
 export function StartModal({ open, onCancel, onStart }: Props) {
-  const [mode, setMode] = useState<StartMode>("live");
   const [jd, setJd] = useState("");
   const [resume, setResume] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  // Default ON: most users running this run an interview through Zoom
-  // / Meet on their laptop with headphones, where mic-only would miss
-  // the interviewer entirely. Auto-detect headphones still kicks in
-  // when this is off, so flipping off is a safe explicit override
-  // (e.g. in-room interview with laptop speakers).
-  const [captureSystemAudio, setCaptureSystemAudio] = useState(true);
-  // Video recording always-on when system audio is on. The same browser
-  // share dialog already has a video track piggy-backed; we just keep
-  // it. Per user spec there is no separate UI toggle — capturing the
-  // video is a property of "system audio capture is on", not an
-  // independent decision. The constant lives here as a named symbol
-  // to keep the wire-up to onStart explicit.
-  const captureVideo = true;
+  // "Microphone On" toggle. Default OFF — the common path is the
+  // candidate using a tab share that already contains their voice
+  // (Zoom etc. routed through the shared tab), so the mic is opt-in.
+  // Flip ON when the candidate's voice needs to come from the laptop
+  // mic specifically. System-audio capture + screen recording are NOT
+  // user-toggleable (always on).
+  const [useMic, setUseMic] = useState(false);
+  // Optional interviewer profile — short summary the user pastes in
+  // (LinkedIn copy-paste, manual notes, etc.). Threaded into Live
+  // Commentary so the coach can tailor framing to the interviewer's
+  // role.
+  const [interviewerProfile, setInterviewerProfile] = useState("");
 
   useEffect(() => {
     if (open) {
-      setMode("live");
       setJd("");
       setResume("");
-      setFile(null);
-      setCaptureSystemAudio(true);
+      setUseMic(false);
+      setInterviewerProfile("");
     }
   }, [open]);
 
-  const canSubmit =
-    jd.trim().length > 0 && (mode === "live" || file !== null);
+  const canSubmit = jd.trim().length > 0;
 
   return (
     <ModalShell open={open} onClose={onCancel} variant="wide">
-      <div className="p-7 px-8">
-        <h2 className="text-[22px] font-bold tracking-tight mb-1 text-ink">
+      {/* Type scale normalized to four sizes:
+            - Heading:    20px / 600
+            - Body:       13px / 400 muted   (description, mic-toggle text)
+            - Help:       12px / 400 subtle  (footer note)
+            - Field internals: handled by Field primitive (13px label,
+              11px Required/Optional badge)
+          Padding uses --space-6 (24px) verticals + --space-8 (32px)
+          horizontals — these match the design system's actual scale
+          (the previous --space-5/--space-7 references were phantom
+          tokens; the spec deliberately skips 5 and 7 in the scale,
+          so var() resolved to 0 and the modal had no top/bottom
+          padding). */}
+      <div className="px-8 py-6">
+        {/* Modal heading — h2 design-system rule: weight 600, never
+            700 at this size, with -0.02em letter-spacing baked in. */}
+        <h2
+          className="text-text mb-2"
+          style={{
+            fontSize: "1.25rem",
+            fontWeight: 600,
+            letterSpacing: "-0.02em",
+            lineHeight: 1.25,
+          }}
+        >
           Start a new session
         </h2>
-        <p className="text-[13.5px] text-ink-light mb-5 leading-relaxed">
-          Paste the job description below. Adding the candidate&apos;s resume
-          helps AI judge how well answers fit the person&apos;s background.
+        <p
+          className="text-text-muted leading-relaxed mb-6"
+          style={{ fontSize: "0.8125rem" }}
+        >
+          Paste the job description. Adding the resume and interviewer
+          background helps AI tailor commentary — the more context you
+          give, the sharper the suggestions.
         </p>
 
-        {/* Mode toggle: live mic vs upload recording */}
-        <div className="mb-5 inline-flex bg-paper-hover p-0.5 rounded-md">
-          <button
-            onClick={() => setMode("live")}
-            className={`px-3 py-1.5 text-[12.5px] font-medium rounded transition-all ${
-              mode === "live"
-                ? "bg-paper text-ink shadow-sm"
-                : "text-ink-light"
-            }`}
-          >
-            Live microphone
-          </button>
-          <button
-            onClick={() => setMode("upload")}
-            className={`px-3 py-1.5 text-[12.5px] font-medium rounded transition-all ${
-              mode === "upload"
-                ? "bg-paper text-ink shadow-sm"
-                : "text-ink-light"
-            }`}
-          >
-            Upload recording
-          </button>
-        </div>
-
-        {/* System-audio capture toggle (live mode only). When ON, the
-            session prompts for a tab/window share with "Share tab audio"
-            checked, so Zoom meeting audio + browser playback get
-            transcribed alongside the mic. Default ON.
-            The "Also record screen video" sub-checkbox piggybacks on the
-            same browser share — no extra dialog. Disabled / hidden when
-            system audio is off because there's no share to attach to. */}
-        {mode === "live" && (
-          <div className="mb-4 px-3.5 py-3 rounded-md border border-rule bg-paper-subtle">
-            <label className="flex items-start gap-2.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={captureSystemAudio}
-                onChange={(e) => setCaptureSystemAudio(e.target.checked)}
-                className="mt-0.5 cursor-pointer accent-accent"
-              />
-              <span className="flex-1 text-[13px] leading-relaxed">
-                <span className="font-semibold text-ink">
-                  Capture system audio
-                </span>
-                <span className="text-ink-light">
-                  {" "}
-                  — pick up sound from a Zoom meeting, browser playback,
-                  or any other tab, alongside your mic.
-                </span>
-              </span>
-            </label>
-          </div>
-        )}
-
-        {/* Upload field (visible only in upload mode) */}
-        {mode === "upload" && (
-          <div className="mb-4">
-            <div className="flex items-center justify-between mb-1.5">
-              <label className="text-[13px] font-semibold text-ink">
-                Interview recording
-              </label>
-              <span className="text-[11px] font-medium tracking-wider uppercase py-0.5 px-1.5 rounded bg-accent-bg text-accent">
-                Required
-              </span>
-            </div>
-            <input
-              type="file"
-              accept="audio/*,video/*"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-              className="w-full text-sm text-ink file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border file:border-rule-strong file:bg-paper file:text-ink file:text-sm file:font-medium file:cursor-pointer hover:file:bg-paper-hover"
-            />
-            <div className="text-xs text-ink-lighter mt-1">
-              Audio (mp3/wav/m4a/webm) or video file. Playback drives live
-              commentary as the recording plays.
-            </div>
-          </div>
-        )}
-
-        <div className="mb-4">
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="text-[13px] font-semibold text-ink">
-              Job Description
-            </label>
-            <span className="text-[11px] font-medium tracking-wider uppercase py-0.5 px-1.5 rounded bg-accent-bg text-accent">
-              Required
+        {/* Microphone toggle — visually distinct from the Field
+            textareas below (it's a yes/no decision, not a typed
+            input). Light surface bg + subtle border. Internal type
+            matches the body scale of the modal subtitle above:
+            13px label + 12.5px help. */}
+        <label
+          className="flex items-start gap-2.5 cursor-pointer rounded-md border border-border bg-surface mb-5"
+          style={{ padding: "10px 12px" }}
+        >
+          <input
+            type="checkbox"
+            checked={useMic}
+            onChange={(e) => setUseMic(e.target.checked)}
+            className="cursor-pointer"
+            style={{
+              accentColor: "var(--color-text)",
+              marginTop: "3px",
+            }}
+          />
+          <span className="flex-1 leading-snug">
+            <span
+              className="font-medium text-text"
+              style={{ fontSize: "0.8125rem" }}
+            >
+              Microphone On
             </span>
-          </div>
-          <textarea
+            <span
+              className="text-text-muted"
+              style={{ fontSize: "0.8125rem" }}
+            >
+              {" "}
+              — turn on if your own voice goes through the laptop mic.
+              Leave off if you&apos;ll share an interview tab that
+              already includes both sides&apos; audio.
+            </span>
+          </span>
+        </label>
+
+        {/* Form fields. Field primitive owns the label-row + Required/
+            Optional badges, so the typography is identical across all
+            three. Textarea min-heights are sized to fit a typical 13"
+            viewport without modal scrolling — JD bigger since it's
+            mandatory and most-used. */}
+        <Field label="Job Description" required>
+          <Textarea
             value={jd}
             onChange={(e) => setJd(e.target.value)}
-            placeholder="Paste the full JD here — role, responsibilities, required skills, company context, etc."
-            className="w-full px-3 py-2 border border-rule-strong rounded-md text-sm text-ink bg-paper outline-none focus:border-accent focus:ring focus:ring-accent/20 focus:ring-offset-0 resize-y min-h-[140px] leading-relaxed"
+            placeholder="Paste the full JD — role, responsibilities, required skills, company context."
+            style={{ minHeight: "88px" }}
           />
-        </div>
+        </Field>
 
-        <div className="mb-4">
-          <div className="flex items-center justify-between mb-1.5">
-            <label className="text-[13px] font-semibold text-ink">
-              Candidate Resume
-            </label>
-            <span className="text-[11px] font-medium tracking-wider uppercase py-0.5 px-1.5 rounded bg-paper-hover text-ink-lighter">
-              Optional
-            </span>
-          </div>
-          <textarea
+        <Field label="Candidate Resume" optional>
+          <Textarea
             value={resume}
             onChange={(e) => setResume(e.target.value)}
-            placeholder="Paste the candidate's resume — past roles, projects, education, etc. This helps AI calibrate answers against their actual experience."
-            className="w-full px-3 py-2 border border-rule-strong rounded-md text-sm text-ink bg-paper outline-none focus:border-accent focus:ring focus:ring-accent/20 focus:ring-offset-0 resize-y min-h-[110px] leading-relaxed"
+            placeholder="Paste the candidate's resume — past roles, projects, education."
+            style={{ minHeight: "64px" }}
           />
-          <div className="text-xs text-ink-lighter mt-1">
-            AI won&apos;t just check what they say — it will cross-check
-            against what they&apos;ve actually done.
-          </div>
-        </div>
+        </Field>
 
-        <div className="flex gap-2 justify-end mt-5">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 rounded-md text-sm font-medium border border-rule-strong bg-paper text-ink hover:bg-paper-hover"
-          >
-            Cancel
-          </button>
-          <button
+        <Field label="Interviewer Profile" optional>
+          <Textarea
+            value={interviewerProfile}
+            onChange={(e) => setInterviewerProfile(e.target.value)}
+            placeholder="Short summary of the interviewer — current role, company, notable background."
+            style={{ minHeight: "64px" }}
+          />
+        </Field>
+
+        {/* Footer note — help-text scale (12px / text-subtle) so it
+            reads as a quiet hint, not a second body paragraph.
+            mt-4 / mb-4 = 16px each, matching the rhythm above. */}
+        <p
+          className="text-text-subtle leading-snug mt-4 mb-4"
+          style={{ fontSize: "0.75rem" }}
+        >
+          On Continue, you&apos;ll share your interview tab (with audio)
+          and this app&apos;s tab (for recording).
+        </p>
+
+        <div className="flex gap-2 justify-end">
+          <Button onClick={onCancel}>Cancel</Button>
+          <Button
+            variant="primary"
+            disabled={!canSubmit}
             onClick={() =>
               canSubmit &&
               onStart({
-                mode,
                 jd: jd.trim(),
                 resume: resume.trim(),
-                file: mode === "upload" && file ? file : undefined,
-                captureSystemAudio:
-                  mode === "live" ? captureSystemAudio : undefined,
-                captureVideo:
-                  mode === "live" && captureSystemAudio
-                    ? captureVideo
-                    : undefined,
+                captureSystemAudio: true,
+                captureVideo: true,
+                useMic,
+                interviewerProfile: interviewerProfile.trim() || undefined,
               })
             }
-            disabled={!canSubmit}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-accent text-white border border-accent hover:bg-[#1a73d1] disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {mode === "upload" ? "Start playback →" : "Start listening →"}
-          </button>
+            Continue →
+          </Button>
         </div>
       </div>
     </ModalShell>

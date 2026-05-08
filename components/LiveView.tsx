@@ -4,7 +4,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
 import { ModalShell } from "@/components/modals/ModalShell";
-import type { MomentStateKind, Question, Utterance } from "@/types/session";
+import { Eyebrow, Button, BrandMark } from "@/components/ui";
+import type {
+  MomentStateKind,
+  Question,
+  RecordingTimeline,
+  Utterance,
+} from "@/types/session";
 
 /**
  * The three top sections (Interview Phase, Live Commentary, Live Captions)
@@ -16,16 +22,24 @@ import type { MomentStateKind, Question, Utterance } from "@/types/session";
  *
  * Target sizes at 920px width:
  *   Phase:      ~140 px   (min; grows for long questions)
- *   Commentary:  226 px   (heading 28 + pane 198)
+ *   Commentary:  280 px   (heading 28 + pane 252)
  *   Captions:    151 px   (heading 28 + lane 60 + divider 1 + lane 60 + border 2)
  *   ─────────────
- *   Total:       517 px   (≈ 16:9 at 920 px — same overall as before)
+ *   Total:       571 px   (fits inside the 580 px ic-capture-region)
+ *
+ * Commentary was 226 px through the BBox-stability fix, but the fixed
+ * height clipped the bottom of the "Try this instead" suggestion
+ * whenever both the commentary paragraph AND the suggestion block were
+ * present (a common case). Bumped to 280 px so the suggestion fits
+ * comfortably; the value is still FIXED (BBox stays stable for Region
+ * Capture), and the inner card adds overflow-y-auto as a fallback for
+ * unusually long combinations.
  *
  * Captions deliberately got smaller (12-13px text vs 14-15px) so the
  * Phase region could absorb full-text questions without truncation.
  */
 const PHASE_MIN_HEIGHT_PX = 140;
-const COMMENTARY_TOTAL_HEIGHT_PX = 226;
+const COMMENTARY_TOTAL_HEIGHT_PX = 280;
 const COMMENTARY_HEADING_HEIGHT_PX = 28;
 const COMMENTARY_PANE_HEIGHT_PX =
   COMMENTARY_TOTAL_HEIGHT_PX - COMMENTARY_HEADING_HEIGHT_PX; // 198
@@ -128,16 +142,29 @@ function CommentaryBody({
   // raw streaming buffer as-is so the user sees tokens appearing.
   const mainHtml = commentary || html || "…";
 
+  // "Try this" suggestion block. Matches the marketing site's
+  // .try-this pattern: bordered inset card inside the commentary
+  // stream with a small UPPERCASE TRY label. No emoji per the design
+  // rule (UI copy stays text-only); visual differentiation comes
+  // from the boxed treatment + label. Label was originally "Try this
+  // instead" — shortened to drop the redundant "instead" word
+  // (the boxed callout already implies a contrast with what was
+  // said). Saves a few px of vertical space too, which matters
+  // inside the fixed-height commentary panel.
   const SuggestionBlock = suggestion ? (
-    <div className="mt-2 pt-2 border-t border-accent/30 text-[12.5px] leading-relaxed text-ink-light">
-      <span className="font-semibold text-accent text-[11px] uppercase tracking-wider mr-1.5">
-        💬 Try
-      </span>
+    <div
+      className="mt-3 rounded-sm text-[14.5px] leading-relaxed text-text-muted"
+      style={{
+        padding: "var(--space-3)",
+        background: "var(--color-bg)",
+        border: "1px solid var(--color-border)",
+      }}
+    >
+      <Eyebrow as="div" className="mb-1" style={{ fontSize: "0.625rem", color: "var(--color-text)", fontWeight: 600 }}>
+        Try this
+      </Eyebrow>
       <em
         className="not-italic"
-        // Re-italicize via inline style so <strong> tags inside the
-        // suggestion stay non-italic per typographic convention while
-        // the plain text reads italic.
         style={{ fontStyle: "italic" }}
         dangerouslySetInnerHTML={{ __html: suggestion }}
       />
@@ -145,12 +172,29 @@ function CommentaryBody({
   ) : null;
 
   if (tone === "hint") {
+    // Listening-hint tone — a thicker left rule + warmer surface
+    // tells the user this is in-the-moment coaching ("listen for X")
+    // distinct from post-answer Q-A commentary.
+    //
+    // No internal scroll: the section grows to fit the entire hint
+    // text. Listening hints can be 200-300 chars on long monologues;
+    // requiring users to mouse-wheel inside this pane while they're
+    // also listening to the interview is the wrong UX.
     return (
-      <div className="w-full h-full flex border-l-[3px] border-accent bg-accent-bg/40 animate-appear">
-        <div className="pl-3 pr-1 pt-3 text-[15px] leading-none shrink-0 select-none">
-          💡
-        </div>
-        <div className="flex-1 min-w-0 pr-4 py-3 overflow-y-auto no-scrollbar text-[13.5px] leading-relaxed text-ink prose-live">
+      <div
+        className="w-full flex animate-appear"
+        style={{
+          borderLeft: "3px solid var(--color-text)",
+          background: "var(--color-surface-2)",
+        }}
+      >
+        {/* Same 17px / leading-normal as the commentary tone below.
+            Hint and commentary share the same fixed display pane;
+            keeping their font sizes aligned avoids a jarring size
+            jump every time the panel switches between them. Same
+            content-budget caps apply (40 words / 80 字 — see
+            /api/commentary listening-hint prompt). */}
+        <div className="flex-1 min-w-0 px-4 py-4 text-[17px] leading-normal text-text prose-live">
           <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
           {SuggestionBlock}
         </div>
@@ -158,15 +202,40 @@ function CommentaryBody({
     );
   }
 
+  // Q-A commentary tone. Auto-height — no internal scrollbar.
+  // Section expands to show all commentary text without requiring
+  // the user to scroll. See parent CommentarySection for the
+  // min-height / no-overflow rationale.
   return (
-    <div className="px-4 py-3 w-full h-full overflow-y-auto no-scrollbar text-[14.5px] leading-relaxed text-ink prose-live animate-appear">
+    // Commentary body bumped 15.5px → 17px per UX feedback (still
+    // too small at the previous size). Switched leading from
+    // leading-relaxed (1.625) to leading-normal (1.5) so the
+    // bigger font doesn't lose line capacity: 17px × 1.5 = 25.5px
+    // line-height, virtually identical to the previous 15.5 ×
+    // 1.625 = 25.2px. Net effect: text is visually larger but
+    // fits the same ~4-5 lines in the fixed 88px commentary area
+    // alongside the Try-this block. /api/commentary budgets
+    // trimmed to 80 字 / 40 words so the model doesn't overshoot
+    // and produce content that gets clipped.
+    <div className="w-full px-4 py-4 text-[17px] leading-normal text-text prose-live animate-appear">
       <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
       {SuggestionBlock}
     </div>
   );
 }
 
-export function LiveView() {
+export function LiveView({
+  isFullscreen = false,
+  onToggleFullscreen,
+  onStartRequest,
+}: {
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
+  /** Called when the empty-state "Start a new session" button is
+   *  clicked. Same handler the Topbar Start button calls — opens
+   *  StartModal. Optional so LiveView still works in isolation. */
+  onStartRequest?: () => void;
+} = {}) {
   const t = useTranslations();
   const questions = useStore((s) => s.liveQuestions);
   const live = useStore((s) => s.live);
@@ -182,9 +251,16 @@ export function LiveView() {
     (s) => s.liveLockedCandidateQuestion
   );
   const lockedProbeQuestion = useStore((s) => s.liveLockedProbeQuestion);
-  const timeline = useStore((s) => s.liveTimeline);
-  const playbackTime = useStore((s) => s.livePlaybackTime);
-  const isUploadMode = useStore((s) => s.liveIsUploadMode);
+  // Upload mode was removed. These bound to upload-only store fields
+  // before; hard-coded so existing branches that read them collapse to
+  // the live-mode path without a deeper refactor. The cast keeps the
+  // surviving `timelineView` useMemo (gated on `if (!timeline)`) typed
+  // against the RecordingTimeline shape — without it, TS would narrow
+  // `timeline` to `null` and reject `.phases` etc. inside the dead
+  // truthy branch.
+  const timeline = null as RecordingTimeline | null;
+  const playbackTime = 0;
+  const isUploadMode = false;
   const forceSetSpeakerRole = useStore((s) => s.forceSetSpeakerRole);
   const [retagModalOpen, setRetagModalOpen] = useState(false);
 
@@ -194,44 +270,6 @@ export function LiveView() {
     window.addEventListener("ic:interim", handler);
     return () => window.removeEventListener("ic:interim", handler);
   }, []);
-
-  // Upload-mode playback: PlaybackSession emits "ic:playback-started"
-  // carrying the HTMLAudioElement in event.detail when it begins. We
-  // hold a ref so the LivePlayerStrip can render a scrubber bound to
-  // the same audio element the session is driving — seeking in the UI
-  // advances the session naturally (PlaybackSession listens to its own
-  // audio element's timeupdate event, so UI seeks trigger utterance
-  // flushes automatically).
-  const [playbackAudio, setPlaybackAudio] = useState<HTMLAudioElement | null>(
-    null
-  );
-  useEffect(() => {
-    const onStart = (e: Event) => {
-      const detail = (e as CustomEvent).detail;
-      if (detail instanceof HTMLAudioElement) setPlaybackAudio(detail);
-    };
-    const onStop = () => setPlaybackAudio(null);
-    window.addEventListener("ic:playback-started", onStart);
-    window.addEventListener("ic:playback-stopped", onStop);
-    return () => {
-      window.removeEventListener("ic:playback-started", onStart);
-      window.removeEventListener("ic:playback-stopped", onStop);
-    };
-  }, []);
-
-  // ReviewPanel dispatches `ic:seek-to` with a seconds number when the
-  // user clicks an entry. We own the audio element here, so we do the
-  // actual seek — keeps ReviewPanel decoupled from the playback source.
-  useEffect(() => {
-    if (!playbackAudio) return;
-    const handler = (e: Event) => {
-      const sec = (e as CustomEvent).detail;
-      if (typeof sec !== "number" || !isFinite(sec)) return;
-      playbackAudio.currentTime = Math.max(0, sec);
-    };
-    window.addEventListener("ic:seek-to", handler);
-    return () => window.removeEventListener("ic:seek-to", handler);
-  }, [playbackAudio]);
 
   // === Timeline-driven resolution (upload + preanalyze) ===
   // When a timeline is present, every piece of derived state — phase,
@@ -460,18 +498,61 @@ export function LiveView() {
   const hasStarted = live.status !== "idle" || questions.length > 0;
 
   if (!hasStarted) {
+    // Empty state — pre-session. Centered card with brand mark,
+    // short copy, and a primary "Start a new session" button. The
+    // button calls onStartRequest (the same StartModal-opening
+    // handler the Topbar's Start button uses) so users have a clear
+    // primary CTA without having to scan the chrome for the small
+    // Start button. Replaces the previous mic-emoji + "Click Start
+    // to begin" placeholder, which read as "this surface is empty"
+    // rather than "here's how to begin".
     return (
-      <>
-        <PageTitle />
-        <div className="flex-1 overflow-y-auto">
-          <div className="text-center py-20 px-5 text-ink-lighter">
-            <div className="text-[44px] mb-3.5 opacity-50">🎙️</div>
-            <div className="text-sm">
-              {t("Click ", "点 ")}<b>Start</b>{t(" to begin.", " 开始")}
-            </div>
+      <div className="flex-1 flex items-center justify-center px-6 py-12">
+        <div className="w-full max-w-[420px] text-center">
+          <div className="flex justify-center mb-6">
+            <BrandMark size={48} />
           </div>
+          <h2
+            className="text-text mb-2"
+            style={{
+              fontSize: "1.5rem",
+              fontWeight: 600,
+              letterSpacing: "-0.02em",
+            }}
+          >
+            {t("Ready when you are.", "随时可以开始。")}
+          </h2>
+          <p className="text-[13.5px] text-text-muted mb-8 leading-relaxed">
+            {t(
+              "Start a session to begin live coaching. Have your job description and resume ready to paste.",
+              "开始一场会话以启动实时辅导。请准备好职位描述和简历以粘贴。"
+            )}
+          </p>
+          {onStartRequest && (
+            <button
+              type="button"
+              onClick={onStartRequest}
+              className="btn btn-primary btn-lg"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 14 14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.75"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <line x1="7" y1="3" x2="7" y2="11" />
+                <line x1="3" y1="7" x2="11" y2="7" />
+              </svg>
+              {t("Start a new session", "开始新会话")}
+            </button>
+          )}
         </div>
-      </>
+      </div>
     );
   }
 
@@ -538,28 +619,164 @@ export function LiveView() {
     );
   const hasUtterances = utterances.length > 0;
 
+  // Lock the outer page-scroll while a session is running. The DOM
+  // `scroll` event fires identically for user-initiated scrolls and
+  // programmatic ones (caption-lane auto-scroll, etc.), so any
+  // scroll-driven Region Capture cropTo refresh ends up firing on
+  // every utterance — produced ~14s of 花屏 at session start before
+  // we removed that listener. Easier path: don't let the user scroll
+  // the page during recording or paused state. They're meant to watch
+  // the coaching surface (which is sized to one viewport) — there's
+  // nothing below the fold that needs scrolling to. The wrapper goes
+  // back to overflow-y-auto when status returns to "idle" (after
+  // End / Discard) so the empty-state landing still scrolls if it
+  // ever overflows.
+  const lockScroll = live.status === "recording" || live.status === "paused";
   return (
     <>
-      <PageTitle />
-
-      {/* Uploaded-recording playback controls. Only mounts when an upload
-          session is actively driving playback. The scrubber works on the
-          same HTMLAudioElement the PlaybackSession listens to, so seeks
-          naturally flush utterances forward. Seeking backwards is a pure
-          listen-along; we don't re-emit already-processed utterances. */}
-      {playbackAudio && <LivePlayerStrip audio={playbackAudio} />}
-
-      <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-[920px] px-24 pt-5 pb-20 max-[900px]:px-5">
+      <div className={`flex-1 ${lockScroll ? "overflow-hidden" : "overflow-y-auto"}`}>
+        {/* Card wrapper. Page title now lives INSIDE the scrollable
+            container (so it scrolls with the rest of the content,
+            instead of sitting outside). The card itself uses
+            position: sticky; top: 0 — so when the user scrolls down,
+            the title scrolls out of view but the card pins to the
+            top of the viewport. Two benefits:
+              1. Region Capture's cropTo bounds NEVER fluctuate —
+                 the card's screen position stays stable while
+                 scrolling, eliminating the title-bleeds-into-
+                 recording artifact users were seeing during
+                 scroll-up gestures.
+              2. The user always has the live coaching surface
+                 anchored at the top of their view, even after
+                 scrolling around. */}
+        {/* Page width tuned to give the cropTarget (#ic-capture-region
+            below) a 16:9 aspect ratio at its 580px fixed height. The
+            recorded video is played back in an `aspect-video` (16:9)
+            frame in PastView, so a 16:9 cropTarget eliminates the
+            black-bar letterboxing on the left/right of the playback.
+            Math: 580 × 16/9 ≈ 1031, so cropTarget needs to be at
+            least 1031px wide. With px-6 (24px each side, 48px total)
+            of breathing room around it, max-w needs to be ≈1080px. */}
+        <div className="mx-auto w-full max-w-[1080px] px-6 pt-5 pb-20 max-[1100px]:px-4">
+          {!isFullscreen && <PageTitle />}
 
           {/* ===== Coaching frame =====
-              Three stacked sections. Total height is approximately
-              16:9 at 920 px width but the Phase region is allowed to
-              grow when a Lead Question text doesn't fit in 2 lines —
-              question readability beats holding a perfect rectangle.
-              Commentary and Captions are fixed heights; only Phase
-              flexes. */}
-          <div className="border border-rule rounded-md overflow-hidden bg-paper flex flex-col mb-6">
+              Three stacked sections. Sticky-pinned to the top of the
+              scrollable area so its screen position stays stable for
+              Region Capture.
+
+              The `ic-capture-region` id is the Region Capture target
+              (see lib/audioSession.ts) — the screen recording crops
+              to this element so the saved video shows only the
+              coaching panel.
+
+              The fullscreen toggle button is positioned absolute in
+              this card's top-right. */}
+          <div
+            id="ic-capture-region"
+            className="sticky top-0 z-10 relative border border-border rounded-lg overflow-hidden bg-bg flex flex-col mb-6"
+            style={
+              isFullscreen
+                ? undefined
+                : {
+                    // Fixed height — keeps the element's bounding
+                    // box stable while content flows inside
+                    // (commentary streaming, captions adding rows,
+                    // top-bar phase transitions).
+                    //
+                    // Without this lock, every internal layout
+                    // change re-triggered Chrome's Region Capture
+                    // auto-tracking, which produces a visible
+                    // garbled-frame ("花屏") at the exact moment
+                    // the UI updates — see the 0:32 case where a
+                    // moment-state transition glitched the recording
+                    // even though no cropTo() refresh fired on our
+                    // side. Locking BBox dimensions takes that
+                    // failure mode off the table.
+                    //
+                    // 580px tuned to fit the common layout: top-bar
+                    // ≈ 100px + commentary pane ≈ 320px + captions
+                    // ≈ 160px. Each inner section has its own
+                    // overflow handling, so content past this cap
+                    // degrades to internal scrolling rather than
+                    // pushing the parent BBox larger. Fullscreen
+                    // bypasses the lock — a fullscreen toggle is
+                    // a deliberate one-off layout change with its
+                    // own crop refresh.
+                    height: 580,
+                  }
+            }
+          >
+            {/* Fullscreen toggle in the card's top-right corner. Lives
+                INSIDE the card (not in the Topbar) per product spec —
+                so the user always has a one-click exit even when the
+                Topbar is auto-hidden in fullscreen. Ghost-button
+                styling so it doesn't compete with the coaching
+                content.
+                LOCKED during active recording (recording / paused
+                statuses). Toggling fullscreen mid-recording causes a
+                cropTarget bbox change → MediaRecorder reference-frame
+                contamination → brief visual artifact in the saved
+                video. To eliminate this entirely we lock the toggle:
+                user picks fullscreen BEFORE clicking Begin (ready-bar
+                phase, status="starting") and is then committed for
+                the duration. Escape key is similarly gated in
+                app/page.tsx. */}
+            {onToggleFullscreen && (() => {
+              const fullscreenLocked =
+                live.status === "recording" || live.status === "paused";
+              return (
+              <button
+                type="button"
+                onClick={fullscreenLocked ? undefined : onToggleFullscreen}
+                disabled={fullscreenLocked}
+                title={
+                  fullscreenLocked
+                    ? t(
+                        "Fullscreen is locked during recording — set this before you click Begin.",
+                        "录制期间无法切换全屏 —— 请在点击 Begin 之前设置好。"
+                      )
+                    : isFullscreen
+                      ? t("Exit fullscreen (Esc)", "退出全屏 (Esc)")
+                      : t("Fullscreen", "全屏")
+                }
+                className="absolute top-2 right-2 z-10 btn btn-ghost btn-sm print:hidden"
+              >
+                {/* Fullscreen toggle icon — SVG instead of Unicode
+                    `⤡` / `⤢` since those glyphs fall back inconsistently
+                    on some font stacks. Two arrows pointing into / out
+                    of the corners of a square. */}
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 14 14"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  {isFullscreen ? (
+                    /* Exit: arrows pointing IN (toward center) */
+                    <>
+                      <path d="M6 2v3H3M2 6h3V3M8 12V9h3M12 8H9v3" />
+                    </>
+                  ) : (
+                    /* Enter: arrows pointing OUT (toward corners) */
+                    <>
+                      <path d="M3 6V3h3M11 3h-3v3M3 8v3h3M11 8v3H8" />
+                    </>
+                  )}
+                </svg>
+                <span>
+                  {isFullscreen
+                    ? t("Exit", "退出全屏")
+                    : t("Fullscreen", "全屏")}
+                </span>
+              </button>
+              );
+            })()}
             {/* (1) Current Question — fixed-height top bar.
                 Five phase states (no fallback-Lead bridging):
                   1. Awaiting Identity — pre-confirmation
@@ -658,6 +875,7 @@ export function LiveView() {
                 heading: t("LIVE COMMENTARY", "实时评论"),
                 observing: t("AI is observing…", "AI 正在观察…"),
               }}
+              isFullscreen={isFullscreen}
             />
 
             {/* (3) Live Captions — two speaker lanes stacked, fixed.
@@ -681,6 +899,7 @@ export function LiveView() {
                 candidate: t("Candidate", "候选人"),
                 speakerPrefix: t("Speaker", "发言者"),
               }}
+              isFullscreen={isFullscreen}
             />
           </div>
 
@@ -695,7 +914,29 @@ export function LiveView() {
             onClose={() => setRetagModalOpen(false)}
             utterances={utterances}
             speakerRoles={speakerRoles}
-            onForceRole={(dg, role) => forceSetSpeakerRole(dg, role)}
+            onForceRole={(dg, role) => {
+              // Apply the user's pick.
+              forceSetSpeakerRole(dg, role);
+              // Mutually-exclusive flip: a two-person interview means
+              // every OTHER known speaker must take the opposite role.
+              // Without this, the user has to click both buttons in
+              // sequence to swap (and ends up with both speakers tagged
+              // the same role mid-flow until the second click). Builds
+              // the set of known dgs from utterances rather than from
+              // speakerRoles (which can be empty for an unlabeled
+              // speaker — that's exactly the case we need to fill).
+              const opposite: "interviewer" | "candidate" =
+                role === "interviewer" ? "candidate" : "interviewer";
+              const seen = new Set<number>();
+              for (const u of utterances) {
+                if (u.dgSpeaker !== undefined) seen.add(u.dgSpeaker);
+              }
+              for (const otherDg of seen) {
+                if (otherDg === dg) continue;
+                if (speakerRoles[otherDg] === opposite) continue;
+                forceSetSpeakerRole(otherDg, opposite);
+              }
+            }}
             labels={{
               title: t(
                 "Re-tag Interviewer / Candidate",
@@ -735,12 +976,26 @@ function PageTitle() {
   // liveTitle is populated after /api/session-title returns — it derives a
   // role-and-company heading from the JD. Until then we show the generic
   // fallback, so the heading never blanks out.
+  //
+  // Rendered as <h1> for the document outline, sized down from the
+  // global marketing-hero default to a comfortable in-app page-title
+  // scale (~28px). The wrapping mx-auto/max-width container that used
+  // to live here was removed — PageTitle is now nested inside the
+  // outer scrollable card-wrapper which already provides those
+  // constraints, so the title shares its horizontal alignment with
+  // the card below it.
   const liveTitle = useStore((s) => s.liveTitle);
   return (
-    <div className="mx-auto w-full max-w-[920px] px-24 pt-10 pb-5 max-[900px]:px-5 max-[900px]:pt-6 max-[900px]:pb-3 shrink-0">
-      <div className="text-4xl font-bold tracking-tight leading-tight text-ink max-[900px]:text-[28px]">
+    <div className="pt-2 pb-5 max-[900px]:pt-1 max-[900px]:pb-3 shrink-0">
+      <h1
+        style={{
+          fontSize: "1.75rem",
+          lineHeight: 1.2,
+          letterSpacing: "-0.02em",
+        }}
+      >
         {liveTitle || "Live Interview Session"}
-      </div>
+      </h1>
     </div>
   );
 }
@@ -924,9 +1179,9 @@ function CurrentQuestionBar({
   if (!rolesConfirmed && hasUtterances) {
     return (
       <BarShell>
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider animate-pulse-dot">
+        <Eyebrow className="animate-pulse-dot">
           {labels.awaitingIdentity}
-        </div>
+        </Eyebrow>
       </BarShell>
     );
   }
@@ -936,9 +1191,7 @@ function CurrentQuestionBar({
   if (!hasUtterances && !mainQuestion && !summary) {
     return (
       <BarShell>
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider">
-          {labels.waitingForFirst}
-        </div>
+        <Eyebrow>{labels.waitingForFirst}</Eyebrow>
       </BarShell>
     );
   }
@@ -947,16 +1200,10 @@ function CurrentQuestionBar({
   //   (a) Upload mode: timelinePhaseKind === "candidate_asking", text
   //       derived from utterances at current playback position.
   //   (b) Live mode (state-driven): state === "candidate_questioning"
-  //       and the moment carries the candidate's current question. This
-  //       fires from the moment of state transition, before the first
-  //       cand-q-cmt commit has happened — text is the freshest
-  //       classifier output and may briefly flicker among rephrasings
-  //       until the lock takes over.
+  //       and the moment carries the candidate's current question.
   //   (c) Live mode (lock-driven): orchestrator has locked a candidate
   //       question (cand-q-cmt commit gates passed) AND no Lead is
-  //       currently locked. Persists across moment-state transitions
-  //       — covers interviewer mid-answer when state briefly flips to
-  //       interviewer_speaking / chitchat. Cleared by Lead-Q lock.
+  //       currently locked. Persists across moment-state transitions.
   // Path (c) takes display priority over (b) once it activates, because
   // the locked text is stable and de-flickered.
   const inCandidateQuestionPhase =
@@ -970,23 +1217,13 @@ function CurrentQuestionBar({
         : lockedCandidateQuestionText ?? liveCandidateQuestionText;
     return (
       <BarShell>
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
-          {labels.candidateAskingHeader}
-        </div>
-        <div className="font-serif text-[17px] leading-snug text-ink font-medium">
+        <Eyebrow className="block mb-2">{labels.candidateAskingHeader}</Eyebrow>
+        <QuestionBubble>
           {text && text.trim().length > 0 ? text : "…"}
-        </div>
+        </QuestionBubble>
       </BarShell>
     );
   }
-
-  // No "asking probe…" placeholder anymore. The placeholder used to
-  // show `summary` (a vague gerund phrase) under a "面试官正在追问…"
-  // header whenever state===interviewer_speaking with mainQuestion locked.
-  // That was misleading: it mixed the in-progress interviewer monologue
-  // summary with the Probe Question slot, even when no actual probe Q
-  // text had been identified yet. Per spec: only show the probe sub-row
-  // when a real probe Q text exists (locked or formally committed).
 
   // Question phase (Lead locked). Typography NO LONGER clamped — the
   // full Lead and Probe text wrap naturally. The Phase region uses
@@ -995,30 +1232,20 @@ function CurrentQuestionBar({
   if (mainQuestion) {
     return (
       <BarShell>
-        <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
-          {labels.leadHeader}
-        </div>
-        <div className="font-serif text-[17px] leading-snug text-ink font-medium">
-          {mainQuestion.text}
-        </div>
+        <Eyebrow className="block mb-2">{labels.leadHeader}</Eyebrow>
+        <QuestionBubble>{mainQuestion.text}</QuestionBubble>
 
         {/* Probe Question sub-row. Shown whenever EITHER:
             (a) followUp Question object is resolved from currentQuestionId
-                (the canonical source — works in steady state)
-            (b) lockedProbeQuestionText is set (the lock — survives any
-                transient null-frame between state updates during Lead
-                transitions, and stays put across moment-state oscillations
-                while the Lead is still active)
+            (b) lockedProbeQuestionText is set
             Text source: followUp.text (fresher) > lockedProbeQuestionText.
-            Cleared only by archiveCurrentMainAndStartNew (new Lead) or
+            Cleared by archiveCurrentMainAndStartNew (new Lead) or
             candidate_questioning entry — both clear lockedProbeQuestion
             in the orchestrator, so the sub-row goes away then. */}
         {(followUp || lockedProbeQuestionText) && (
-          <div className="mt-2 pl-3 border-l-2 border-rule">
-            <div className="text-[10px] font-semibold text-ink-lighter uppercase tracking-wider mb-0.5">
-              {labels.probeHeader}
-            </div>
-            <div className="font-serif text-[14px] leading-snug text-ink-light">
+          <div className="mt-3 pl-3 border-l-2 border-border">
+            <Eyebrow as="div" className="mb-1">{labels.probeHeader}</Eyebrow>
+            <div className="text-[15px] leading-snug text-text-muted">
               {followUp?.text ?? lockedProbeQuestionText}
             </div>
           </div>
@@ -1030,25 +1257,36 @@ function CurrentQuestionBar({
   // Interview Ongoing — no active Lead, not in reverse Q&A. Single
   // catch-all for warm-up, between-Leads transitions, and the wrap-up
   // tail after reverse Q&A. Shows the moment summary so the user
-  // always knows what's happening, even when the classifier hasn't
-  // locked a fresh Lead yet (e.g. interviewer mid-setup, or new Lead
-  // failing the 4-layer filter). Replaces the older Warm-up /
-  // Between-Questions / Q&A-Wrap-up trio plus the fallback-archived-
-  // Lead bridge — those distinctions weren't actionable for the user
-  // and the time-gated fallback caused "jump back to old Lead" bugs.
+  // always knows what's happening.
   return (
     <BarShell>
-      <div className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider mb-1">
-        {labels.interviewOngoingHeader}
-      </div>
+      <Eyebrow className="block mb-2">{labels.interviewOngoingHeader}</Eyebrow>
       {summary ? (
-        <div className="font-serif text-[15px] leading-snug text-ink-light italic">
+        <div className="text-[16px] leading-relaxed text-text-muted">
           {summary}
         </div>
       ) : (
-        <div className="text-[13px] text-ink-lighter italic">—</div>
+        <div className="text-[14px] text-text-subtle italic">—</div>
       )}
     </BarShell>
+  );
+}
+
+/** Question-bubble — plain text, no chrome. Earlier versions used
+ *  the marketing-site `.question-bubble` decoration (thick left
+ *  rule + surface background) but per user feedback the chrome was
+ *  competing with the question content itself. Question reads
+ *  cleanest as just bold black text at a slightly elevated size.
+ *
+ *  Used for both Lead Question and Candidate's Question paths. The
+ *  surrounding eyebrow ("LEAD QUESTION" etc.) above provides the
+ *  semantic label, so the text doesn't need extra decoration to
+ *  signal "this is what's on the table". */
+function QuestionBubble({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="text-[1.0625rem] leading-snug text-text font-medium">
+      {children}
+    </div>
   );
 }
 
@@ -1061,7 +1299,7 @@ function CurrentQuestionBar({
 function BarShell({ children }: { children: React.ReactNode }) {
   return (
     <div
-      className="border-b border-rule px-5 py-3 flex flex-col justify-center shrink-0"
+      className="border-b border-border px-5 py-4 flex flex-col justify-center shrink-0"
       style={{ minHeight: PHASE_MIN_HEIGHT_PX }}
     >
       {children}
@@ -1090,6 +1328,7 @@ function CommentarySection({
   candidateQuestionCommentary,
   overrideText,
   labels,
+  isFullscreen = false,
 }: {
   state: MomentStateKind;
   currentQuestion: Question | undefined;
@@ -1121,6 +1360,10 @@ function CommentarySection({
      *  waiting-for-answer, candidate-mid-answer. */
     observing: string;
   };
+  /** When true, the section grows to fill its flex parent instead of
+   *  using the default 16:9-derived fixed height. Prevents whitespace
+   *  below the captions in fullscreen mode. */
+  isFullscreen?: boolean;
 }) {
   // Re-render when the displayed comment's min-window expires so the
   // "AI is observing…" indicator can appear.
@@ -1291,59 +1534,90 @@ function CommentarySection({
     setLiveCandidateQuestionCommentary,
   ]);
 
-  // Middle pane of the 16:9 frame. Total height is fixed; heading row +
-  // pane together fit exactly COMMENTARY_TOTAL_HEIGHT_PX. The pane itself
-  // has overflow-y-auto as a defensive fallback — prompts are tuned to
-  // keep content within these bounds (3–4 sentences / ~60 words / ~120
-  // Chinese chars) so scrolling is rare.
+  // Middle pane of the coaching frame. FIXED height — locks
+  // dimensions so Region Capture's BBox tracking stays stable as
+  // commentary streams in. Earlier this used `minHeight` (auto-grow
+  // to fit long comments), but every commentary token streamed in
+  // triggered a height change which Chrome's Region Capture saw as
+  // a layout event and produced visible garbled frames ("花屏") at
+  // exactly those moments.
+  //
+  // Fixed height + `overflow: hidden` on the inner content means
+  // long commentary now CLIPS at the bottom rather than pushing the
+  // panel taller. The model is prompted to write 3-4 sentences /
+  // ~70 words / ~150 Chinese chars (see api/commentary route) which
+  // fits comfortably in 198px (~6-7 lines) at the current font size.
+  // A handful of unusually long comments will get a tail-clip — an
+  // acceptable trade for rock-stable recording.
   return (
     <div
-      className="flex flex-col border-b border-rule shrink-0"
+      className="flex flex-col border-b border-border shrink-0 overflow-hidden"
       style={{ height: COMMENTARY_TOTAL_HEIGHT_PX }}
     >
       <div
-        className="flex items-center px-5 text-[11px] text-ink-lighter tracking-wide font-medium shrink-0"
+        className="flex items-center px-5 shrink-0"
         style={{ height: COMMENTARY_HEADING_HEIGHT_PX }}
       >
-        {labels.heading}
+        <Eyebrow>{labels.heading}</Eyebrow>
       </div>
 
-      <div className="flex-1 min-h-0 mx-5 mb-3 border border-rule bg-paper-subtle rounded-md overflow-hidden flex">
-        {showCandidateQuestionCommentary ? (
-          // Candidate-question commentary: same 14.5px black-text look
-          // as Q-A commentary. Visually distinct from the listen-hint
-          // pane (no 💡 / blue border); contextualized by the Phase bar
-          // above showing "Candidate's Question".
-          <CommentaryBody
-            html={candidateQuestionCommentary || "…"}
-            tone="commentary"
-          />
-        ) : showListeningHint ? (
-          // Listening hint visual treatment: 💡 icon column + accent-blue
-          // left border + smaller 13.5px font so the user can tell at a
-          // glance this is in-the-moment coaching ("listen for X") vs
-          // post-answer evaluative commentary.
-          <CommentaryBody html={listeningHint} tone="hint" />
-        ) : isShowing && displayedComment ? (
-          <CommentaryBody
-            html={displayedComment.text || "…"}
-            tone="commentary"
-          />
-        ) : isIdle ? (
-          // Unified idle state: dots + "AI is observing…" across all
-          // sub-cases (role-identification, between-Qs, waiting-for-
-          // answer, candidate-mid-answer). Same visual for all so
-          // transitions feel smooth.
-          <div className="m-auto inline-flex items-center gap-2 text-ink-lighter italic text-sm">
+      {/* Idle state ("AI is observing…") renders WITHOUT the
+          bordered surface card — just centered dots + text floating
+          on the section's white background, no chrome. Per user
+          feedback: the box was over-decorating an empty waiting
+          state. The bordered card returns the moment actual
+          commentary starts streaming.
+
+          Dots use the gentler `animate-pulse-dot` keyframe (opacity
+          fade) instead of the previous `animate-bounce-dot`
+          (vertical bounce) — pulse reads as "thinking quietly",
+          bounce read as "loading something". For an ambient
+          listening indicator the calmer pulse fits better. */}
+      {isIdle ? (
+        <div className="flex-1 flex items-center justify-center mb-3">
+          <div className="inline-flex items-center gap-2.5 text-text-subtle italic text-sm">
             <span className="inline-flex gap-[3px]">
-              <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot" />
-              <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot [animation-delay:.15s]" />
-              <span className="w-[5px] h-[5px] rounded-full bg-accent animate-bounce-dot [animation-delay:.3s]" />
+              <span className="w-[5px] h-[5px] rounded-full bg-text animate-pulse-dot" />
+              <span className="w-[5px] h-[5px] rounded-full bg-text animate-pulse-dot [animation-delay:.2s]" />
+              <span className="w-[5px] h-[5px] rounded-full bg-text animate-pulse-dot [animation-delay:.4s]" />
             </span>
             {labels.observing}
           </div>
-        ) : null}
-      </div>
+        </div>
+      ) : (
+        // Bordered card is flex-1 inside the fixed-height
+        // CommentarySection above, with min-h-0 + overflow-hidden.
+        // No scrollbar (per UX requirement: scrollbars in a live-
+        // coaching panel are a friction during an interview). The
+        // commentary prompt is sized to the panel's character budget
+        // (see /api/commentary route — ~50 words / ~250 chars EN
+        // / ~120 Chinese chars + a 15-30 word Try block) so the
+        // common case fits without clipping. Rare overflow gets a
+        // silent bottom clip rather than introducing a scrollbar.
+        <div className="mx-5 mb-3 border border-border bg-surface rounded-md flex flex-1 min-h-0 overflow-hidden">
+          {showCandidateQuestionCommentary ? (
+            // Candidate-question commentary: same look as Q-A
+            // commentary. Visually distinct from the listen-hint pane
+            // (no 💡 / blue border); contextualized by the Phase bar
+            // above showing "Candidate's Question".
+            <CommentaryBody
+              html={candidateQuestionCommentary || "…"}
+              tone="commentary"
+            />
+          ) : showListeningHint ? (
+            // Listening hint visual treatment: thicker left border +
+            // smaller font so the user can tell at a glance this is
+            // in-the-moment coaching ("listen for X") vs post-answer
+            // evaluative commentary.
+            <CommentaryBody html={listeningHint} tone="hint" />
+          ) : isShowing && displayedComment ? (
+            <CommentaryBody
+              html={displayedComment.text || "…"}
+              tone="commentary"
+            />
+          ) : null}
+        </div>
+      )}
     </div>
   );
 }
@@ -1429,15 +1703,15 @@ function RetagSpeakersModal({
   return (
     <ModalShell open={open} onClose={onClose}>
       <div className="p-7 px-8">
-        <h2 className="text-[18px] font-semibold mb-1.5 text-ink">
+        <h2 className="text-[18px] font-semibold mb-1.5 text-text">
           {labels.title}
         </h2>
-        <div className="text-sm text-ink-light mb-4 leading-relaxed">
+        <div className="text-sm text-text-muted mb-5 leading-relaxed">
           {labels.description}
         </div>
 
         {speakers.length === 0 ? (
-          <div className="py-6 text-center text-[13px] text-ink-lighter italic">
+          <div className="py-6 text-center text-[13px] text-text-subtle italic">
             {labels.noSpeakers}
           </div>
         ) : (
@@ -1445,45 +1719,41 @@ function RetagSpeakersModal({
             {speakers.map((s) => (
               <div
                 key={s.dgSpeaker}
-                className="border border-rule rounded-md p-3 bg-paper-subtle"
+                className="border border-border rounded-md p-3 bg-surface"
               >
                 <div className="flex items-baseline justify-between gap-3 mb-2">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-lighter">
+                  <div className="text-[11px] font-medium uppercase tracking-wider text-text-subtle">
                     Speaker {s.dgSpeaker}
                     {s.role && (
-                      <span className="ml-2 normal-case font-normal text-ink-light">
-                        · current: <strong>{s.role === "interviewer" ? labels.interviewer : labels.candidate}</strong>
+                      <span className="ml-2 normal-case font-normal text-text-muted">
+                        · current: <strong className="text-text">{s.role === "interviewer" ? labels.interviewer : labels.candidate}</strong>
                       </span>
                     )}
                   </div>
                 </div>
-                <div className="text-[12px] text-ink-light italic mb-2.5 leading-snug line-clamp-2">
-                  <span className="text-ink-lighter not-italic mr-1">
+                <div className="text-[12px] text-text-muted italic mb-2.5 leading-snug line-clamp-2">
+                  <span className="text-text-subtle not-italic mr-1">
                     {labels.sample}:
                   </span>
                   &ldquo;{s.sample}&rdquo;
                 </div>
                 <div className="flex gap-2">
-                  <button
+                  <Button
+                    variant={s.role === "interviewer" ? "primary" : "secondary"}
+                    size="sm"
                     onClick={() => onForceRole(s.dgSpeaker, "interviewer")}
-                    className={`flex-1 px-3 py-1.5 rounded-md text-[12.5px] font-medium border transition-colors ${
-                      s.role === "interviewer"
-                        ? "bg-accent text-paper border-accent"
-                        : "bg-paper text-ink border-rule-strong hover:bg-paper-hover"
-                    }`}
+                    className="flex-1"
                   >
                     {labels.interviewer}
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant={s.role === "candidate" ? "primary" : "secondary"}
+                    size="sm"
                     onClick={() => onForceRole(s.dgSpeaker, "candidate")}
-                    className={`flex-1 px-3 py-1.5 rounded-md text-[12.5px] font-medium border transition-colors ${
-                      s.role === "candidate"
-                        ? "bg-accent text-paper border-accent"
-                        : "bg-paper text-ink border-rule-strong hover:bg-paper-hover"
-                    }`}
+                    className="flex-1"
                   >
                     {labels.candidate}
-                  </button>
+                  </Button>
                 </div>
               </div>
             ))}
@@ -1491,12 +1761,7 @@ function RetagSpeakersModal({
         )}
 
         <div className="flex justify-end mt-4">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 rounded-md text-sm font-medium border border-rule-strong bg-paper text-ink hover:bg-paper-hover"
-          >
-            {labels.close}
-          </button>
+          <Button onClick={onClose}>{labels.close}</Button>
         </div>
       </div>
     </ModalShell>
@@ -1512,11 +1777,16 @@ function LiveCaptions({
   onRetagClick,
   retagLabel,
   labels,
+  isFullscreen = false,
 }: {
   utterances: Utterance[];
   interim: string;
   isRecording: boolean;
   speakerRoles: Record<number, "interviewer" | "candidate">;
+  /** When true, captions section uses a taller fixed height so larger
+   *  caption text has room to breathe. Default false matches the
+   *  16:9-derived sizing of normal mode. */
+  isFullscreen?: boolean;
   /** When set (upload + timeline mode), treat only utterances whose
    *  `atSeconds + duration` (i.e. end time) ≤ maxTimeSec as visible.
    *  Scrubbing backwards hides later utterances; forward reveals them. */
@@ -1561,38 +1831,54 @@ function LiveCaptions({
       seen.add(u.dgSpeaker);
       firstAppearance.push(u.dgSpeaker);
     }
-    const laneA = interviewerDg ?? firstAppearance[0];
-    let laneB =
-      candidateDg ?? firstAppearance.find((s) => s !== laneA);
-    // Dedupe: when only ONE speaker exists in the recording and only the
-    // candidate role has been identified, interviewerDg is undefined →
-    // laneA falls through to the first (and only) speaker number; then
-    // candidateDg refers to that SAME number → laneB collapses to laneA
-    // and the UI renders both lanes with identical text. Force laneB
-    // empty in that case so the single-speaker recording shows one lane.
+    // Lane assignment with role-aware reservation.
+    //
+    // Convention: lane A = interviewer slot, lane B = candidate slot.
+    //
+    // Earlier the lane fallback was `interviewerDg ?? firstAppearance[0]`
+    // which leaked the first-spoken dg into lane A even when that dg's
+    // role was known to be candidate. Concretely: user tags dg:0 as
+    // candidate before dg:1 has spoken → laneA falls through to dg:0
+    // (the candidate) and laneB dedupes to undefined → lane A shows
+    // candidate text under the "Candidate" label, lane B is empty.
+    // The user's expected "Interviewer · waiting to speak" placeholder
+    // never appears.
+    //
+    // Fix: when ONE role is tagged but the OPPOSITE dg hasn't spoken
+    // yet, leave that lane explicitly undefined so the reserved-role
+    // placeholder kicks in. The dg fallback only applies when NO role
+    // is tagged (initial state, before the user picks anything).
+    const laneA: number | undefined =
+      interviewerDg !== undefined
+        ? interviewerDg
+        : candidateDg !== undefined
+        ? // Candidate is tagged, interviewer not yet → reserve laneA
+          undefined
+        : firstAppearance[0];
+    let laneB: number | undefined =
+      candidateDg !== undefined
+        ? candidateDg
+        : interviewerDg !== undefined
+        ? // Interviewer is tagged, candidate not yet → reserve laneB
+          undefined
+        : firstAppearance.find((s) => s !== laneA);
+    // Defensive dedupe: a lingering edge case (e.g. role map racing
+    // with utterance arrival) could still collapse both lanes onto the
+    // same dg. Force laneB empty in that case so we don't render
+    // duplicate text.
     if (laneA !== undefined && laneA === laneB) laneB = undefined;
 
-    // Pre-label empty lanes once the user has tagged one role. If the
-    // user marked dg:0 as "interviewer", we logically know the OTHER
-    // speaker will be the candidate — but Deepgram hasn't emitted a
-    // dg:1 utterance yet, so laneB has no dgSpeaker attached. Reserve
-    // the role visually so the user sees "Candidate · waiting to speak"
-    // in the second lane instead of a generic "Speaker 2" placeholder.
+    // Pre-label the empty lane once the user has tagged one role.
+    // When laneA is empty AND candidate is tagged, we know laneA is
+    // waiting for the interviewer (so reserve "interviewer"). Mirror
+    // logic for laneB.
     const laneAReservedRole: "interviewer" | "candidate" | undefined =
-      laneA === undefined
-        ? interviewerDg === undefined && candidateDg !== undefined
-          ? "interviewer"
-          : interviewerDg !== undefined
-          ? "interviewer"
-          : undefined
+      laneA === undefined && candidateDg !== undefined
+        ? "interviewer"
         : undefined;
     const laneBReservedRole: "interviewer" | "candidate" | undefined =
-      laneB === undefined
-        ? candidateDg === undefined && interviewerDg !== undefined
-          ? "candidate"
-          : candidateDg !== undefined
-          ? "candidate"
-          : undefined
+      laneB === undefined && interviewerDg !== undefined
+        ? "candidate"
         : undefined;
 
     return { laneA, laneB, laneAReservedRole, laneBReservedRole };
@@ -1739,21 +2025,30 @@ function LiveCaptions({
   // is blank / placeholder when only one speaker exists) so the total
   // height stays constant regardless of speaker count — important for
   // the video aspect ratio.
+  // Captions section: fixed sizing in all modes — same layout as
+  // before fullscreen mode existed. Fullscreen doesn't change the
+  // card's interior, only hides chrome around it.
   return (
     <div
-      className="bg-paper-subtle flex flex-col shrink-0"
+      className="bg-surface flex flex-col shrink-0"
       style={{ height: CAPTIONS_TOTAL_HEIGHT_PX }}
     >
       <div
-        className="px-4 border-b border-rule flex items-center gap-2 shrink-0"
+        className="px-4 border-b border-border flex items-center gap-3 shrink-0"
         style={{ height: CAPTIONS_HEADING_HEIGHT_PX }}
       >
-        <span className="text-[11px] font-semibold text-ink-lighter uppercase tracking-wider">
-          {labels.heading}
-        </span>
+        <Eyebrow>{labels.heading}</Eyebrow>
         {isRecording && (
-          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-accent uppercase tracking-wider">
-            <span className="w-1.5 h-1.5 rounded-full bg-live animate-pulse-dot" />
+          // Recording indicator. Uses the functional --color-error red
+          // (replaces the old "live" hue) for the dot so all alert/
+          // recording reds across the app are the same hue. Eyebrow-
+          // sized text in mono color since accent has been collapsed
+          // to mono in this design system.
+          <span className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-text uppercase tracking-wider">
+            <span
+              className="w-1.5 h-1.5 rounded-full animate-pulse-dot"
+              style={{ background: "var(--color-error)" }}
+            />
             {labels.live}
           </span>
         )}
@@ -1765,10 +2060,25 @@ function LiveCaptions({
           // mode (upload mode pre-identifies via Haiku).
           <button
             onClick={onRetagClick}
-            className="ml-auto inline-flex items-center gap-1 text-[10.5px] text-ink-lighter hover:text-ink hover:underline underline-offset-2 transition-colors"
+            className="ml-auto inline-flex items-center gap-1 text-[12.5px] text-text-subtle hover:text-text transition-colors"
             title="Re-tag interviewer / candidate"
           >
-            <span className="text-[11px] leading-none">↻</span>
+            {/* Refresh/cycle icon — SVG to avoid `↻` U+21BB
+                font-fallback issues. */}
+            <svg
+              width="11"
+              height="11"
+              viewBox="0 0 14 14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M3 7a4 4 0 1 1 1.2 2.85" />
+              <polyline points="3 6 3 9.5 6.5 9.5" />
+            </svg>
             <span>{retagLabel || "Re-tag"}</span>
           </button>
         )}
@@ -1778,13 +2088,15 @@ function LiveCaptions({
         text={textA}
         isSpeakingNow={aSpeaking || firstInterimOrphaned}
         interim={interimForA}
+        isFullscreen={isFullscreen}
       />
-      <div className="h-px bg-rule" />
+      <div className="h-px bg-border" />
       <CaptionLane
         meta={metaB}
         text={textB}
         isSpeakingNow={bSpeaking}
         interim={interimForB}
+        isFullscreen={isFullscreen}
       />
     </div>
   );
@@ -1808,149 +2120,23 @@ function LiveCaptions({
  * the session (which listens to the element's own timeupdate events and
  * flushes utterances forward as needed).
  */
-function LivePlayerStrip({ audio }: { audio: HTMLAudioElement }) {
-  const [time, setTime] = useState(audio.currentTime);
-  const [duration, setDuration] = useState(
-    isFinite(audio.duration) ? audio.duration : 0
-  );
-  const [paused, setPaused] = useState(audio.paused);
-  const [collapsed, setCollapsed] = useState(false);
-  const setLivePlaybackTime = useStore((s) => s.setLivePlaybackTime);
 
-  useEffect(() => {
-    const onTime = () => {
-      setTime(audio.currentTime);
-      // Mirror into the store so timeline-driven UI (phases, current
-      // question, commentary, listening hints, captions) can re-derive.
-      setLivePlaybackTime(audio.currentTime);
-    };
-    const onMeta = () =>
-      setDuration(isFinite(audio.duration) ? audio.duration : 0);
-    const onPlay = () => setPaused(false);
-    const onPause = () => setPaused(true);
-    audio.addEventListener("timeupdate", onTime);
-    audio.addEventListener("loadedmetadata", onMeta);
-    audio.addEventListener("durationchange", onMeta);
-    audio.addEventListener("play", onPlay);
-    audio.addEventListener("pause", onPause);
-    // `seeked` fires once a seek completes — useful when the user
-    // scrubs while paused (timeupdate may not fire reliably in that
-    // state across browsers). Hooked to the same handler so the store
-    // sees the new position promptly either way.
-    audio.addEventListener("seeked", onTime);
-    // Initial sync in case the element is already beyond these events.
-    onTime();
-    onMeta();
-    setPaused(audio.paused);
-    return () => {
-      audio.removeEventListener("timeupdate", onTime);
-      audio.removeEventListener("loadedmetadata", onMeta);
-      audio.removeEventListener("durationchange", onMeta);
-      audio.removeEventListener("play", onPlay);
-      audio.removeEventListener("pause", onPause);
-      audio.removeEventListener("seeked", onTime);
-    };
-  }, [audio, setLivePlaybackTime]);
-
-  const pct = duration > 0 ? (time / duration) * 100 : 0;
-  const fmt = (s: number) => {
-    if (!isFinite(s)) return "00:00";
-    const mm = Math.floor(s / 60).toString().padStart(2, "0");
-    const ss = Math.floor(s % 60).toString().padStart(2, "0");
-    return `${mm}:${ss}`;
-  };
-
-  const onTrackClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (duration === 0) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const p = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    audio.currentTime = p * duration;
-    setTime(audio.currentTime);
-    // IMPORTANT: push the new position into the store immediately. The
-    // native `timeupdate` event fires after a seek but sometimes only
-    // once and only if the element is playing — if the user scrubs
-    // while paused, the timeline-driven UI (phase / question /
-    // commentary / captions) could otherwise sit on stale state until
-    // they hit play. Direct write keeps everything in sync.
-    setLivePlaybackTime(audio.currentTime);
-  };
-
-  // Collapsed mode: just a small "show progress bar" pill anchored on
-  // the right, so the user can hide the strip but still bring it back.
-  if (collapsed) {
-    return (
-      <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0 pb-3 flex justify-end">
-        <button
-          onClick={() => setCollapsed(false)}
-          className="inline-flex items-center gap-1.5 text-[11px] text-ink-lighter hover:text-ink border border-rule bg-paper-subtle px-2.5 py-1 rounded-md"
-        >
-          <span className="font-mono tabular-nums">{fmt(time)}</span>
-          <span>· Show progress</span>
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mx-auto w-full max-w-[920px] px-24 max-[900px]:px-5 shrink-0 pb-3">
-      <div className="flex items-center gap-3 rounded-md border border-rule bg-paper-subtle px-3 py-2">
-        <button
-          onClick={() => {
-            if (paused) void audio.play();
-            else audio.pause();
-          }}
-          className="w-8 h-8 rounded-full bg-ink hover:bg-[#1f1e1a] text-paper grid place-items-center text-[12px] shrink-0 transition-colors"
-          aria-label={paused ? "Play" : "Pause"}
-        >
-          {paused ? "▶" : "▮▮"}
-        </button>
-        <span className="font-mono text-[11px] text-ink-light tabular-nums min-w-[74px]">
-          <span className="text-ink font-semibold">{fmt(time)}</span>
-          <span> / {fmt(duration)}</span>
-        </span>
-        <div
-          onClick={onTrackClick}
-          className="flex-1 h-1.5 bg-paper-hover rounded-full relative cursor-pointer"
-          role="slider"
-          aria-label="Recording progress"
-          aria-valuenow={Math.round(time)}
-          aria-valuemax={Math.round(duration)}
-        >
-          <div
-            className="absolute left-0 top-0 bottom-0 bg-ink rounded-full"
-            style={{ width: `${pct}%` }}
-          />
-          <div
-            className="absolute top-1/2 w-3 h-3 bg-ink rounded-full border-2 border-paper shadow"
-            style={{ left: `${pct}%`, transform: "translate(-50%, -50%)" }}
-          />
-        </div>
-        <span className="text-[10.5px] text-ink-lighter tracking-wider uppercase">
-          Recording
-        </span>
-        <button
-          onClick={() => setCollapsed(true)}
-          className="shrink-0 text-ink-lighter hover:text-ink text-[13px] leading-none px-1"
-          aria-label="Hide progress bar"
-          title="Hide"
-        >
-          ×
-        </button>
-      </div>
-    </div>
-  );
-}
 
 function CaptionLane({
   meta,
   text,
   isSpeakingNow,
   interim,
+  isFullscreen = false,
 }: {
   meta: { name: string; reserved?: boolean };
   text: string;
   isSpeakingNow: boolean;
   interim: string;
+  /** When true, lane is taller, label column wider, gap and padding
+   *  bigger — matches the bumped text scale and gives the speaker
+   *  label proper breathing room. */
+  isFullscreen?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1963,6 +2149,9 @@ function CaptionLane({
     if (el) el.scrollTop = el.scrollHeight;
   }, [text, interim, isSpeakingNow]);
 
+  // Same layout in all modes — fullscreen only hides the page
+  // chrome around the card; the card and its lanes keep their
+  // original dimensions so Region Capture's recording is consistent.
   return (
     <div
       className="px-4 py-1.5 flex gap-3 items-start overflow-hidden"
@@ -1970,12 +2159,12 @@ function CaptionLane({
     >
       <div className="w-[90px] shrink-0">
         <div
-          className={`text-[10.5px] font-medium uppercase tracking-wider ${
+          className={`text-[12px] font-medium uppercase tracking-wider ${
             isSpeakingNow
-              ? "text-accent animate-pulse-label"
+              ? "text-text animate-pulse-label"
               : meta.reserved
-              ? "text-ink-lighter"
-              : "text-ink"
+              ? "text-text-subtle"
+              : "text-text"
           }`}
         >
           {meta.name}
@@ -1983,17 +2172,32 @@ function CaptionLane({
       </div>
       <div
         ref={ref}
-        className="flex-1 min-w-0 text-[12.5px] leading-snug text-ink overflow-y-auto no-scrollbar h-full"
+        // Font + line-height locked so EXACTLY two lines fit in the
+        // CAPTIONS_LANE_HEIGHT_PX (60px) lane without a 3rd line
+        // peeking through at the top. Math:
+        //   - lane height       = 60px
+        //   - vertical padding  = py-1.5 = 12px
+        //   - usable text area  = 48px
+        //   - line-height       = 24px (locked, not snug)
+        //   - 2 lines           = 48px → exactly fills, line 3 starts
+        //                          at 48px → entirely outside the
+        //                          visible region (no peek)
+        // The font bump 14 → 15.5 makes the captions a touch easier
+        // to read at glance distance; the explicit leading-[24px]
+        // (vs. snug = 1.375) is what guarantees the clean cutoff
+        // regardless of subpixel rounding. Don't change either side
+        // in isolation — they're paired.
+        className="flex-1 min-w-0 text-[15.5px] leading-[24px] text-text overflow-y-auto no-scrollbar h-full"
       >
         {meta.reserved ? (
           // Role is known (the other side was tagged) but this speaker
           // hasn't been heard yet. Show an explicit waiting state so the
           // user understands the system is ready — just no voice yet.
-          <span className="text-ink-lighter/70 italic inline-flex items-center gap-2">
+          <span className="text-text-subtle italic inline-flex items-center gap-2">
             <span className="inline-flex gap-[3px]">
-              <span className="w-[4px] h-[4px] rounded-full bg-ink-lighter animate-bounce-dot" />
-              <span className="w-[4px] h-[4px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.15s]" />
-              <span className="w-[4px] h-[4px] rounded-full bg-ink-lighter animate-bounce-dot [animation-delay:.3s]" />
+              <span className="w-[4px] h-[4px] rounded-full bg-text-subtle animate-bounce-dot" />
+              <span className="w-[4px] h-[4px] rounded-full bg-text-subtle animate-bounce-dot [animation-delay:.15s]" />
+              <span className="w-[4px] h-[4px] rounded-full bg-text-subtle animate-bounce-dot [animation-delay:.3s]" />
             </span>
             waiting to speak
           </span>
@@ -2001,13 +2205,13 @@ function CaptionLane({
           <>
             {text}
             {interim && (
-              <span className="text-ink-lighter/70 italic"> {interim}</span>
+              <span className="text-text-subtle italic"> {interim}</span>
             )}
           </>
         ) : interim ? (
-          <span className="text-ink-lighter/70 italic">{interim}</span>
+          <span className="text-text-subtle italic">{interim}</span>
         ) : (
-          <span className="text-ink-lighter/70 italic">—</span>
+          <span className="text-text-subtle italic">—</span>
         )}
       </div>
     </div>

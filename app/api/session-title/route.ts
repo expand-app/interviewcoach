@@ -76,10 +76,29 @@ Write the title.`;
       .split("\n")[0]
       .slice(0, 80);
 
+    if (!text) {
+      // Model returned empty / whitespace — count as fallback so the
+      // client knows to retry. Surface in server log too so we can
+      // see if this happens in patterns (specific JD shapes etc.).
+      console.warn("[session-title] model returned empty text");
+      return NextResponse.json({
+        title: "Live Interview Session",
+        fallback: true,
+      });
+    }
+
+    return NextResponse.json({ title: text });
+  } catch (e) {
+    // Used to be a bare `catch {}` — completely silent, the only
+    // visible symptom was the title staying as "Live Interview
+    // Session". Now log the real cause (ECONNRESET / 429 / timeout /
+    // etc.) and signal `fallback: true` so the client can retry.
+    const status = (e as { status?: number })?.status;
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[session-title] failed:", status, msg);
     return NextResponse.json({
-      title: text || "Live Interview Session",
+      title: "Live Interview Session",
+      fallback: true,
     });
-  } catch {
-    return NextResponse.json({ title: "Live Interview Session" });
   }
 }

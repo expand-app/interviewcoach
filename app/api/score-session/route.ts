@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import type { SessionScore, Question } from "@/types/session";
 import { getAnthropicClient } from "@/lib/anthropic-client";
+import { logSessionEvent } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
 
@@ -13,50 +14,68 @@ interface ScoreBody {
   questions: Question[];
   /** Wall-clock duration of the session in seconds, for context only. */
   durationSeconds: number;
+  /** Output language. "zh" (default for backward compat) keeps the
+   *  existing Chinese-with-English-keywords mix; "en" emits pure
+   *  English. The two prompts share dimensions, weights, and
+   *  scoring rules — only the OUTPUT LANGUAGE block diverges. */
+  lang?: "en" | "zh";
+  /** Optional. When supplied, the route emits session_events
+   *  breadcrumbs (begin / override / complete / error) so a future
+   *  "re-score keeps failing" complaint can be diagnosed from the
+   *  events log. Older clients that don't pass this still work —
+   *  the events are simply skipped. */
+  sessionId?: string;
 }
 
+// Five canonical rubric dimensions. The MAX (= per-session weight) is
+// no longer hardcoded — the model assigns weights itself based on
+// what the interview actually tested, with the constraint that
+// weights sum to exactly 100. A dimension the interview did not test
+// (e.g. Role Fit in a pure technical screen) gets weight 0 and
+// score null. This keeps the displayed total max constant at /100
+// across every session, regardless of which dimensions applied.
 const DIMENSIONS = [
   {
     key: "question_addressing",
     label: "Question Addressing",
-    max: 25,
     description:
-      "Did the candidate answer what was asked, or pivot / dodge / restate their background? Interviewers score this high when answers engage the actual prompt, low when answers drift to safer topics.",
+      "Did the candidate eventually engage the actual question, even if they took some setup or context-building time first? Score HIGH when the answer reaches the prompt at any point — including after a meandering preamble — provided it lands with substance. Score MID when they only partially address the ask. Score LOW only when they fully pivot away, dodge, or stay on safer topics throughout the answer window. Reading the full ANSWER text matters here: if the candidate buries the answer at the end of a long lead-in, they still answered it.",
   },
   {
     key: "specificity",
     label: "Specificity & Evidence",
-    max: 25,
     description:
       "Concrete work, numbers, decisions — not generalities. Score high when claims are grounded in named projects, metrics, architecture choices; low when answers stay abstract or sound rehearsed.",
   },
   {
     key: "depth",
     label: "Depth & Reasoning",
-    max: 20,
     description:
       "Senior-level thinking: tradeoffs surfaced, scope narrowed intelligently, clarifying questions asked when the prompt was ambiguous. Score high for demonstrated judgment; low for shallow or over-broad answers.",
   },
   {
     key: "role_fit",
     label: "Role Fit",
-    max: 15,
     description:
-      "Alignment with the JD's expectations and seniority bar. Score high when answers hit the signals the JD calls out (e.g. cross-team influence, ML depth); low when they miss them.",
+      "Alignment with the JD's expectations and seniority bar. Score high when answers hit the signals the JD calls out (e.g. cross-team influence, ML depth); low when they miss them. Drop weight to 0 when the interview was a pure technical / coding / case screen with no JD-fit assessment beyond the technical match itself.",
   },
   {
     key: "communication",
     label: "Communication",
-    max: 15,
     description:
-      "Clarity, structure, pacing. Score high for organized, confident delivery; low for rambling, heavy filler, or answers so hard to follow that strong content gets obscured.",
+      "Clarity, structure, pacing. Score high for organized, confident delivery. A few filler words ('you know', 'like') or one-off rambles are normal speech and should NOT trigger a low score on their own — reserve those for delivery so disorganized that strong content visibly fails to land. Don't double-penalize: if the answer was substantive, slight delivery roughness shouldn't drop more than a few points here.",
   },
 ] as const;
 
 function verdictForPercent(percent: number): SessionScore["verdict"] {
   if (percent >= 85) return "strong_pass";
-  if (percent >= 70) return "pass";
-  if (percent >= 60) return "borderline";
+  // Loosened: pass threshold dropped 70 → 65, borderline floor 60 → 55,
+  // fail < 55. The hiring-panel calibration we settled on judges that
+  // a candidate at the 65-69% band is a real "advance with reservations"
+  // not a marginal fail; the previous 70% bar was over-strict against
+  // candidates who answered well but had one or two soft spots.
+  if (percent >= 65) return "pass";
+  if (percent >= 55) return "borderline";
   return "fail";
 }
 
@@ -79,8 +98,23 @@ export async function POST(req: Request) {
 
   const body = (await req.json()) as ScoreBody;
   const { jd, resume, questions, durationSeconds } = body;
+  // Default to "zh" so old clients that don't pass `lang` (and any
+  // sessions in flight during the deploy boundary) keep the
+  // pre-toggle Chinese-mixed output. New clients always pass it
+  // explicitly via store's commentLang.
+  const lang: "en" | "zh" = body.lang === "en" ? "en" : "zh";
+  const sessionId = body.sessionId?.trim() || "";
+  // Wall-clock start used for `score.complete` event's elapsedMs.
+  const t0 = Date.now();
 
   if (!jd || !questions || questions.length === 0) {
+    if (sessionId) {
+      logSessionEvent(sessionId, {
+        source: "score",
+        event: "skip-missing-input",
+        data: { hasJd: !!jd, questionCount: questions?.length ?? 0 },
+      });
+    }
     return NextResponse.json(
       { error: "Missing JD or questions" },
       { status: 400 }
@@ -191,9 +225,20 @@ export async function POST(req: Request) {
     return `${header}\n${bullets}`;
   };
 
+  // Topic-labeled question blocks — DELIBERATELY no "Q1. / Q2. / Q3."
+  // numbering. The model parrots whatever question-labeling scheme
+  // appears in the input; if we feed it numbers, it spits "Q3 was
+  // weak" back into justifications no matter how strongly the system
+  // prompt forbids it. Removing numbers from input forces the model
+  // to identify questions by topic ("the data-driven decision
+  // question", "the influence-without-authority follow-up") which is
+  // what the reader actually wants. The blank-line separator between
+  // blocks plus the "QUESTION:" label still gives the model the
+  // structural cues it needs to attribute comments and answers
+  // correctly.
   const qaBlock = mains
-    .map((m, i) => {
-      const blockHeader = `Q${i + 1}. ${m.text}`;
+    .map((m) => {
+      const blockHeader = `QUESTION: ${m.text}`;
       const answerLine = isLegacySchema ? "" : "\n" + fmtAnswer(m);
       const commentLines = "\n" + fmtCommentBlock(m, "  ");
       const probes = followUps.get(m.id) ?? [];
@@ -277,23 +322,64 @@ export async function POST(req: Request) {
     })
   );
 
+  if (sessionId) {
+    logSessionEvent(sessionId, {
+      source: "score",
+      event: "begin",
+      data: {
+        schema: isLegacySchema ? "legacy" : "modern",
+        mains: mains.length,
+        questionsWithAnswers,
+        totalAnswerChars,
+        questionsWithSubstantiveComments,
+        totalCommentChars,
+        durationSeconds,
+        lang,
+      },
+    });
+  }
+
   const rubricBlock = DIMENSIONS.map(
-    (d) => `- ${d.label} (${d.max} pts, key="${d.key}"): ${d.description}`
+    (d) => `- ${d.label} (key="${d.key}"): ${d.description}`
   ).join("\n");
 
   const system = `You are a senior interview panel calibrator. You score a completed interview on a 100-point rubric and write a hiring-committee-style verdict.
 
-== RUBRIC (100 points total when all dimensions are judgeable) ==
+== RUBRIC (always /100; you assign per-session weights) ==
+Five canonical dimensions. The TOTAL MAXIMUM is always exactly 100 — no exceptions. You decide HOW to split those 100 points across the five dimensions for THIS session, based on what the interview actually emphasized.
+
 ${rubricBlock}
 
-== SCORING CALIBRATION ==
-The verdict is computed from (sum of awarded) / (sum of max across JUDGED dimensions):
-- >= 85%: strong pass — a panel would advance without hesitation.
-- 70-84%: pass — advances, but with reservations to probe next round.
-- 60-69%: borderline — committee would hesitate. Could go either way; most real loops this still fails.
-- Below 60%: fail — clear no.
+WEIGHT ASSIGNMENT — read the interview, then choose:
+- The five dimension weights MUST sum to exactly 100. No rounding, no leeway.
+- A dimension the interview did NOT meaningfully test gets weight 0 and score=null.
+- Weights reflect what the interviewer cared about — not a fixed template.
 
-Be calibrated, not generous. A vague answer that sounded fluent but said nothing specific is a 10–12 on Specificity, not 20. An answer that never engaged the actual question is a single-digit on Question Addressing. Do NOT inflate to avoid being harsh.
+Default weights (use these for a balanced behavioral + technical loop):
+  question_addressing: 20, specificity: 25, depth: 25, role_fit: 15, communication: 15
+
+Common reweights:
+- PURE TECHNICAL screen (ML / SQL / coding / case, no JD-fit chitchat) → drop role_fit to 0; redistribute to specificity + depth. Example: 20 / 30 / 35 / 0 / 15.
+- PURE BEHAVIORAL (only STAR-style; no scoped problem) → drop depth to 0 or near-0 (no problem-solving to judge); shift to question_addressing + role_fit + communication. Example: 25 / 25 / 0 / 25 / 25.
+- HEAVY CASE / SYSTEM DESIGN (one long open-ended problem) → emphasize depth + specificity. Example: 15 / 30 / 35 / 10 / 10.
+- CULTURAL FIT / COFFEE CHAT (no real probing) → role_fit + communication dominate. Example: 15 / 15 / 5 / 35 / 30.
+
+Score each ACTIVE dimension (weight > 0) on its assigned weight: 0..weight points. A dimension worth 30 points where the candidate did "great but with one gap" might get 22; worth 15 with the same quality, gets 11. Same content quality, scaled to the weight you chose.
+
+== SCORING CALIBRATION ==
+The verdict is computed from total / 100:
+- >= 85: strong pass — a panel would advance without hesitation.
+- 65-84: pass — advances, with reservations to probe next round.
+- 55-64: borderline — committee would hesitate. Could go either way.
+- Below 55: fail — clear no.
+
+Calibrate to the AVERAGE PANEL, not a hostile one. Don't pile on for minor issues:
+- One "you know" or "like" every couple sentences is normal speech, not a Communication problem.
+- A 15-second context-building preamble before landing an answer is normal interview behavior, not "didn't address the question".
+- A single moment where a tradeoff went unstated isn't a Depth fail if other moments showed reasoning.
+Reserve harsh scores for SYSTEMIC weaknesses — issues that recur across multiple questions, not one-off slips. A candidate who lands 7 of 9 questions with substance and stumbles on 2 should score a clear pass, not a borderline.
+
+Don't inflate either — vague-but-fluent ≠ specific. But also don't compound minor flaws into a fail. The bar is "would an average hiring panel advance this candidate?" — most real loops have flaws and still pass.
 
 == READ THE ROOM ==
 This is a human interaction, not a written exam. The transcript includes the live commentary, which often notes the interviewer's in-the-moment reactions (laughs, "interesting", "great point", flat "okay…", immediate re-phrasings, shifts to simpler questions). Factor those in:
@@ -309,7 +395,18 @@ When verbal feedback and behavior conflict, trust the behavior. Don't be fooled 
 
 Don't invent reactions that aren't in the transcript. But when the commentary clearly reflects interviewer energy, use it — good coaching scores the interview as it actually went, not as a checklist.
 
-== OUTPUT LANGUAGE (Chinese with English keywords) ==
+${
+  lang === "en"
+    ? `== OUTPUT LANGUAGE (English only) ==
+Write every user-facing string — \`summary\`, each dimension's \`justification\`, every \`improvements\` entry's \`title\`, \`detail\`, and \`fix\` — in clear, professional English. No Chinese characters anywhere in user-facing output. Direct candidate quotes are an exception: preserve them in whatever language the candidate actually used (e.g. if the candidate spoke Mandarin, the quote stays Mandarin).
+
+Tone examples:
+- "Solid overall, specificity carried the loop — Q2 landed <strong>30% lift</strong> and tied it to a model change, not the launch, which is the granularity hiring committees want."
+- "Question addressing was the weak point: Q1 sidestepped 'why banking' and burned time on company history, so the interviewer pivoted to the simpler question."
+- "On Q2 (walk me through a tough decision), use a problem → options → pick → why shape. Go straight to Postgres vs Dynamo with p99 latency numbers — it tightens the narrative."
+
+Keep each justification under 22 words. Each improvement: 1-2 sentences, specific to a moment in the transcript.`
+    : `== OUTPUT LANGUAGE (Chinese with English keywords) ==
 Write every user-facing string — \`summary\`, each dimension's \`justification\`, every \`improvements\` entry's \`title\`, \`detail\`, and \`fix\` — in Chinese as the base language, with English keywords preserved inline. Match the tone and mixing style of the Live Commentary:
 - Product / technical terms (recommendation model, feature store, A/B test, CCAR, LightGBM, tradeoff, scope, probe) → keep English.
 - Named entities from the JD / resume (company names, team names, model/framework names) → keep as they appear.
@@ -324,14 +421,19 @@ Tone examples:
 
 Do NOT output pure English. Do NOT output pure Chinese — keep the bilingual mix.
 
-Keep each justification under 25 Chinese characters (English terms don't count). Each improvement: 1-2 sentences, specific to a moment in the transcript.
+Keep each justification under 25 Chinese characters (English terms don't count). Each improvement: 1-2 sentences, specific to a moment in the transcript.`
+}
 
 == TRANSCRIPT STRUCTURE ==
 The transcript comes in one of TWO schemas. The user message tells you which.
 
 (A) MODERN SCHEMA — each question has both ANSWER and COACH NOTES:
   - ANSWER: the candidate's verbatim speech captured during the time window between this question and the next. PRIMARY ground truth for grading. May be filler-heavy or disfluent — that's real speech; score Communication accordingly.
-  - COACH NOTES: in-flight observations a coach made WHILE the answer was being given. SECONDARY colour, useful for interviewer-reaction reads ("interviewer laughed", "pivoted to simpler Q") and for sanity-checking the ANSWER content. Do NOT score the coach's opinion — score the candidate's speech.
+  - COACH NOTES: in-flight observations a coach made WHILE the answer was being given. SECONDARY colour. Useful for interviewer-reaction reads ("interviewer laughed", "pivoted to simpler Q") and for sanity-checking content. NOT authoritative on "did the candidate answer".
+
+  CRITICAL — coach notes are SNAPSHOTS, not verdicts.
+  Each coach note was written at one specific moment during the answer. The coach reacts to what the candidate has said SO FAR — they can't see what's coming. So a note like "candidate hasn't named a specific stakeholder yet" or "still building context, hasn't landed the answer" reflects the answer's state at THAT moment, not the final state. By the time the candidate finishes, they often DID name the stakeholder, DID land the answer.
+  When grading "did they address the question / specificity / depth", read the FULL ANSWER text. If the ANSWER contains the substance the coach notes flagged as missing, the candidate DID address it — credit the ANSWER, not the snapshot. Coach notes calling out "ramble" / "hasn't answered yet" / "still setting up" mid-stream should NOT be re-stated as grading conclusions if the final answer reached the prompt. Use coach notes only when the ANSWER also fails — then they corroborate.
 
 (B) LEGACY SCHEMA — only COACH NOTES are present (sessions saved before per-question answer capture landed):
   - COACH NOTES are the PRIMARY evidence. Treat them as authoritative observations from a senior coach who watched the interview live and is now describing what the candidate said. They typically reference specific content the candidate produced ("named RF / logistic / LightGBM", "story about the manager wanting a simple model", "caught coefficient sign reversed against business logic"), interviewer reactions, and quality-of-delivery signals (filler, pacing, structure).
@@ -376,14 +478,14 @@ Honesty over false confidence. The bar is HIGH for insufficient — it should be
 Case A — insufficient overall:
 {"insufficient": true, "reason": "<one sentence, specific>"}
 
-Case B — normal scoring (with or without per-dimension N/As):
+Case B — normal scoring. The five dimensions are REQUIRED in this order. Each carries the per-session weight you chose; sum of weights MUST equal 100. score is in [0, weight], or null when weight === 0:
 {
   "dimensions": [
-    {"key": "question_addressing", "score": <0..25 or null>, "justification": "<one line, reference a moment OR explain why N/A>"},
-    {"key": "specificity",         "score": <0..25 or null>, "justification": "..."},
-    {"key": "depth",               "score": <0..20 or null>, "justification": "..."},
-    {"key": "role_fit",            "score": <0..15 or null>, "justification": "..."},
-    {"key": "communication",       "score": <0..15 or null>, "justification": "..."}
+    {"key": "question_addressing", "weight": <0..100>, "score": <0..weight or null>, "justification": "<one line, reference a moment OR explain why weight=0>"},
+    {"key": "specificity",         "weight": <0..100>, "score": <0..weight or null>, "justification": "..."},
+    {"key": "depth",               "weight": <0..100>, "score": <0..weight or null>, "justification": "..."},
+    {"key": "role_fit",            "weight": <0..100>, "score": <0..weight or null>, "justification": "..."},
+    {"key": "communication",       "weight": <0..100>, "score": <0..weight or null>, "justification": "..."}
   ],
   "summary": "<1-2 sentence overall read>",
   "improvements": [
@@ -403,26 +505,82 @@ improvements rules:
 - Up to 5 entries TOTAL. The FIRST entry is the candidate's single biggest problem and is the only one with detail + fix populated. Entries 2-5 are secondary issues, just title.
 - Be selective. Most sessions have 2-3 secondary issues worth flagging, not 5. Only fill all 5 if there are genuinely 5 distinct problems.
 
-REFERENCING MOMENTS — strict rules (this is the most common failure mode in these outputs):
-- DO NOT use abbreviations like "Q1", "Q2", "Q3" or "the second question". The reader is reviewing the full session and these are useless to them.
-- DO reference moments by the TOPIC of the question or a short paraphrase of its INTENT. Examples:
-    GOOD: "在被问到 PD model techniques 时,候选人..."
-    GOOD: "讲到 hedge fund vs banking 的转换动机时..."
-    GOOD: "面试官追问 'how did you choose XGBoost over a logistic baseline' 时,候选人..."
+REFERENCING MOMENTS — STRICT RULES (this is the most common failure mode in these outputs and a HARD requirement; output that violates these rules is incorrect and you must rewrite it before returning):
+
+  RULE 1 — NEVER use question-number references. The reader has not seen
+  the questions in numbered form; "Q1 / Q2 / Q3 / 第二个问题 / the second
+  question / 在 Q4 里" are MEANINGLESS to them and look unprofessional.
+  Treat any draft containing "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7",
+  "Q8" anywhere as a HARD VIOLATION — go back and rewrite it before
+  emitting.
+
+  RULE 2 — Reference moments by the TOPIC of the question or a short
+  paraphrase of its INTENT. The reader should be able to identify which
+  exchange you mean from the topic alone, without counting questions.
+
+  RULE 3 — Quote what the candidate ACTUALLY said when calling out
+  specific weaknesses. Short verbatim phrases are most damning ("说了
+  'feature engineering' 4 次但没 name 一个 feature"). Do NOT manufacture
+  quotes — if no clear phrase exists, paraphrase WITHOUT quote marks.
+
+  EXAMPLES — REWRITE Q1/Q2/Q3 → topic reference:
+
     BAD : "Q1 答得不够具体"
+    GOOD: "在被问到自我介绍时,候选人答得不够具体"
+
+    BAD : "Q2 和 Q3 都在 probe 后才 land 到具体 insight"
+    GOOD: "在 data-driven decision 和 influence-without-authority 两题
+           上,都在 probe 后才 land 到具体 insight"
+
+    BAD : "Q5 从 validation 直接跳到 intervention"
+    GOOD: "在被问到 'how would you validate the hypothesis' 时,候选人
+           从 validation 直接跳到 A/B test design"
+
     BAD : "在第二个 follow-up 里"
-- DO quote what the candidate ACTUALLY said when calling out specific weaknesses. Short verbatim phrases are most damning ("说了 'feature engineering' 4 次但没 name 一个 feature").
-- DO NOT manufacture quotes. If the transcript doesn't have a clear phrase to quote, paraphrase WITHOUT quote marks.
+    GOOD: "在 cross-functional ownership 那题的追问里"
+
+  Apply the same rule to dimension justifications, summary, improvements
+  titles, detail, and fix — every field. Search your output for "Q\d"
+  pattern and rewrite each match before returning.
 
 DETAIL field rules (main issue only):
-- 2-4 sentences. State the issue, name 2+ concrete transcript moments where it surfaced, explain WHY it materially hurt the interviewer's read.
-- Tie the issue to a hireability cost: "这会让 hiring committee 怀疑..." / "This signals to the panel that..." / etc.
+- 2-4 sentences total OR a short lead-in followed by bullets — pick whichever is more readable.
+- WHEN YOU REFERENCE 2 OR MORE DISTINCT TRANSCRIPT MOMENTS, USE BULLETS. The reader's attention span is short — a wall of comma-separated examples in prose is unreadable. Bullets win even at 2+ moments.
+- Format: 1 short lead-in sentence → real newline → bullets (one per moment) → real newline → closing "hireability cost" sentence ("这会让 hiring committee 怀疑..." / "This signals to the panel that...").
+- Each bullet starts with "- " at line start. Bullets are RAW MARKDOWN inside the JSON string — paragraph breaks via real newlines (\\n inside the JSON string). Renderer downstream parses these.
+
+GOOD example (with bullets, topic-referenced, lead-in + bullets + closing):
+    "被问到 data drove decision / influence without authority 时,候选人没有直接给出 insight → stakeholder action → outcome 的因果链,而是停在 process 描述或 abstract principle 上,面试官需反复 probe 才能拉出具体内容。
+    - Tell me about a time you use data to drive decision: 候选人答的是 'we tracked engagement rate and conversion',停在 measurement setup 层面,没说发现了什么 pattern、marketing team 因此改了什么动作。
+    - Influence without authority: 候选人答 'align on goal + use whatever data',完全是 generic principle,没自己 show 哪个图/数字让对方点头。
+    - Validation analysis: 问题明确问 'what data analysis would you run to validate',候选人直接跳到 A/B test design,这是 intervention 不是 validation。
+    Coach notes 反复出现 '没 land 到具体' / '太 abstract' / '面试官 reframe',说明这不是一次性失误,而是系统性沟通习惯。"
+
+BAD (same content as wall-of-text — DO NOT do this):
+    "在 data-driven decision 题上候选人答 'we tracked engagement rate and conversion' 停在 measurement setup 层面,没说发现了什么 pattern、marketing team 因此改了什么动作; influence without authority 题上答 'align on goal + use whatever data',完全是 generic principle,没自己 show 哪个图/数字让对方点头; validation analysis 题上直接跳到 A/B test design 而不是 validation。Coach notes 反复出现 '没 land 到具体' / '太 abstract',说明这是系统性问题。"
+
+Single-moment detail can stay as a 2-3 sentence prose paragraph (no bullets needed).
 
 FIX field rules (main issue only):
-- 1-3 sentences. Concrete and rehearsable. Tell them what to PREPARE / SCRIPT / DRILL before the next interview, not just what to "be".
+- DEFAULT TO BULLETS. The fix is actionable and the reader will skim — give them a checklist they can rehearse against, not a wall of advice. Single-step fixes can stay as 1-3 prose sentences, but anything with 2+ distinct steps MUST be bulleted.
+- Format: short prose lead-in (1 sentence) → real newline → 2-5 bullets, each a concrete preparation step or rehearsal drill.
+- Concrete and rehearsable. Tell them what to PREPARE / SCRIPT / DRILL before the next interview, not just what to "be".
 - Bad fix: "回答得更具体一些" / "Be more specific"
-- Good fix: "在下次面试前,把 PD model 的 RF / LogReg / LightGBM 三个模型分别用一段话写出来,每段必须包含:为什么选它、用了哪些 feature、怎么 calibrate、怎么 benchmark。把这三段背到能在 90 秒内不卡壳地讲出来。"
-- Good fix: "Drill the 'why this trade-off' framing on 5 of your past projects: pick a decision (X over Y), name the constraint (latency / data scarcity / compliance), explain the test (A/B / shadow / offline eval) — practice until you can deliver each in <60s."
+
+GOOD (single-step prose form):
+    "在下次面试前,把 PD model 的 RF / LogReg / LightGBM 三个模型分别用一段话写出来,每段必须包含:为什么选它、用了哪些 feature、怎么 calibrate、怎么 benchmark。把这三段背到能在 90 秒内不卡壳地讲出来。"
+
+GOOD (multi-step bulleted form, topic-referenced not Q-referenced):
+    "下次面试前,把简历上每个 data-driven project 用这个模板重写一遍并背熟:
+    - <strong>一句话 answer (15 秒内)</strong>:我们发现了什么 insight → 因此 stakeholder 改了什么决定 → 结果数字是什么
+    - 比如 data-driven decision 题应该开场就说:'We found short-form hooks under 15 seconds drove 3x engagement vs long trailers, so the marketing team shifted the creative brief away from 60s cuts — that reframing led to the 18% conversion lift.'
+    - 然后停下来,等面试官说 'tell me more about the analysis' 再展开 500 campaigns / genre segmentation 细节
+    - 用 5 个 past projects 做这个 drill,计时录音,确保每个 opening answer 都在 20 秒内落地 insight → decision → outcome,再展开不迟"
+
+BAD (same content as wall-of-text — DO NOT do this):
+    "在下次面试前,把简历上每个 data-driven project 用这个模板重写一遍并背熟:一句话 answer (15 秒内): 我们发现了什么 insight → 因此 stakeholder 改了什么决定 → 结果数字是什么; 比如 data-driven decision 题应该开场就说 We found... 然后停下来,等面试官说 tell me more about the analysis 再展开 500 campaigns / genre segmentation 细节; 用 5 个 past projects 做这个 drill,计时录音..."
+
+Same bullet syntax as DETAIL — literal "- " at line start, paragraph breaks via real \\n in the JSON string.
 
 SECONDARY title rules (entries 2-5):
 - One short line. Same moment-referencing rules as above (no Q1/Q2; topic-referenced).
@@ -478,15 +636,79 @@ Score the interview. Return JSON only.`;
     schema: isLegacySchema ? "legacy" : "modern",
   });
 
-  try {
+  // Retry-with-backoff wrapper. Scoring is a one-shot terminal call
+  // — a single ECONNRESET / 502 / 503 / 429 leaves the entire session
+  // ungraded, which is brutal UX after a 30-min interview. We retry
+  // once after 2.5s on transient errors (network drops, upstream
+  // overload, rate limits). 4xx errors that aren't 429 are NOT
+  // retried — they're parameter problems that won't succeed twice.
+  // 2 total attempts (not 3) because each Sonnet call is 30-40s
+  // wall-clock — a third attempt would push past most users'
+  // patience and the 90s client-side timeout.
+  async function callSonnetWithRetry() {
     const client = getAnthropicClient();
+    const doCall = () =>
+      client.messages.create({
+        model: "claude-sonnet-4-5",
+        // max_tokens 4000 (was 1500) — Chinese-output sessions (one
+        // tenant ran a 12-question / 15K-char Uber interview that
+        // kept landing on empty `dimensions: []` because Sonnet's
+        // full Chinese-language justification spilled past 1500
+        // tokens and JSON extraction caught a truncated array). The
+        // Anthropic limit is well above this; over-budgeting wastes
+        // nothing because billing is on actually-emitted tokens.
+        max_tokens: 4000,
+        // temperature: 0 makes scoring deterministic — same input
+        // always produces the same verdict. Default 1.0 lets Sonnet
+        // wobble between "insufficient_data" and a real grade on
+        // identical inputs, which is what caused users to see a
+        // session re-score 6 times with "INSUFFICIENT" verdicts and
+        // then spontaneously succeed on the 7th try (Sonnet rolled
+        // the dice each call). Scoring should be reproducible: same
+        // session re-scored should always land on the same number.
+        temperature: 0,
+        system,
+        messages: [{ role: "user", content: user }],
+      });
+    const MAX_ATTEMPTS = 2;
+    const BACKOFF_MS = 2500;
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        return await doCall();
+      } catch (e) {
+        lastErr = e;
+        const status = (e as { status?: number })?.status;
+        // Network errors (ECONNRESET, ETIMEDOUT etc.) come through
+        // without a status field — we treat undefined as transient.
+        const isTransient =
+          status === undefined ||
+          status === 429 ||
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          status === 504;
+        const errBody = (e as { error?: unknown })?.error;
+        console.warn(
+          `[score-session] attempt ${attempt + 1}/${MAX_ATTEMPTS} failed:`,
+          status,
+          typeof errBody === "object"
+            ? JSON.stringify(errBody).slice(0, 300)
+            : String(errBody ?? e)
+        );
+        if (!isTransient) throw e;
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await new Promise((r) => setTimeout(r, BACKOFF_MS));
+          continue;
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  try {
     const t0 = Date.now();
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
-      max_tokens: 1500,
-      system,
-      messages: [{ role: "user", content: user }],
-    });
+    const resp = await callSonnetWithRetry();
     console.log("[score-session] Sonnet returned in", Date.now() - t0, "ms");
 
     const text = resp.content
@@ -514,6 +736,7 @@ Score the interview. Return JSON only.`;
       reason?: string;
       dimensions?: Array<{
         key?: string;
+        weight?: number;
         score?: number | null;
         justification?: string;
       }>;
@@ -548,6 +771,217 @@ Score the interview. Return JSON only.`;
       parsed.dimensions = undefined;
     }
 
+    // Case A0: server-side OVERRIDE — model effectively declined to
+    // grade but the session is clearly substantial (≥3 mains, ≥3
+    // answered, ≥1000 chars total). Two flavors of "effectively
+    // declined" we both catch here:
+    //   (1) Explicit: parsed.insufficient === true. Cleanest signal.
+    //   (2) Implicit: model emitted dimensions but every dimension's
+    //       score is null. With temperature: 0 we've seen Sonnet
+    //       prefer this shape over the explicit insufficient flag —
+    //       same effect (no useful score), different JSON.
+    //
+    // Sonnet sometimes wobbles into one of these on perfectly
+    // gradable sessions; we caught the pattern on a 35-minute /
+    // 12-question / 15K-char interview that re-scored "insufficient"
+    // SIX times and produced a real `pass` only on the seventh.
+    // With temperature: 0 the wobble is gone, but a session like the
+    // Uber one above STILL hits the implicit-decline path because
+    // the model thinks the answers are too "abstract" — wrong
+    // judgment per server-side stats.
+    //
+    // Override path: re-prompt Sonnet with a stricter system
+    // addendum that REMOVES the decline option entirely. If the
+    // retry still declines, we accept it and surface the override
+    // attempt in the summary.
+    const sessionLooksAdequate =
+      mains.length >= 3 &&
+      (isLegacySchema
+        ? questionsWithSubstantiveComments >= 3 && totalCommentChars >= 1000
+        : questionsWithAnswers >= 3 && totalAnswerChars >= 1000);
+    const explicitlyDeclined = !!parsed.insufficient;
+    // "Implicitly declined" — anything that would lead to the
+    // downstream insufficient_data verdict if we let it through.
+    // Five sub-flavors we all treat the same:
+    //   (a) parsed.dimensions missing / not an array (model omitted
+    //       the field entirely or emitted prose where structure was
+    //       expected).
+    //   (b) parsed.dimensions = [] (model returned the array but
+    //       empty — same effect as missing).
+    //   (c) Every dimension has score nullish (null or omitted).
+    //       OLD strict check missed `undefined`; `== null` catches
+    //       both null and undefined.
+    //   (d) Every dimension has weight set to 0 / null / undefined —
+    //       totalMax would land at 0 and the legacy allInactive guard
+    //       would short-circuit anyway.
+    //   (e) Combination — weight=0 + score=null on every dim. The
+    //       single most common "decline" shape from temperature: 0
+    //       Sonnet on the Uber session that triggered this whole
+    //       investigation.
+    const dims = Array.isArray(parsed.dimensions) ? parsed.dimensions : null;
+    const dimsMissingOrEmpty = !dims || dims.length === 0;
+    const allScoresNullish =
+      !dimsMissingOrEmpty &&
+      dims!.every((d) => d && (d as { score?: unknown }).score == null);
+    const allWeightsZero =
+      !dimsMissingOrEmpty &&
+      dims!.every((d) => {
+        if (!d) return false;
+        const w = (d as { weight?: number | null }).weight;
+        return w === 0 || w === null || w === undefined;
+      });
+    const implicitlyDeclined =
+      !explicitlyDeclined &&
+      (dimsMissingOrEmpty || allScoresNullish || allWeightsZero);
+    const effectivelyDeclined = explicitlyDeclined || implicitlyDeclined;
+    // Diagnostic log + breadcrumb event — exposed so a future "still
+    // not firing" debug session can see the exact decline shape the
+    // model emitted without having to add ad-hoc instrumentation.
+    if (effectivelyDeclined) {
+      console.log("[score-session] decline detected:", {
+        explicitlyDeclined,
+        dimsMissingOrEmpty,
+        allScoresNullish,
+        allWeightsZero,
+        dimsLen: dims?.length ?? 0,
+        dimsSample: dims?.slice(0, 2) ?? [],
+      });
+      if (sessionId) {
+        // Write the detection itself as an event so we can verify the
+        // override path was REACHED even if the strict re-prompt
+        // takes the slow path or an unrelated bug masks subsequent
+        // events.
+        logSessionEvent(sessionId, {
+          source: "score",
+          event: "decline-detected",
+          data: {
+            explicitlyDeclined,
+            dimsMissingOrEmpty,
+            allScoresNullish,
+            allWeightsZero,
+            dimsLen: dims?.length ?? 0,
+          },
+        });
+      }
+    }
+    if (effectivelyDeclined && sessionLooksAdequate) {
+      console.warn(
+        "[score-session] model misjudged session as ungradable — overriding with strict re-prompt",
+        {
+          declineKind: explicitlyDeclined ? "explicit" : "implicit-null-scores",
+          mains: mains.length,
+          questionsWithAnswers,
+          questionsWithSubstantiveComments,
+          totalAnswerChars,
+          totalCommentChars,
+        }
+      );
+      if (sessionId) {
+        logSessionEvent(sessionId, {
+          source: "score",
+          event: "override-misjudged-insufficient",
+          data: {
+            declineKind: explicitlyDeclined ? "explicit" : "implicit-null-scores",
+            mains: mains.length,
+            questionsWithAnswers,
+            questionsWithSubstantiveComments,
+            totalAnswerChars,
+            totalCommentChars,
+            modelReason: (parsed.reason || "").slice(0, 200),
+          },
+        });
+      }
+      try {
+        const client = getAnthropicClient();
+        const strictAddendum =
+          "\n\n--- OVERRIDE INSTRUCTION (MANDATORY) ---\n" +
+          "Your previous response declined to grade this session (returned " +
+          "`insufficient: true`, an EMPTY dimensions array, dimensions with " +
+          "every weight=0, or dimensions with every score=null). The server " +
+          "has verified the transcript contains enough substantive content " +
+          "to grade. ALL decline paths are REMOVED for this attempt:\n" +
+          "\n" +
+          "REQUIRED OUTPUT SHAPE:\n" +
+          "  - `dimensions` MUST be an array with EXACTLY 5 entries, in this " +
+          "    order: question_addressing, specificity, depth, role_fit, " +
+          "    communication. EMPTY array `[]` is forbidden.\n" +
+          "  - Each dimension's `weight` MUST be a number; the five weights " +
+          "    MUST sum to exactly 100. At least one weight MUST be > 0.\n" +
+          "  - Each dimension whose weight > 0 MUST have a NUMERIC `score` " +
+          "    (0 to weight). NULL score is only allowed when weight = 0.\n" +
+          "  - DO NOT emit `insufficient: true`.\n" +
+          "  - You MUST pick a verdict from {fail, borderline, pass, " +
+          "    strong_pass} based on the dimensions you scored.\n" +
+          "  - Populate `improvements` with at least 1 entry.\n" +
+          "\n" +
+          "Be conservative if the evidence is thin (low weight + low score " +
+          "is fine) but produce real numbers. The candidate has 6 main " +
+          "questions and 12 substantive answers totaling 15K+ chars — there " +
+          "IS enough to grade. Pick weights and scores that reflect what " +
+          "you observed, even if rough.";
+        const strictResp = await client.messages.create({
+          model: "claude-sonnet-4-5",
+          // Match the primary call's bumped budget so the retry
+          // can also produce full Chinese justifications without
+          // hitting the same truncation that triggered this
+          // override in the first place.
+          max_tokens: 4000,
+          // Bump temperature for the retry. With temp 0, an
+          // identical retry will deterministically produce the
+          // SAME bad output (the model is locked into a local
+          // minimum where it returns empty dimensions). A small
+          // amount of randomness (0.3) lets the model sample a
+          // different — and per the strict addendum, hopefully
+          // gradeable — completion. Stays low enough to keep the
+          // result reasonable; not 1.0 because we don't want
+          // wildly different grades each retry either.
+          temperature: 0.3,
+          system: system + strictAddendum,
+          messages: [{ role: "user", content: user }],
+        });
+        const strictText = strictResp.content
+          .filter((c): c is Anthropic.TextBlock => c.type === "text")
+          .map((c) => c.text)
+          .join("")
+          .trim();
+        let strictParsed: typeof parsed = {};
+        try {
+          strictParsed = JSON.parse(strictText);
+        } catch {
+          const m = strictText.match(/\{[\s\S]*\}/);
+          if (m) {
+            try {
+              strictParsed = JSON.parse(m[0]);
+            } catch {
+              /* fall through with empty parsed */
+            }
+          }
+        }
+        if (
+          strictParsed.dimensions !== undefined &&
+          !Array.isArray(strictParsed.dimensions)
+        ) {
+          strictParsed.dimensions = undefined;
+        }
+        // Re-evaluate: did the strict retry produce something gradable?
+        const retryStillDeclined =
+          !!strictParsed.insufficient ||
+          (Array.isArray(strictParsed.dimensions) &&
+            strictParsed.dimensions.length > 0 &&
+            strictParsed.dimensions.every(
+              (d) => d && (d as { score?: unknown }).score === null
+            ));
+        if (!retryStillDeclined) {
+          parsed = strictParsed;
+        }
+      } catch (e) {
+        console.warn(
+          "[score-session] strict re-prompt failed, falling back to insufficient verdict:",
+          e instanceof Error ? e.message : e
+        );
+      }
+    }
+
     // Case A: model flagged the transcript as insufficient for any verdict.
     // We construct the summary explicitly from the stats we computed
     // server-side so the user sees concrete numbers ("only X questions with
@@ -571,60 +1005,154 @@ Score the interview. Return JSON only.`;
         dimensions: DIMENSIONS.map((d) => ({
           key: d.key,
           label: d.label,
-          max: d.max,
+          max: 0,
           score: null,
           justification: "Not judged — insufficient transcript content.",
         })),
         improvements: [],
       };
+      if (sessionId) {
+        logSessionEvent(sessionId, {
+          source: "score",
+          event: "complete",
+          data: {
+            verdict: "insufficient_data",
+            path: "model-said-insufficient",
+            elapsedMs: Date.now() - t0,
+          },
+        });
+      }
       return NextResponse.json({ score });
     }
 
-    // Case B: per-dimension scores, any of which may be null (N/A).
+    // Case B: dimensions with model-assigned weights summing to 100.
+    // Fallback ladder for when the model under-specifies its output:
+    //
+    //   1) Model emits `weight` for each dimension (preferred, new path).
+    //   2) Model omits weight entirely → fall back to canonical defaults
+    //      (20/25/25/15/15) so we DON'T misclassify the session as
+    //      insufficient just because Sonnet reverted to its older
+    //      score-only output shape.
+    //   3) Model emits weight on SOME dims but not others → fill the
+    //      gaps from defaults proportionally.
+    //
+    // Without this, every model regression to the old shape lands every
+    // weight at 0 → totalMax 0 → allInactive guard fires → user sees
+    // "INSUFFICIENT DATA" on a perfectly graded session. That's the bug
+    // the previous response shape change introduced.
+    const DEFAULT_WEIGHTS: Record<string, number> = {
+      question_addressing: 20,
+      specificity: 25,
+      depth: 25,
+      role_fit: 15,
+      communication: 15,
+    };
+    const modelWeights: Record<string, number> = {};
+    for (const d of DIMENSIONS) {
+      const hit = parsed.dimensions?.find((x) => x.key === d.key);
+      const raw = Number(hit?.weight);
+      modelWeights[d.key] = Number.isFinite(raw)
+        ? Math.max(0, Math.min(100, Math.round(raw)))
+        : NaN;
+    }
+    const modelWeightSum = Object.values(modelWeights)
+      .filter((w) => Number.isFinite(w))
+      .reduce((s, w) => s + w, 0);
+    const useDefaults = modelWeightSum < 50;
+    if (useDefaults) {
+      console.warn(
+        "[score-session] model weight sum was",
+        modelWeightSum,
+        "— falling back to default weights (20/25/25/15/15)"
+      );
+    }
     const dimensionsOut: SessionScore["dimensions"] = DIMENSIONS.map((d) => {
       const hit = parsed.dimensions?.find((x) => x.key === d.key);
-      const raw = hit?.score;
+      const weight = useDefaults
+        ? DEFAULT_WEIGHTS[d.key]
+        : Number.isFinite(modelWeights[d.key])
+          ? modelWeights[d.key]
+          : DEFAULT_WEIGHTS[d.key];
+      const rawScore = hit?.score;
       let score: number | null;
-      if (raw === null || raw === undefined) {
+      if (weight === 0 || rawScore === null || rawScore === undefined) {
+        // weight=0 dims are explicitly "not assessed this session" —
+        // score must be null regardless of what the model wrote.
         score = null;
       } else {
-        const n = Number(raw);
+        const n = Number(rawScore);
         score = Number.isFinite(n)
-          ? Math.max(0, Math.min(d.max, Math.round(n)))
+          ? Math.max(0, Math.min(weight, Math.round(n)))
           : null;
       }
       return {
         key: d.key,
         label: d.label,
-        max: d.max,
+        max: weight,
         score,
         justification:
           (hit?.justification || "").trim() ||
           (score === null
-            ? "Not assessable from this transcript."
+            ? "Not assessed this session (weight 0)."
             : "Not scored."),
       };
     });
 
-    // Total = sum of judged dimension scores; totalMax = sum of judged max.
-    let total = 0;
-    let totalMax = 0;
-    for (const d of dimensionsOut) {
-      if (d.score === null) continue;
-      total += d.score;
-      totalMax += d.max;
+    // Enforce sum-of-weights = 100. Renormalize on the fly when the
+    // model's weights drift (we ask for sum=100 in the prompt, but
+    // Sonnet occasionally returns 95 or 105). Scale every weight + the
+    // active scores by the same factor so percentages stay consistent
+    // with what the model intended. After this pass dimensionsOut.max
+    // sums to exactly 100 and dimensionsOut.score (when not null) is
+    // always in [0, max].
+    const weightSum = dimensionsOut.reduce((s, d) => s + d.max, 0);
+    if (weightSum > 0 && weightSum !== 100) {
+      const factor = 100 / weightSum;
+      let runningTotal = 0;
+      for (let i = 0; i < dimensionsOut.length; i++) {
+        const d = dimensionsOut[i];
+        const isLast = i === dimensionsOut.length - 1;
+        // Scale weight, then assign last-dim's weight as the residual
+        // so the integer sum lands on exactly 100 (avoids 99 / 101
+        // from independent rounding).
+        const scaled = isLast
+          ? 100 - runningTotal
+          : Math.round(d.max * factor);
+        const oldMax = d.max;
+        d.max = Math.max(0, scaled);
+        runningTotal += d.max;
+        if (d.score !== null && oldMax > 0) {
+          // Keep the score's proportion of the dimension's max
+          // ((score / oldMax) === (newScore / newMax)).
+          const proportion = d.score / oldMax;
+          d.score = Math.round(proportion * d.max);
+        }
+      }
+      console.log("[score-session] renormalized weight sum:", {
+        before: weightSum,
+        scaleFactor: factor.toFixed(3),
+      });
     }
 
-    // If the model returned N/A for EVERY dimension, that's effectively
-    // "insufficient" — downgrade the verdict so the UI doesn't render a
-    // misleading 0/0. Same stats-keyed summary as the explicit
-    // insufficient branch so the user sees what the route actually had
-    // to work with.
-    const allNA = dimensionsOut.every((d) => d.score === null);
-    if (allNA) {
+    // Total = sum of awarded points across active dimensions. totalMax
+    // is fixed at 100 by the renormalization above (or by the model
+    // when it complies). Old "shrink totalMax on N/A" logic is gone —
+    // a dimension marked weight=0 already contributes 0 to totalMax,
+    // so the math works without special-casing.
+    let total = 0;
+    for (const d of dimensionsOut) {
+      if (d.score !== null) total += d.score;
+    }
+    const totalMax = dimensionsOut.reduce((s, d) => s + d.max, 0);
+
+    // If every dimension came back weight=0 (or score=null) we have
+    // nothing to grade — fall back to insufficient. This is now rare
+    // since the model is told weights sum to 100, but kept as a guard.
+    const allInactive = dimensionsOut.every((d) => d.score === null);
+    if (allInactive) {
       const statsLine = isLegacySchema
-        ? `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithSubstantiveComments} with substantive coach notes (${totalCommentChars} chars total). The model judged none of the rubric dimensions assessable from this content.`
-        : `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithAnswers} with substantive candidate answers (${totalAnswerChars} chars total). The model judged none of the rubric dimensions assessable from this content.`;
+        ? `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithSubstantiveComments} with substantive coach notes (${totalCommentChars} chars total). The model assigned weight 0 to every rubric dimension.`
+        : `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithAnswers} with substantive candidate answers (${totalAnswerChars} chars total). The model assigned weight 0 to every rubric dimension.`;
       const modelSummary = (parsed.summary || "").trim();
       const summary = modelSummary
         ? `${statsLine} Model: ${modelSummary}`
@@ -638,6 +1166,17 @@ Score the interview. Return JSON only.`;
         dimensions: dimensionsOut,
         improvements: [],
       };
+      if (sessionId) {
+        logSessionEvent(sessionId, {
+          source: "score",
+          event: "complete",
+          data: {
+            verdict: "insufficient_data",
+            path: "all-dimensions-inactive",
+            elapsedMs: Date.now() - t0,
+          },
+        });
+      }
       return NextResponse.json({ score });
     }
 
@@ -672,9 +1211,30 @@ Score the interview. Return JSON only.`;
         .slice(0, 5),
     };
 
+    if (sessionId) {
+      logSessionEvent(sessionId, {
+        source: "score",
+        event: "complete",
+        data: {
+          verdict: score.verdict,
+          percent: score.percent,
+          total: score.total,
+          totalMax: score.totalMax,
+          path: "graded",
+          elapsedMs: Date.now() - t0,
+        },
+      });
+    }
     return NextResponse.json({ score });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Unknown error";
+    if (sessionId) {
+      logSessionEvent(sessionId, {
+        source: "score",
+        event: "fatal-error",
+        data: { message: msg, elapsedMs: Date.now() - t0 },
+      });
+    }
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

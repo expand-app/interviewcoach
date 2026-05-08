@@ -1,7 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useStore } from "@/lib/store";
+import {
+  getDebugEvents,
+  getEventsVersion,
+  getResetSeq,
+  subscribeDebugEvents,
+  type DebugEvent,
+} from "@/lib/debug-buffer";
 
 /**
  * Live Debug Panel — right-rail real-time view of the session log.
@@ -217,42 +224,59 @@ const REASONING: Record<
   },
 };
 
-// Parse one log line into a structured entry. Returns null for header
-// lines (starting with `#`) and blank lines.
-interface LogEntry {
+// Structured entry derived from a DebugEvent. The render layer below
+// originally parsed text log lines (`mm:ss.mmm  [source]  event data`)
+// pulled from the file-based logger. Phase 2 swapped the file for a
+// client-side ring buffer of DebugEvent objects, but we kept the
+// LogEntry shape so the render didn't need to change — the conversion
+// happens in `entriesFromEvents` below.
+export interface LogEntry {
   lineIdx: number;
-  raw: string;
-  time: string;        // mm:ss.mmm
-  tSec: number;        // seconds from session start
-  source: string;      // e.g. "commentary"
-  event: string;       // e.g. "request"
-  data: string;        // everything after the event tag, trimmed
-  key: string;         // source:event
+  raw: string;        // pretty `mm:ss.mmm  [source]  event  data` line
+  time: string;       // mm:ss.mmm
+  tSec: number;       // seconds from session start
+  source: string;     // e.g. "commentary"
+  event: string;      // e.g. "request"
+  data: string;       // payload as JSON-ish text; truncated for display
+  key: string;        // source:event — used by the REASONING dictionary
 }
 
-function parseLine(raw: string, idx: number): LogEntry | null {
-  if (!raw.trim() || raw.startsWith("#")) return null;
-  // format: "mm:ss.mmm  [source      ]  event       data..."
-  const m = raw.match(
-    /^(\d{2}):(\d{2})\.(\d{3})\s+\[([^\]]+)\]\s+(\S+)(.*)$/
-  );
-  if (!m) return null;
-  const mm = parseInt(m[1], 10);
-  const ss = parseInt(m[2], 10);
-  const ms = parseInt(m[3], 10);
-  const source = m[4].trim();
-  const event = m[5].trim();
-  const data = (m[6] || "").trim();
-  return {
-    lineIdx: idx,
-    raw,
-    time: `${m[1]}:${m[2]}.${m[3]}`,
-    tSec: mm * 60 + ss + ms / 1000,
-    source,
-    event,
-    data,
-    key: `${source}:${event}`,
-  };
+function fmtMs(ms: number): string {
+  const total = Math.max(0, ms);
+  const mm = Math.floor(total / 60_000).toString().padStart(2, "0");
+  const ss = Math.floor((total % 60_000) / 1000).toString().padStart(2, "0");
+  const msPart = Math.floor(total % 1000).toString().padStart(3, "0");
+  return `${mm}:${ss}.${msPart}`;
+}
+
+function dataToText(d: unknown): string {
+  if (d === undefined || d === null) return "";
+  if (typeof d === "string") return d;
+  try {
+    return JSON.stringify(d);
+  } catch {
+    return String(d);
+  }
+}
+
+export function entriesFromEvents(events: readonly DebugEvent[]): LogEntry[] {
+  const out: LogEntry[] = [];
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    const time = fmtMs(e.atMs);
+    const dataText = dataToText(e.data).replace(/\s+/g, " ").slice(0, 400);
+    out.push({
+      lineIdx: i,
+      raw: `${time}  [${e.source.padEnd(12).slice(0, 12)}]  ${e.event.padEnd(10).slice(0, 10)}${dataText ? "  " + dataText : ""}`,
+      time,
+      tSec: e.atMs / 1000,
+      source: e.source,
+      event: e.event,
+      data: dataText,
+      key: `${e.source}:${e.event}`,
+    });
+  }
+  return out;
 }
 
 interface UserComment {
@@ -275,49 +299,51 @@ function fmtTime(sec: number): string {
 export function LiveDebugPanel() {
   const elapsedSec = useStore((s) => s.live.elapsedSeconds);
 
-  // Poll the log file. 1.5s is plenty — events are typically seconds
-  // apart and this is dev infrastructure, not a production path.
-  const [rawLog, setRawLog] = useState<string>("");
-  const [mtime, setMtime] = useState<number>(0);
-  useEffect(() => {
-    let aborted = false;
-    const tick = async () => {
-      try {
-        const res = await fetch("/api/debug-log/read", {
-          cache: "no-store",
-        });
-        if (!res.ok) return;
-        const data = (await res.json()) as {
-          content: string;
-          mtime: number;
-          size: number;
-        };
-        if (aborted) return;
-        if (data.mtime !== mtime) {
-          setRawLog(data.content);
-          setMtime(data.mtime);
-        }
-      } catch {
-        /* ignore — log will refresh on next tick */
-      }
-    };
-    void tick();
-    const id = setInterval(() => void tick(), 1500);
-    return () => {
-      aborted = true;
-      clearInterval(id);
-    };
-  }, [mtime]);
+  // Phase 2: subscribe to the in-memory debug buffer instead of
+  // polling a file. Two subtleties make this fiddly:
+  //
+  // 1) The snapshot is a VERSION NUMBER (primitive), not the events
+  //    array. pushDebugEvent mutates the buffer in place, so its
+  //    array reference is stable across pushes. React's Object.is
+  //    bails out on stable references, silently skipping every
+  //    re-render. Returning the version number forces a fresh
+  //    Object.is comparison on each push.
+  //
+  // 2) Downstream useMemos that compute `entries` / `rawLog` /
+  //    `reversedEntries` MUST depend on the version too, NOT on
+  //    `events`. Same root cause: `events` reference never changes,
+  //    so a useMemo([events]) caches its result forever even when
+  //    the buffer's contents have grown. Threading the version
+  //    through every memo ensures they recompute on each push.
+  const version = useSyncExternalStore(
+    subscribeDebugEvents,
+    getEventsVersion,
+    () => 0
+  );
+  const events = getDebugEvents();
+  const resetSeq = useSyncExternalStore(
+    subscribeDebugEvents,
+    getResetSeq,
+    () => 0
+  );
 
-  const entries: LogEntry[] = useMemo(() => {
-    const lines = rawLog.split("\n");
-    const out: LogEntry[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const e = parseLine(lines[i], i);
-      if (e) out.push(e);
-    }
-    return out;
-  }, [rawLog]);
+  const entries: LogEntry[] = useMemo(
+    () => entriesFromEvents(events),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [version]
+  );
+
+  // Build the raw-text view of the log for the copy/analyze flows.
+  // Recreate the format the file-based logger used (`mm:ss.mmm
+  // [source] event data`) plus a header, so analyze-session prompts
+  // and pasted debriefs still parse the same shape.
+  const rawLog = useMemo(() => {
+    const header =
+      `# puebulo debug log · ${new Date().toISOString()}\n` +
+      `# format: mm:ss.mmm  [source]  event  data\n`;
+    const body = entries.map((e) => e.raw).join("\n");
+    return body ? header + body + "\n" : header;
+  }, [entries]);
 
   // Newest-first view of the entries. The user's workflow is "glance
   // at the panel, see what just happened, decide if it's broken" — so
@@ -335,24 +361,14 @@ export function LiveDebugPanel() {
   // tSec < 0.5 — means the log just rotated.
   const [comments, setComments] = useState<UserComment[]>([]);
   const [draft, setDraft] = useState("");
-  // Clear comments whenever the log rotates (new session). We detect
-  // this by the first entry's key being session:start or session:reset
-  // with a very small tSec (<0.5s) and a new mtime — the log just
-  // rebooted.
-  const lastResetMtimeRef = useRef(0);
+  // Clear comments whenever the buffer resets (new session boundary).
+  // resetSeq is bumped by lib/debug-buffer's resetDebugBuffer().
+  const lastResetSeqRef = useRef(0);
   useEffect(() => {
-    if (!mtime) return;
-    if (mtime === lastResetMtimeRef.current) return;
-    const first = entries[0];
-    if (
-      first &&
-      (first.key === "session:reset" || first.key === "session:start") &&
-      first.tSec < 0.5
-    ) {
-      setComments([]);
-      lastResetMtimeRef.current = mtime;
-    }
-  }, [entries, mtime]);
+    if (resetSeq === lastResetSeqRef.current) return;
+    setComments([]);
+    lastResetSeqRef.current = resetSeq;
+  }, [resetSeq]);
 
   const addComment = () => {
     const text = draft.trim();
@@ -394,7 +410,7 @@ export function LiveDebugPanel() {
 
   const copyDebrief = async () => {
     const lines: string[] = [];
-    lines.push("# Interview Coach — session debrief\n");
+    lines.push("# puebulo — session debrief\n");
     lines.push("## User comments (pinned to timestamps)\n");
     if (comments.length === 0) {
       lines.push("_no comments_\n");
@@ -481,7 +497,7 @@ export function LiveDebugPanel() {
       const findings = data.findings || [];
       // Format as markdown and copy to clipboard.
       const md: string[] = [];
-      md.push("# Interview Coach — auto-diagnosis\n");
+      md.push("# puebulo — auto-diagnosis\n");
       if (data.summary) md.push(`**Summary:** ${data.summary}\n`);
       md.push(`## Findings (${findings.length})\n`);
       if (findings.length === 0) {
@@ -588,7 +604,10 @@ export function LiveDebugPanel() {
                 <span className="flex-1 text-ink">{c.text}</span>
                 <button
                   onClick={() => removeComment(c.id)}
-                  className="text-ink-lighter hover:text-rose-600 opacity-0 group-hover:opacity-100 text-[11px]"
+                  className="text-text-subtle opacity-0 group-hover:opacity-100 text-[11px] transition-colors"
+                  style={{ color: "var(--color-text-subtle)" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.color = "var(--color-error)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = "var(--color-text-subtle)")}
                   aria-label="Delete comment"
                 >
                   ×
@@ -613,7 +632,7 @@ export function LiveDebugPanel() {
           <button
             onClick={addComment}
             disabled={!draft.trim()}
-            className="px-2.5 py-1.5 text-[11.5px] font-semibold rounded-md bg-accent text-white hover:bg-[#1a73d1] disabled:bg-paper-hover disabled:text-ink-lighter disabled:cursor-not-allowed transition-colors"
+            className="btn btn-primary btn-sm"
           >
             Pin
           </button>
@@ -622,18 +641,19 @@ export function LiveDebugPanel() {
           <button
             onClick={copyDebrief}
             disabled={entries.length === 0 && comments.length === 0}
-            className={`flex-1 px-3 py-2 text-[12px] font-semibold rounded-md transition-colors ${
+            className="flex-1 btn btn-primary"
+            style={
               copyFlash
-                ? "bg-emerald-600 text-white"
-                : "bg-ink text-paper hover:bg-[#1f1e1a] disabled:bg-paper-hover disabled:text-ink-lighter"
-            }`}
+                ? { background: "var(--color-success)", borderColor: "var(--color-success)" }
+                : undefined
+            }
           >
             {copyFlash ? "Copied ✓" : "Copy debrief"}
           </button>
           <button
             onClick={analyzeSession}
             disabled={analyzing || entries.length === 0}
-            className="flex-1 px-3 py-2 text-[12px] font-semibold rounded-md bg-accent text-white hover:bg-[#1a73d1] disabled:bg-paper-hover disabled:text-ink-lighter transition-colors"
+            className="flex-1 btn btn-primary"
             title="Run auto-diagnosis: an Opus pass over the session's log + transcript, returns a list of bugs / improvements. Copied as markdown for pasting into Claude."
           >
             {analyzing ? "Analyzing…" : "Analyze & copy"}
@@ -651,7 +671,7 @@ export function LiveDebugPanel() {
 
 // ---------- helpers ----------
 
-function LogLine({ entry }: { entry: LogEntry }) {
+export function LogLine({ entry }: { entry: LogEntry }) {
   const [expanded, setExpanded] = useState(false);
   const reasoning = REASONING[entry.key];
   const sourceColor = SOURCE_COLORS[entry.source] ?? "text-ink-light";

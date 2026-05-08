@@ -36,7 +36,7 @@ interface Finding {
 }
 
 /**
- * Auto-diagnose an Interview Coach session.
+ * Auto-diagnose a puebulo session.
  *
  * Given the debug log (events + timestamps) and the transcript (what
  * was actually said), an Opus-4.7 pass identifies behavioral bugs and
@@ -59,7 +59,7 @@ export async function POST(req: Request) {
 
   const client = getAnthropicClient();
 
-  const system = `You are an expert QA engineer for "Interview Coach", a live
+  const system = `You are an expert QA engineer for "puebulo", a live
 coaching app that listens to interviews and overlays real-time AI
 commentary. Your job is to REVIEW A SESSION and identify APP BUGS
 and COACHING-QUALITY ISSUES — not critique the candidate or
@@ -178,7 +178,7 @@ not useful.`;
         "\n=== END USER COMMENTS ===\n"
       : "";
 
-  const user = `Analyze the following Interview Coach session.
+  const user = `Analyze the following puebulo session.
 
 === TRANSCRIPT ===
 ${transcript || "(no transcript captured)"}

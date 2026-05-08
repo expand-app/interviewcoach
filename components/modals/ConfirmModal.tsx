@@ -1,6 +1,7 @@
 "use client";
 
 import { ModalShell } from "./ModalShell";
+import { Button } from "@/components/ui";
 
 interface Props {
   open: boolean;
@@ -8,7 +9,9 @@ interface Props {
   description: React.ReactNode;
   confirmLabel: string;
   cancelLabel: string;
-  /** "primary" = blue button, "danger" = red destructive. */
+  /** "primary" = mono black confirm button (the standard).
+   *  "danger" = error-color confirm for destructive actions like
+   *  Discard, Delete, Sign-out-without-saving. */
   tone?: "primary" | "danger";
   onCancel: () => void;
   onConfirm: () => void;
@@ -24,29 +27,30 @@ export function ConfirmModal({
   onCancel,
   onConfirm,
 }: Props) {
-  const confirmClass =
+  // Danger tone overrides the Button's mono background with the
+  // design system's error color via inline style. Avoids polluting
+  // the global .btn-primary rule with a danger variant — only this
+  // one modal needs it. The Button primitive otherwise handles all
+  // padding, radius, focus ring, and hover transitions.
+  const dangerStyle =
     tone === "danger"
-      ? "bg-[#c73434] hover:bg-[#a82828] border-[#c73434]"
-      : "bg-accent hover:bg-[#1a73d1] border-accent";
+      ? {
+          background: "var(--color-error)",
+          color: "var(--color-bg)",
+          borderColor: "var(--color-error)",
+        }
+      : undefined;
 
   return (
     <ModalShell open={open} onClose={onCancel}>
       <div className="p-7 px-8">
-        <h2 className="text-[18px] font-semibold mb-1.5 text-ink">{title}</h2>
-        <div className="text-sm text-ink-light mb-4 leading-relaxed">{description}</div>
+        <h2 className="text-[18px] font-semibold mb-1.5 text-text">{title}</h2>
+        <div className="text-sm text-text-muted mb-5 leading-relaxed">{description}</div>
         <div className="flex gap-2 justify-end mt-4">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 rounded-md text-sm font-medium border border-rule-strong bg-paper text-ink hover:bg-paper-hover"
-          >
-            {cancelLabel}
-          </button>
-          <button
-            onClick={onConfirm}
-            className={`px-4 py-2 rounded-md text-sm font-medium text-white border ${confirmClass}`}
-          >
+          <Button onClick={onCancel}>{cancelLabel}</Button>
+          <Button variant="primary" onClick={onConfirm} style={dangerStyle}>
             {confirmLabel}
-          </button>
+          </Button>
         </div>
       </div>
     </ModalShell>

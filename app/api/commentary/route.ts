@@ -7,6 +7,12 @@ interface CommentaryBody {
   jd: string;
   /** Candidate's resume, may be empty. */
   resume?: string;
+  /** Optional summary of the interviewer's background (typically
+   *  scraped + summarized from a LinkedIn URL, or written manually by
+   *  the user in the StartModal). When present, lets the coach tailor
+   *  framing to the interviewer's role — e.g. tighter technical depth
+   *  for an engineer, more impact narratives for a hiring manager. */
+  interviewerProfile?: string;
   /** The interviewer's question currently being answered.
    *  Empty string when `mode === "listening"` — there's no finalized
    *  question yet, the interviewer is still talking. */
@@ -66,6 +72,7 @@ export async function POST(req: Request) {
   const {
     jd,
     resume,
+    interviewerProfile,
     question,
     answer,
     priorComments = [],
@@ -75,6 +82,30 @@ export async function POST(req: Request) {
     interviewerMonologue = "",
     candidateQuestion = "",
   } = body;
+
+  // Optional interviewer-profile context block. Empty string when no
+  // profile was provided in the StartModal — render nothing so existing
+  // prompts behave identically. When present, slot it in next to the
+  // resume so the model sees it before the question/job-task section.
+  const trimmedProfile = (interviewerProfile || "").trim();
+  const interviewerBlockEn = trimmedProfile
+    ? `=== INTERVIEWER PROFILE ===
+${trimmedProfile}
+=== END INTERVIEWER PROFILE ===
+
+Tailor your observation to who's asking. Engineering interviewer → expect technical depth, code/system tradeoffs, named tools. Hiring manager / cross-functional partner → expect impact narratives, scope, stakeholder navigation. Senior leader → expect crisp framing and judgment, less detail. Don't over-rotate, but use this as a CALIBRATION for what 'lands well' with this specific person.
+
+`
+    : "";
+  const interviewerBlockZh = trimmedProfile
+    ? `=== 面试官背景 ===
+${trimmedProfile}
+=== 面试官背景结束 ===
+
+根据面试官的角色调整观察。技术面试官 → 期待技术深度、code/system tradeoff、具体工具名。Hiring manager / 跨职能 partner → 期待 impact、scope、stakeholder 协作。资深 leader → 期待清晰的 framing 和 judgment,细节少一点。不要过度迎合,但把这个当成 "什么样的回答能打动这个人" 的 calibration。
+
+`
+    : "";
 
   if (mode === "answer" && (!question || !answer)) {
     return new Response("Missing question or answer", { status: 400 });
@@ -126,11 +157,11 @@ ${resume}
 
 Use the resume to cross-check claims. Flag claimed experience not on the resume; note missed opportunities to invoke relevant resume experience.
 ` : ""}
-
+${interviewerBlockEn}
 The interviewer's question: "${question}"
 
 Your job:
-- Write ONE observation, 3–4 sentences (strict upper bound: ~70 words / ~450 characters). This must fit in a FIXED display pane — anything longer will be clipped. Use the space to actually develop a point: name the moment, name the gap or strength, say what to do or watch for next. Don't pad; one sharp sentence is fine when that's all there is.
+- Write ONE observation, 2–3 sentences (HARD upper bound: ~40 words / ~200 characters). This must fit in a FIXED display pane that ALSO has to render a 15-30 word "Try this" suggestion below it — anything longer will be clipped at the bottom. Use the space to actually develop a point: name the moment, name the gap or strength, say what to do or watch for next. Don't pad; one sharp sentence is fine when that's all there is.
 - It should be in ENGLISH. Preserve direct candidate quotes in their original language if the candidate spoke Chinese.
 - Be specific and candid, but WARM. You're a coach sitting next to the candidate, not a panelist taking notes against them.
 - Reference particular things the candidate said.
@@ -208,11 +239,11 @@ ${resume}
 
 用简历来核对候选人说的内容。如果他声称的经历在简历上看不出来,指出来。如果简历上有相关经历但他没提到,也指出这个错过的机会。
 ` : ""}
-
+${interviewerBlockZh}
 面试官的问题:"${question}"
 
 你的任务:
-- 写一条观察,3-4 句(严格上限:主体 150 字以内,英文术语不计入)。这段要放进一个固定大小的展示框,超出部分会被裁掉,宁可短不能超。用这个空间真正展开:指出哪个瞬间、问题/亮点是什么、下一步该怎么做或看什么。不要硬凑;只有一句 sharp 的就停。
+- 写一条观察,2-3 句(硬性上限:主体 80 字以内,英文术语不计入)。这段要放进一个固定大小的展示框,框下面还要放一个 15-30 词的"Try this"建议块,主体超长会从底部裁掉。用这个空间真正展开:指出哪个瞬间、问题/亮点是什么、下一步该怎么做或看什么。不要硬凑;只有一句 sharp 的就停。
 - 中文为主,但 PRESERVE 关键英文原文(混杂中英是目标,不是要全中文)。
 - 具体、坦率,但要 WARM。你是坐在候选人旁边的 coach,不是在旁边记笔记打分的 panelist。
 - 引用他们实际说的东西,不要泛泛而谈。
@@ -312,9 +343,9 @@ DRIFT DETECTION(重要):
 ${jd}
 === JD 结束 ===
 
-${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
+${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}${interviewerBlockZh}
 输出形式:
-- 一条"听力提示",3-4 句(严格上限:主体 150 字以内,英文术语不计入)。要放进固定大小的展示框,超出会被裁掉,宁可短不能超。抓面试官刚说的具体细节、点出他的关切,再给一句候选人可以怎么接的建议。不要硬凑;短 sharp 也可以。
+- 一条"听力提示",2-3 句(硬性上限:主体 80 字以内,英文术语不计入)。要放进固定大小的展示框,框下面还要放一个 15-30 词的"Try this"建议块,主体超长会从底部裁掉。抓面试官刚说的具体细节、点出他的关切,再给一句候选人可以怎么接的建议。不要硬凑;短 sharp 也可以。
 - 中文为主,关键词保留英文。
 - 可以用 <strong>...</strong> 标 1-2 个关键词。不要用 markdown。
 - 不要开场白,不要"我觉得" —— 直接给提示。
@@ -340,9 +371,9 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
 ${jd}
 === END JD ===
 
-${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}
+${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}${interviewerBlockEn}
 Output:
-- ONE listening tip, 3–4 sentences (strict upper bound: ~70 words / ~450 characters). This must fit in a FIXED display pane — anything longer will be clipped. Catch the specific detail the interviewer just revealed, flag what they care about, and give one concrete suggestion for how the candidate can pick up the thread. Don't pad — a sharp short tip is fine.
+- ONE listening tip, 2–3 sentences (HARD upper bound: ~40 words / ~200 characters). This must fit in a FIXED display pane that ALSO has to render a 15-30 word "Try this" suggestion below it — anything longer will be clipped at the bottom. Catch the specific detail the interviewer just revealed, flag what they care about, and give one concrete suggestion for how the candidate can pick up the thread. Don't pad — a sharp short tip is fine.
 - ENGLISH, with technical terms preserved.
 - You may use <strong>...</strong> to highlight 1–2 key terms. No markdown.
 - No preamble, no "I think" — just the tip.
@@ -387,9 +418,9 @@ Don't phrase this as a judgment. It's a tip, not a score.${SAY_BLOCK}`;
 ${jd}
 === END JD ===
 
-${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}
+${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}${interviewerBlockEn}
 
-Your job: ONE short observation, 3–4 sentences (strict upper bound: ~70 words / ~450 characters). Fits in a fixed display pane. ENGLISH with technical terms preserved. May use <strong>...</strong> for 1–2 key terms. No markdown. No preamble.
+Your job: ONE short observation, 2–3 sentences (HARD upper bound: ~40 words / ~200 characters). Fits in a fixed display pane that ALSO has to render a 15-30 word "Try this" suggestion below — anything longer is clipped. ENGLISH with technical terms preserved. May use <strong>...</strong> for 1–2 key terms. No markdown. No preamble.
 
 What makes a STRONG candidate question:
 - SPECIFIC to something the interviewer revealed earlier in the conversation. ("You mentioned the team is migrating from EMR to OpenSearch — is that already in production, or still in design?") Shows the candidate listened.
@@ -424,9 +455,9 @@ Examples:
 ${jd}
 === JD 结束 ===
 
-${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}
+${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}${interviewerBlockZh}
 
-输出:一条观察,3-4 句(严格上限:主体 150 字以内,英文术语不计入)。要放进固定大小展示框。中文为主,英文术语保留。可以用 <strong>...</strong> 标 1-2 个关键词。不要 markdown,不要开场白。
+输出:一条观察,2-3 句(硬性上限:主体 80 字以内,英文术语不计入)。要放进固定大小展示框,框下面还要放一个 15-30 词的"Try this"建议块,主体超长会从底部裁掉。中文为主,英文术语保留。可以用 <strong>...</strong> 标 1-2 个关键词。不要 markdown,不要开场白。
 
 什么是 STRONG 的候选人提问:
 - 锚在面试官前面 reveal 的具体细节上("你刚才提到团队从 EMR 迁到 OpenSearch —— 这个已经 in production 了还是在 design?")。说明候选人在听。

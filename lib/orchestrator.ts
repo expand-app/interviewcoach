@@ -1,5 +1,4 @@
 import { AudioSession } from "./audioSession";
-import { PlaybackSession, type TranscribedUtterance } from "./playbackSession";
 import { useStore } from "./store";
 import { logClient as log, resetClientLog } from "./client-log";
 import type {
@@ -47,6 +46,12 @@ interface CaptureSource {
   pause(): void | Promise<void>;
   resume(): void | Promise<void>;
   stop(): Promise<void>;
+  /** True after stop() has fully run OR start() aborted partway via
+   *  abortSession() (no audio source / declined screen share / no
+   *  video track). Lets the orchestrator detect "this CaptureSource
+   *  is dead, drop the ref before re-Start" — without this, a Try
+   *  Again click would early-return on the corpse instance. */
+  readonly isStopped: boolean;
 }
 
 /**
@@ -112,11 +117,30 @@ const IDENTIFY_CONFIDENCE_THRESHOLD  = 2;
 // === Question-lock multi-signal filter ===
 // See `pendingLead` doc on the class for the full 4-layer design.
 /** Layer 1: min fraction of ≥4-char tokens in the proposed Q text that
- *  must appear in the last 30s of interviewer transcript. Below this
- *  the Q is assumed hallucinated and discarded. */
-const GROUNDING_MIN_TOKEN_MATCH = 0.5;
-/** Layer 1: how far back to look for grounding (seconds of speech). */
-const GROUNDING_RECENT_SEC = 30;
+ *  must appear in the last GROUNDING_RECENT_SEC of transcript. Below
+ *  this the Q is assumed hallucinated and discarded.
+ *
+ *  Lowered from 0.5 → 0.35 (2026-05-07): in a case interview the
+ *  interviewer's question often has 6-10 substantive tokens and only
+ *  3-4 of them appear in the recent transcript window because the
+ *  candidate has been the dominant speaker. Examples that previously
+ *  L1-failed in McKinsey session sess-1778129512327:
+ *    "On what would it take to build a new electric vehicle charging…"
+ *    "What are all the things to consider?"
+ *    "What other considerations should the CEO have in mind…"
+ *    "And what data would you use for that?"
+ *  These are real interviewer asks; the 0.5 bar caught hallucinations
+ *  but also blocked these legit questions. 0.35 is permissive enough
+ *  to let them through while still discarding the obvious fabrications
+ *  (which typically have 0% token overlap, not 35%). */
+const GROUNDING_MIN_TOKEN_MATCH = 0.35;
+/** Layer 1: how far back to look for grounding (seconds of speech).
+ *  Extended from 30s → 60s (2026-05-07): case-style follow-ups often
+ *  reference content the interviewer set up 30-50s earlier in the
+ *  case prompt, which falls outside a 30s window. 60s covers the
+ *  typical case-prompt + clarifier round without bleeding into the
+ *  unrelated previous Lead. */
+const GROUNDING_RECENT_SEC = 60;
 /** Layer 3: milliseconds of interviewer silence required after the
  *  proposed Lead before we commit. If a new interviewer utterance
  *  arrives within this window, pending is discarded. */
@@ -125,10 +149,17 @@ const CONTINUATION_GATE_MS = 3000;
  *  semantically-similar new proposal is dropped as a restatement. The
  *  classifier sometimes emits the same Q twice back-to-back with
  *  slightly different wording; without this, both end up committed as
- *  separate Questions. 10s is long enough to cover the typical
+ *  separate Questions. 20s is long enough to cover the typical
  *  classifier-flap window but short enough that a genuine new Q on
- *  the same topic minutes later still gets through. */
-const RESTATEMENT_COOLDOWN_MS = 10000;
+ *  the same topic minutes later still gets through.
+ *
+ *  Bumped from 10s → 20s (2026-05-07): the 10s window let through
+ *  duplicates 14-16s apart that we observed in McKinsey session
+ *  sess-1778129512327 (sec 284 + 298 same Q2 text; sec 2093 + 2109
+ *  same Q5 text). The Jaccard threshold of 0.5 still gates against
+ *  truly different questions in the cooldown window, so widening to
+ *  20s only catches actual restatements. */
+const RESTATEMENT_COOLDOWN_MS = 20000;
 /** Token-Jaccard threshold above which a new proposal is considered a
  *  restatement of the just-committed Q. ≥ 0.5 reliably catches the
  *  "a little bit" vs "a bit" type reword but lets genuinely different
@@ -234,18 +265,43 @@ export class LiveOrchestrator {
   private pendingListeningHint = false;
   private lastListeningHintAt = 0;
 
-  /** Shared across ALL commentary types (Q-A, listening hint, cand-q).
-   *  Every commentary that successfully streams in records its final
-   *  text + the moment it finished streaming here. Before firing a
-   *  listening hint or candidate-question commentary we consult this
-   *  to ensure the previous piece has been on screen long enough for a
-   *  typical reader to finish — no point slamming a new hint in while
-   *  the old one is still being read. Q-A commentary itself is NOT
-   *  gated by this (it has its own minMs drop-on-overlap mechanism),
-   *  but Q-A DOES update these fields so subsequent hints respect the
-   *  time the user needs to absorb a Q-A observation. */
-  private lastCommentaryReadyAt = 0;
-  private lastCommentaryText = "";
+  /** PER-KIND reading protection. Each commentary kind tracks its own
+   *  most-recent display + finish time. We used to share a single
+   *  field across all three kinds, which had a bad failure mode:
+   *  during a long interviewer monologue we'd queue a listening hint,
+   *  the candidate would flip into reverse-Q&A asking a question, and
+   *  the cand-q-cmt fire path would defer because "the previous
+   *  listening hint is still being read" — even though the UI had
+   *  already moved on to the candidate-question commentary slot.
+   *  Splitting per-kind means a listening hint never blocks a
+   *  cand-q-cmt and vice versa; only repeats within the same kind
+   *  defer (which is what reading protection is actually for).
+   *  Q-A commentary doesn't appear here — it gates on its own
+   *  liveDisplayedComment.minMs window inside generateComment. */
+  /** Buffer of listening hints that completed during interviewer
+   *  monologue while no question was locked. Drained onto the next
+   *  Lead question that locks (in commitLead / addFollowUpAndStart /
+   *  archiveCurrentMainAndStartNew) as listening-kind comments. The
+   *  drained hints surface in PastView's transcript under that
+   *  question, with the same UI treatment as Q-A commentary so the
+   *  candidate can review what they were supposed to listen for at
+   *  that moment + the suggested phrasing to react with. */
+  private pendingListeningHints: Array<{
+    id: string;
+    text: string;
+    atSeconds: number;
+    /** Snapshot of the interviewer monologue buffer the AI saw when
+     *  it generated this hint. Persisted to comments.context_text so
+     *  PastView can render "Interviewer mentioned …" using the same
+     *  content the model reacted to, rather than guessing from a
+     *  time window over utterances (which catches the tail filler
+     *  "Okay. Yeah." instead of the substantive case prompt). */
+    contextText: string;
+  }> = [];
+  private lastListenHintReadyAt = 0;
+  private lastListenHintText = "";
+  private lastCandQCmtReadyAt = 0;
+  private lastCandQCmtText = "";
   /** Buffer size when the last listening-hint fired. Re-firing requires
    *  buffer to grow by LISTENING_HINT_TRIGGER_CHARS beyond THIS size, so
    *  the cooldown isn't the only gate — genuinely new monologue content
@@ -341,8 +397,29 @@ export class LiveOrchestrator {
     state: MomentStateKind;
     count: number;
   } | null = null;
+  /** When hysteresis is pending on a "closing" transit (count:1/need:2),
+   *  the second confirm ordinarily comes from another classify cycle —
+   *  but after a real goodbye there's typically no new speech, so no
+   *  new utterance, so no new classify, so hysteresis stays stuck and
+   *  the closing prompt never fires. This timer auto-confirms the
+   *  pending closing transit after CLOSING_SILENCE_AUTOCONFIRM_MS of
+   *  silence. Cancelled if new substantive speech arrives (someone
+   *  said one more thing, conversation isn't over) or if hysteresis
+   *  flips to a different proposed state. */
+  private closingHysteresisAutoTimer: ReturnType<typeof setTimeout> | null =
+    null;
 
   private knownDgSpeakers = new Set<number>();
+  /** Fold map: phantom dgSpeaker → real dgSpeaker. Populated when a
+   *  brand-new dg arrives but BOTH roles are already filled by other
+   *  dgs (= Deepgram diarization minted a third speaker label for one
+   *  of the two real people, typically the candidate as their voice
+   *  drifts). Once mapped, every subsequent utterance from the
+   *  phantom dg gets remapped to the real dg before storage — so the
+   *  captions / transcript / scoring all see one coherent run instead
+   *  of fragmented single-word noise. The fold is one-way and final
+   *  for the session (we never un-fold). */
+  private dgFoldMap: Map<number, number> = new Map();
   private identifyInFlight = false;
   private identifyLastUtteranceCount = 0;
   /** Last identify-speakers result. Used to require two consecutive
@@ -377,7 +454,6 @@ export class LiveOrchestrator {
    *  listening-hint work — the UI reads those directly from the
    *  timeline indexed by the current playback time. Utterances still
    *  flow into the captions path so the caption lanes render. */
-  private usingTimeline = false;
 
   private lastDgSpeaker: number | undefined;
   private lastTranscriptAt = 0;
@@ -392,655 +468,123 @@ export class LiveOrchestrator {
   // that window, the interview is genuinely over — fire `ic:closing-
   // detected` so the UI can prompt "Save now?". User-side outcomes:
   //   - "Save & view scoring" → normal End & Save flow
-  //   - "Continue recording"  → call `disableClosingDetection()` so we
-  //     never fire again this session (prevents annoyance loops where
-  //     the classifier keeps flapping in and out of closing).
-  // Single-shot per session: once fired (or once the user dismissed),
-  // `closingDetectionDisabled` flips true and stays that way.
+  //   - "Continue recording"  → call `disableClosingDetection()`. Used
+  //     to PERMANENTLY mute the prompt for the rest of the session;
+  //     that was wrong because real interviews routinely have multiple
+  //     "near-closings" (chitchat wrap-up → real goodbye 5+ minutes
+  //     later) and the user would never see the prompt at the actual
+  //     end. Replaced with a COOLDOWN timestamp instead — see
+  //     `closingDetectionMutedUntil` below.
   private closingSilenceTimer: ReturnType<typeof setTimeout> | null = null;
-  private closingDetectionDisabled = false;
-  private closingDetectionFired = false;
+  /** When > 0, closing detection is silenced until this Date.now() ms.
+   *  Set after the user clicks "Continue recording" (5 min cooldown)
+   *  or after a successful fire (so we don't re-fire while the modal
+   *  itself is up — UI handles its own dismissal). 0 = not muted. */
+  private closingDetectionMutedUntil = 0;
+  /** Cooldown after the user dismisses ("Continue recording"). 5 min
+   *  is long enough that the interview's small-talk wrap-up has
+   *  genuinely transitioned into more content, but short enough that
+   *  if the real goodbye comes ~7-10 min later we still catch it. */
+  private static CLOSING_DISMISS_COOLDOWN_MS = 5 * 60 * 1000;
+  /** Cooldown after we successfully fire (to debounce repeat fires
+   *  while the modal is on screen and the user hasn't decided yet). */
+  private static CLOSING_FIRE_COOLDOWN_MS = 30 * 1000;
   /** ms; tunable via the user spec ("3-second silence after closing"). */
   private static CLOSING_SILENCE_MS = 3000;
   /** ms; minimum utterance length that counts as "they're still talking,
    *  cancel the closing timer". Filler like "yeah" / "ok" doesn't count. */
   private static CLOSING_UTTERANCE_MIN_CHARS = 10;
+  /** ms; if classify-moment said state="closing" and the room has been
+   *  silent for at least this long, we treat that silence as the
+   *  hysteresis confirmation cycle — without this, a real goodbye
+   *  followed by silence (the most common ending pattern) keeps
+   *  hysteresis stuck at count:1/need:2 forever and the prompt never
+   *  fires. */
+  private static CLOSING_SILENCE_AUTOCONFIRM_MS = 8000;
+
+  /** Silence-based session-end detection. Two thresholds while
+   *  status === "recording":
+   *    - IDLE_PROMPT_MS (2 min) → dispatch `ic:idle-prompt` so the
+   *      UI can ask "Session quiet for 2 min — save now or continue?"
+   *      Fires once per idle window; new speech / user clicking
+   *      "Continue" resets the baseline.
+   *    - IDLE_AUTO_SAVE_MS (5 min) → dispatch `ic:auto-save-requested`
+   *      The page treats this as an automatic End & Save with the
+   *      currently-derived live title. Saves whatever was recorded
+   *      rather than losing it to a forgotten tab.
+   *  Both reset the moment a real Deepgram utterance arrives (which
+   *  bumps lastTranscriptAt in onUtterance). */
+  private static IDLE_PROMPT_MS = 2 * 60 * 1000;
+  private static IDLE_AUTO_SAVE_MS = 5 * 60 * 1000;
+  private static IDLE_CHECK_INTERVAL_MS = 30 * 1000;
+  private idleCheckTimer: ReturnType<typeof setInterval> | null = null;
+  /** Track which thresholds we've already fired this idle window so
+   *  events are one-shot. Reset when activity resumes (new utterance
+   *  OR user-clicked Continue on the idle prompt). */
+  private idlePromptFired = false;
+  /** Wall-clock when start() / resume() last fired. Used as the
+   *  inactivity baseline when no transcript has arrived yet — prevents
+   *  a forgotten session from sitting in "lastTranscriptAt = 0" state
+   *  forever and bypassing the auto-save check. */
+  private sessionLastResumedAt = 0;
 
   async start(
     options: {
       captureTabAudio?: "auto" | "on" | "off";
       captureVideo?: boolean;
+      useMic?: boolean;
     } = {}
-  ) {
-    if (this.audio) return;
+  ): Promise<boolean> {
+    // Already-running guard. A "live" AudioSession (not stopped /
+    // not aborted) means a session is genuinely in progress — bail.
+    // BUT: if `this.audio` is set yet stopped, that's a corpse from
+    // a prior abortSession() call (no-audio-source / declined screen
+    // share / no video track). The abort path doesn't null this ref
+    // because it doesn't have a back-reference to the orchestrator;
+    // we clean it up here so a re-Start after Try Again actually
+    // creates a fresh AudioSession instead of silently no-op'ing.
+    if (this.audio) {
+      // Already running — caller should NOT bump status (it's already
+      // "recording"). Return true so the page treats this as success.
+      if (!this.audio.isStopped) return true;
+      this.audio = null;
+    }
     resetClientLog();
     log("session", "start", {
       mode: "live",
       captureTabAudio: options.captureTabAudio ?? "auto",
       captureVideo: options.captureVideo ?? false,
+      useMic: options.useMic ?? true,
     });
     this.resetSessionState();
     this.audio = new AudioSession(this.makeCallbacks(), {
       captureTabAudio: options.captureTabAudio ?? "auto",
       captureVideo: options.captureVideo ?? false,
+      useMic: options.useMic ?? true,
     });
     await this.audio.start();
+    // Bail out of the post-start setup if start() aborted partway —
+    // armIdleCheck etc. would set timers on a session that doesn't
+    // actually exist. Clear the dead ref so the next start() can
+    // run cleanly without going through the stopped-check path
+    // again. Returning false signals the caller that the session
+    // didn't actually arm; the page's `ic:session-aborted` event
+    // handler has already flipped live.status back to "idle" by
+    // this point, so the caller MUST NOT bump status to "recording"
+    // (which would overwrite the abort's idle and leave the user
+    // staring at a "live" topbar over a session that never started).
+    if (this.audio.isStopped) {
+      this.audio = null;
+      return false;
+    }
+    this.sessionLastResumedAt = Date.now();
+    this.idlePromptFired = false;
+    this.armIdleCheck();
+    return true;
   }
-
-  /** Start a playback-driven session using an uploaded audio file. Uses
-   *  the same classify/commentary pipeline — only the transcript source
-   *  differs. Utterances must come pre-transcribed from
-   *  /api/transcribe-file.
-   *
-   *  Upload mode has the full transcript up front, so we can identify
-   *  who's the interviewer vs. the candidate BEFORE playback begins
-   *  (using samples drawn from across the whole recording, not just the
-   *  first few pleasantries). The captions then render with correct
-   *  role labels from utterance #1 instead of churning through the
-   *  in-session refresh loop. */
-  async startWithFile(file: File, utterances: TranscribedUtterance[]) {
-    if (this.audio) return;
-    resetClientLog();
-    log("session", "start", {
-      mode: "upload",
-      fileName: file.name,
-      utterances: utterances.length,
-    });
-    this.resetSessionState();
-    const store = useStore.getState();
-    const setStage = store.setLiveProcessingStage;
-
-    setStage("identifying");
-    await this.preIdentifyRolesFromFullTranscript(utterances);
-
-    // Pre-load EVERY utterance into the store with its timestamps. The
-    // live-view captions component indexes these by the current
-    // playback time, so scrubbing anywhere shows the right captions
-    // immediately without any real-time emission.
-    const preloaded: Utterance[] = utterances.map((u, i) => ({
-      id: `u-upload-${i}`,
-      dgSpeaker: u.speaker,
-      text: u.text,
-      atSeconds: u.start,
-      duration: u.duration,
-    }));
-    store.replaceLiveUtterances(preloaded);
-    // Signal to the in-session pipeline to stay out of the way — utterances
-    // are already populated; we don't want classify-moment / commentary /
-    // listening-hint triggers running during playback.
-    this.usingTimeline = true;
-    // Tell the UI we're in upload-mode playback so it mounts the
-    // scrubber, the ReviewPanel, and time-indexed captions.
-    store.setLiveIsUploadMode(true);
-
-    // Round 2+3+4: extract Interview Phases + Questions, then Live
-    // Commentary, then a self-review pass that reconciles all three
-    // artifacts against the transcript and corrects anything that
-    // doesn't hold up. Listening hints come in a later round.
-    setStage("analyzing");
-    console.log("[orchestrator] → extractPhasesAndQuestions");
-    const extracted = await this.extractPhasesAndQuestions(utterances);
-    console.log(
-      `[orchestrator] ← extractPhasesAndQuestions: questions=${extracted?.questions.length ?? 0}`
-    );
-    if (extracted && extracted.questions.length > 0) {
-      console.log(
-        `[orchestrator] → extractCommentary (${extracted.questions.length} questions)`
-      );
-      await this.extractCommentary(utterances, extracted.questions);
-      console.log("[orchestrator] ← extractCommentary done");
-    } else {
-      console.warn(
-        "[orchestrator] SKIPPING extractCommentary — 0 questions extracted"
-      );
-    }
-    // Listening hints — fired whenever the interviewer monologues
-    // substantively. Independent of question extraction, so we run it
-    // even when no questions were found (pure-context recording edge case).
-    console.log("[orchestrator] → extractListeningHints");
-    await this.extractListeningHints(utterances);
-    console.log("[orchestrator] ← extractListeningHints done");
-    // Review pass removed: Opus 4.7's first-pass output is good enough
-    // that the second-pass semantic check wasn't earning the ~60-90s of
-    // latency + the extra token cost. Re-enable if we see systematic
-    // miscategorizations again.
-    setStage("ready");
-
-    // PlaybackSession plays audio but does NOT re-emit utterances (we've
-    // already pre-loaded them) — keeps captions from duplicating.
-    this.audio = new PlaybackSession(
-      file,
-      utterances,
-      this.makeCallbacks(),
-      { skipEmit: true }
-    );
-    await this.audio.start();
-  }
-
-  /**
-   * Round-2 helper: calls /api/extract-phases-questions with the full
-   * transcript (roles + timestamps), seeds the resulting questions and
-   * phases into the store so the LiveView renders phase chip + current
-   * Lead/Probe from playbackTime.
-   *
-   * Non-fatal: on failure, timeline stays null and the UI falls back to
-   * placeholder states for phase/questions (captions still work).
-   */
-  private async extractPhasesAndQuestions(
-    utterances: TranscribedUtterance[]
-  ): Promise<{
-    questions: Array<{
-      id: string;
-      text: string;
-      parentId?: string;
-      askedAtSec: number;
-    }>;
-  } | null> {
-    const store = useStore.getState();
-    const roles = store.liveSpeakerRoles;
-    const forApi = utterances.map((u) => {
-      const role =
-        u.speaker !== undefined && roles[u.speaker] === "interviewer"
-          ? "interviewer"
-          : u.speaker !== undefined && roles[u.speaker] === "candidate"
-          ? "candidate"
-          : "unknown";
-      return {
-        role: role as "interviewer" | "candidate" | "unknown",
-        text: u.text,
-        start: u.start,
-        end: u.end,
-      };
-    });
-
-    try {
-      const resp = await fetch("/api/extract-phases-questions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jd: store.liveJd,
-          resume: store.liveResume,
-          lang: store.commentLang,
-          utterances: forApi,
-        }),
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(`extract ${resp.status}: ${text.slice(0, 200)}`);
-      }
-      const data = (await resp.json()) as {
-        questions?: Array<{
-          id: string;
-          text: string;
-          parentId?: string;
-          askedAtSec: number;
-        }>;
-        phases?: Array<{
-          fromSec: number;
-          kind: string;
-          questionId?: string;
-        }>;
-      };
-
-      const questions = data.questions ?? [];
-      const phases = data.phases ?? [];
-
-      // Seed liveQuestions so the rest of the app (Past Sessions
-      // rendering, scoring) sees questions as it would for a live
-      // session. Commentary is seeded separately by extractCommentary.
-      for (const q of questions) {
-        store.addQuestion({
-          id: q.id,
-          text: q.text,
-          askedAtSeconds: q.askedAtSec,
-          comments: [],
-          parentQuestionId: q.parentId ?? undefined,
-        });
-      }
-
-      // Set the timeline with phases + questions. commentary + hints
-      // start empty; extractCommentary fills the commentary field next.
-      store.setLiveTimeline({
-        questions,
-        commentary: [],
-        listeningHints: [],
-        phases: phases.map((p) => ({
-          fromSec: p.fromSec,
-          kind: p.kind as
-            | "chitchat"
-            | "interviewer_asking_first"
-            | "interviewer_probing"
-            | "candidate_answering"
-            | "between_questions",
-          questionId: p.questionId,
-        })),
-      });
-
-      return { questions };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "unknown";
-      window.dispatchEvent(
-        new CustomEvent("ic:error", {
-          detail: `Phase/question extraction failed (${msg}). Captions still work, but the phase chip and current question won't populate.`,
-        })
-      );
-      return null;
-    }
-  }
-
-  /**
-   * Round-3 helper: takes the questions extracted from round 2 and
-   * produces Live Commentary entries anchored to specific moments of
-   * the recording. Seeds results into both `liveTimeline.commentary`
-   * (so the LiveView shows the right comment at the right playback
-   * time) AND each corresponding `liveQuestions.comments[]` (so Past
-   * Sessions renders the same commentary and scoring has material).
-   *
-   * Non-fatal: a failure here doesn't break playback — the commentary
-   * pane just stays empty for the session.
-   */
-  private async extractCommentary(
-    utterances: TranscribedUtterance[],
-    questions: Array<{
-      id: string;
-      text: string;
-      parentId?: string;
-      askedAtSec: number;
-    }>
-  ) {
-    console.log(
-      `[extract-commentary client] entering: ${utterances.length} utterances, ${questions.length} questions — ids: ${questions.map((q) => q.id).join(",")}`
-    );
-    const store = useStore.getState();
-    const roles = store.liveSpeakerRoles;
-    const forApi = utterances.map((u) => {
-      const role =
-        u.speaker !== undefined && roles[u.speaker] === "interviewer"
-          ? "interviewer"
-          : u.speaker !== undefined && roles[u.speaker] === "candidate"
-          ? "candidate"
-          : "unknown";
-      return {
-        role: role as "interviewer" | "candidate" | "unknown",
-        text: u.text,
-        start: u.start,
-        end: u.end,
-      };
-    });
-
-    try {
-      const resp = await fetch("/api/extract-commentary", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jd: store.liveJd,
-          resume: store.liveResume,
-          lang: store.commentLang,
-          utterances: forApi,
-          questions,
-        }),
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(`extract-commentary ${resp.status}: ${text.slice(0, 200)}`);
-      }
-      const data = (await resp.json()) as {
-        commentary?: Array<{
-          id: string;
-          questionId: string;
-          atSec: number;
-          text: string;
-        }>;
-      };
-      const commentary = data.commentary ?? [];
-      console.log(
-        `[extract-commentary client] received ${commentary.length} commentary entries`
-      );
-      if (commentary.length === 0) {
-        window.dispatchEvent(
-          new CustomEvent("ic:error", {
-            detail:
-              "Commentary extraction returned 0 entries. Check server logs for the reason.",
-          })
-        );
-        return;
-      }
-
-      // Merge into the existing timeline — we already seeded phases +
-      // questions above; just patch the commentary field in place.
-      const current = useStore.getState().liveTimeline;
-      if (current) {
-        useStore.getState().setLiveTimeline({
-          ...current,
-          commentary,
-        });
-        console.log(
-          `[extract-commentary client] patched timeline.commentary (${commentary.length} entries)`
-        );
-      } else {
-        console.warn(
-          "[extract-commentary client] liveTimeline is null — can't patch commentary in"
-        );
-      }
-
-      // Attach each comment to its question so Past Sessions + scoring
-      // see it. addCommentToQuestion is additive; questions were seeded
-      // with empty comments arrays in round 2.
-      for (const c of commentary) {
-        store.addCommentToQuestion(c.questionId, {
-          id: c.id,
-          text: c.text,
-          atSeconds: c.atSec,
-        });
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "unknown";
-      window.dispatchEvent(
-        new CustomEvent("ic:error", {
-          detail: `Commentary extraction failed (${msg}). Phases + questions still work.`,
-        })
-      );
-    }
-  }
-
-  /**
-   * Companion to extractCommentary. Produces listening hints for the
-   * uploaded recording — coaching notes that fire when the interviewer
-   * monologues (describing team, setup, case context). Mirrors the
-   * live-mode mode:"listening" flow so recorded review has parity.
-   *
-   * Non-fatal: if the call fails, `liveTimeline.listeningHints` stays
-   * empty and the UI just won't show amber hint cards.
-   */
-  private async extractListeningHints(utterances: TranscribedUtterance[]) {
-    const store = useStore.getState();
-    const roles = store.liveSpeakerRoles;
-    const forApi = utterances.map((u) => {
-      const role =
-        u.speaker !== undefined && roles[u.speaker] === "interviewer"
-          ? "interviewer"
-          : u.speaker !== undefined && roles[u.speaker] === "candidate"
-          ? "candidate"
-          : "unknown";
-      return {
-        role: role as "interviewer" | "candidate" | "unknown",
-        text: u.text,
-        start: u.start,
-        end: u.end,
-      };
-    });
-
-    try {
-      const resp = await fetch("/api/extract-listening-hints", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jd: store.liveJd,
-          resume: store.liveResume,
-          lang: store.commentLang,
-          utterances: forApi,
-        }),
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(
-          `extract-listening-hints ${resp.status}: ${text.slice(0, 200)}`
-        );
-      }
-      const data = (await resp.json()) as {
-        listeningHints?: Array<{
-          id: string;
-          atSec: number;
-          text: string;
-        }>;
-      };
-      const hints = data.listeningHints ?? [];
-      console.log(
-        `[extract-listening-hints client] received ${hints.length} hints`
-      );
-      if (hints.length === 0) return; // no monologues worth hinting; fine.
-
-      // Patch into the existing timeline. Questions + phases + commentary
-      // were seeded earlier in this session; this just fills the
-      // listeningHints slot.
-      const current = useStore.getState().liveTimeline;
-      if (current) {
-        useStore.getState().setLiveTimeline({
-          ...current,
-          listeningHints: hints,
-        });
-      } else {
-        console.warn(
-          "[extract-listening-hints client] liveTimeline null — seeding minimal timeline"
-        );
-        useStore.getState().setLiveTimeline({
-          questions: [],
-          commentary: [],
-          phases: [],
-          listeningHints: hints,
-        });
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "unknown";
-      window.dispatchEvent(
-        new CustomEvent("ic:error", {
-          detail: `Listening-hints extraction failed (${msg}). Other commentary still works.`,
-        })
-      );
-    }
-  }
-
-  /**
-   * Pre-analysis for upload mode. One Sonnet call against the full
-   * transcript — produces a structured timeline of questions,
-   * commentary, listening hints, and phase segments. Stored on the store
-   * and used by the LiveView to render correct state at any playback
-   * position including after seeks.
-   *
-   * On failure, we fall through: `usingTimeline` stays false, the
-   * in-session pipeline takes over as normal.
-   */
-  private async preAnalyzeRecording(utterances: TranscribedUtterance[]) {
-    const store = useStore.getState();
-    const roles = store.liveSpeakerRoles;
-
-    // Map dgSpeaker → role label for the preanalyze API. Unknown speakers
-    // are sent as "unknown" rather than dropped — the model can still
-    // reason about the transcript structure from text alone.
-    const forApi = utterances.map((u) => {
-      const role =
-        u.speaker !== undefined && roles[u.speaker] === "interviewer"
-          ? "interviewer"
-          : u.speaker !== undefined && roles[u.speaker] === "candidate"
-          ? "candidate"
-          : "unknown";
-      return {
-        role: role as "interviewer" | "candidate" | "unknown",
-        text: u.text,
-        start: u.start,
-        end: u.end,
-      };
-    });
-
-    try {
-      const resp = await fetch("/api/preanalyze-recording", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jd: store.liveJd,
-          resume: store.liveResume,
-          lang: store.commentLang,
-          utterances: forApi,
-        }),
-      });
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => "");
-        throw new Error(`preanalyze ${resp.status}: ${body.slice(0, 200)}`);
-      }
-      const data = (await resp.json()) as {
-        timeline?: {
-          questions: Array<{
-            id: string;
-            text: string;
-            parentId?: string;
-            askedAtSec: number;
-          }>;
-          commentary: Array<{
-            id: string;
-            questionId: string;
-            atSec: number;
-            text: string;
-          }>;
-          listeningHints: Array<{ id: string; atSec: number; text: string }>;
-          phases: Array<{
-            fromSec: number;
-            kind: string;
-            questionId?: string;
-          }>;
-        };
-      };
-      if (!data.timeline) return;
-
-      // Seed liveQuestions with timeline questions so ArchivedMainBlock,
-      // scoring (which reads liveQuestions), and past-session rendering
-      // all work the same way they do for live sessions.
-      const questionComments = new Map<string, typeof data.timeline.commentary>();
-      for (const c of data.timeline.commentary) {
-        const list = questionComments.get(c.questionId) ?? [];
-        list.push(c);
-        questionComments.set(c.questionId, list);
-      }
-      for (const q of data.timeline.questions) {
-        const comments = (questionComments.get(q.id) ?? [])
-          .slice()
-          .sort((a, b) => a.atSec - b.atSec)
-          .map((c) => ({ id: c.id, text: c.text, atSeconds: c.atSec }));
-        store.addQuestion({
-          id: q.id,
-          text: q.text,
-          askedAtSeconds: q.askedAtSec,
-          comments,
-          parentQuestionId: q.parentId ?? undefined,
-        });
-      }
-
-      // Store the full timeline for the live view to index into.
-      store.setLiveTimeline({
-        questions: data.timeline.questions,
-        commentary: data.timeline.commentary,
-        listeningHints: data.timeline.listeningHints,
-        phases: data.timeline.phases.map((p) => ({
-          fromSec: p.fromSec,
-          kind: p.kind as
-            | "chitchat"
-            | "interviewer_asking_first"
-            | "interviewer_probing"
-            | "candidate_answering"
-            | "between_questions",
-          questionId: p.questionId,
-        })),
-      });
-      this.usingTimeline = true;
-    } catch (e) {
-      // Non-fatal — but the user deserves to know: without the timeline,
-      // commentary/listening-hints/phases won't pre-populate, and
-      // scrubbing backward shows stale UI state. Let the session
-      // continue with in-session processing as a graceful fallback.
-      const msg = e instanceof Error ? e.message : "unknown";
-      window.dispatchEvent(
-        new CustomEvent("ic:error", {
-          detail: `Pre-analysis failed (${msg}). Commentary will build up as the recording plays.`,
-        })
-      );
-    }
-  }
-
-  /**
-   * Called once at the start of an upload-mode session. Runs
-   * identify-speakers against a BALANCED sample drawn from the whole
-   * transcript — preamble + middle + late Q&A — so Haiku sees the real
-   * interviewer/candidate dynamic, not just the "interviewer sells the
-   * role" opening that throws off rolling-window identification. Seeds
-   * the store roles AND pre-fills the per-speaker streak counters at
-   * the stability threshold, so the in-session refresh loop trusts this
-   * result and doesn't start second-guessing it mid-playback.
-   *
-   * Non-fatal on any failure: if the call doesn't succeed (network,
-   * missing key, thin transcript), we just fall through and the
-   * in-session identify loop takes over as usual.
-   */
-  private async preIdentifyRolesFromFullTranscript(
-    utterances: TranscribedUtterance[]
-  ) {
-    const bySpeaker = new Map<number, string[]>();
-    for (const u of utterances) {
-      if (typeof u.speaker !== "number") continue;
-      const list = bySpeaker.get(u.speaker) ?? [];
-      list.push(u.text);
-      bySpeaker.set(u.speaker, list);
-    }
-    if (bySpeaker.size < 2) return; // nothing to disambiguate
-
-    // Budget ~50 total utterances sent to Haiku — plenty of context,
-    // well inside token limits. Distribute evenly across speakers and
-    // across time within each speaker's turns.
-    const BUDGET = 50;
-    const perSpeaker = Math.max(1, Math.floor(BUDGET / bySpeaker.size));
-    const sample: Array<{ speaker: number; text: string }> = [];
-    for (const [dg, list] of bySpeaker.entries()) {
-      // Spread picks uniformly across this speaker's turns — opening,
-      // middle, late — so the preamble isn't over-weighted.
-      if (list.length <= perSpeaker) {
-        for (const text of list) sample.push({ speaker: dg, text });
-      } else {
-        const step = list.length / perSpeaker;
-        for (let i = 0; i < perSpeaker; i++) {
-          sample.push({ speaker: dg, text: list[Math.floor(i * step)] });
-        }
-      }
-    }
-
-    try {
-      const resp = await fetch("/api/identify-speakers", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ utterances: sample }),
-      });
-      if (!resp.ok) return;
-      const data = (await resp.json()) as {
-        roles?: Record<string, "interviewer" | "candidate">;
-      };
-      if (!data.roles) return;
-
-      const numKeyed: Record<number, "interviewer" | "candidate"> = {};
-      for (const [k, v] of Object.entries(data.roles)) {
-        const n = Number(k);
-        if (Number.isFinite(n)) numKeyed[n] = v;
-      }
-      if (Object.keys(numKeyed).length === 0) return;
-
-      // Seed the store so captions render with the right labels from
-      // utterance #1. Also flag the session as preIdentified so the
-      // in-session identify loop doesn't second-guess this call (upload
-      // mode got to inspect the full transcript — any in-session
-      // review would see strictly less context).
-      useStore.getState().mergeSpeakerRoles(numKeyed);
-      this.lastIdentifyResult = numKeyed;
-      this.pendingRoles = { ...numKeyed };
-      // Seed the streak high enough that the first in-session run
-      // (which shouldn't happen for upload, but if it somehow did) won't
-      // invalidate this result on a single dissent.
-      for (const n of Object.keys(numKeyed).map(Number)) {
-        this.roleAgreementStreak[n] = IDENTIFY_CONFIDENCE_THRESHOLD;
-      }
-      this.preIdentified = true;
-    } catch {
-      /* non-fatal — fall through to in-session identify */
-    }
-  }
-
   private resetSessionState() {
     this.knownDgSpeakers.clear();
+    this.dgFoldMap.clear();
     this.identifyInFlight = false;
     this.identifyLastUtteranceCount = 0;
     this.lastIdentifyResult = {};
@@ -1057,8 +601,13 @@ export class LiveOrchestrator {
     this.lastListeningHintBufferSize = 0;
     this.pendingListeningHint = false;
     this.lastListeningHintAt = 0;
-    this.lastCommentaryReadyAt = 0;
-    this.lastCommentaryText = "";
+    this.lastListenHintReadyAt = 0;
+    this.pendingListeningHints = [];
+    this.sessionLastResumedAt = 0;
+    this.idlePromptFired = false;
+    this.lastListenHintText = "";
+    this.lastCandQCmtReadyAt = 0;
+    this.lastCandQCmtText = "";
     this.pendingCommentaryFor = null;
     // Abort any in-flight Lead validation from the previous session.
     if (this.pendingLead?.timer) clearTimeout(this.pendingLead.timer);
@@ -1072,7 +621,17 @@ export class LiveOrchestrator {
     this.momentHysteresisPending = null;
     this.lastCommentAt.clear();
     this.commentCountPerQ.clear();
-    this.usingTimeline = false;
+    // Closing detection: clear any in-flight timers + reset cooldown
+    // so a fresh session starts with no muting from the previous one.
+    this.closingDetectionMutedUntil = 0;
+    if (this.closingSilenceTimer) {
+      clearTimeout(this.closingSilenceTimer);
+      this.closingSilenceTimer = null;
+    }
+    if (this.closingHysteresisAutoTimer) {
+      clearTimeout(this.closingHysteresisAutoTimer);
+      this.closingHysteresisAutoTimer = null;
+    }
   }
 
   private makeCallbacks() {
@@ -1085,17 +644,47 @@ export class LiveOrchestrator {
       onAudioReady: (audioUrl: string) => {
         (window as unknown as { __ic_audioUrl?: string }).__ic_audioUrl = audioUrl;
       },
-      onVideoReady: (videoUrl: string) => {
-        // Symmetric to audioUrl: stash on window so app/page.tsx's
-        // End-&-Save flow can read it and pass to endLive(). Cleared
-        // there after consumption so a stale URL can't leak into the
+      onVideoReady: (
+        segmentUrls: string[],
+        _duration: number,
+        mime: string
+      ) => {
+        // Stash recording artifacts on window so app/page.tsx's
+        // End-&-Save flow can read them and pass to endLive(). Cleared
+        // there after consumption so stale URLs can't leak into the
         // next session.
-        (window as unknown as { __ic_videoUrl?: string }).__ic_videoUrl =
-          videoUrl;
+        //
+        // segmentUrls: blob: URL per pause/resume cycle (length 1
+        //   when the user never paused). The store uploads each as
+        //   its own S3 object, then calls /api/uploads/concat which
+        //   ffmpeg-stitches them into one MP4 with `-c copy`.
+        // mime: container/codec MIME, e.g. "video/mp4" or
+        //   "video/webm" — passed to the upload code so the
+        //   presigned PUT URL is signed with the right Content-Type.
+        // __ic_videoUrl: backward-compat single URL. Set to the
+        //   FIRST segment so the just-ended same-tab past view has
+        //   SOMETHING to play before the server concat completes;
+        //   the PastView signed-URL effect overrides this once the
+        //   final MP4 is ready.
+        const win = window as unknown as {
+          __ic_videoUrl?: string;
+          __ic_videoSegmentUrls?: string[];
+          __ic_videoMime?: string;
+        };
+        win.__ic_videoSegmentUrls = segmentUrls;
+        win.__ic_videoMime = mime;
+        win.__ic_videoUrl = segmentUrls[0];
       },
       onError: (msg: string) => {
+        // Informational / warning channel — used by AudioSession for
+        // mid-flow toasts ("Next: pick THIS interview-coach tab",
+        // "Tab audio capture declined — continuing with mic-only",
+        // "Deepgram reconnected — replaying buffered chunks", etc.).
+        // We DO NOT idle the live session here: a soft toast must not
+        // kill an otherwise-healthy session. Genuinely fatal failures
+        // throw out of audio.start() and are caught by the page's
+        // handleStartConfirm catch block, which idles status there.
         window.dispatchEvent(new CustomEvent("ic:error", { detail: msg }));
-        useStore.getState().setLiveStatus("idle");
       },
       onPlaybackEnded: () => {
         // Forwarded to the page as a distinct event so it can show a
@@ -1103,16 +692,89 @@ export class LiveOrchestrator {
         // code to the session class.
         window.dispatchEvent(new CustomEvent("ic:playback-ended"));
       },
+      // Diagnostic hook — every Deepgram WebSocket close (clean or not)
+      // gets persisted as a structured event. Without this, silent
+      // socket deaths look identical to "real silence" in postmortems
+      // (no transcripts arrive, but we have no signal to distinguish
+      // "DG died" vs "speakers stopped talking" vs "tab audio source
+      // disappeared"). Pairs with audio:level RMS heartbeats and the
+      // tab-audio:track-ended log to triangulate "why did transcripts
+      // stop?" failures.
+      onWsClose: (info: {
+        code: number;
+        reason: string;
+        wasClean: boolean;
+        reconnectAttempt: number;
+        willReconnect: boolean;
+      }) => {
+        log("dg-ws", "close", info as unknown as Record<string, unknown>);
+      },
+      // Bridge AudioSession's diagnostic log calls into the client
+      // debug buffer. AudioSession emits events as `"source:event"`
+      // strings ("video:share-granted", "zoom:locked",
+      // "mic:dg-reconnect", etc.); we split into source/event so the
+      // LiveDebugPanel's REASONING dictionary keys match (it indexes
+      // on `source:event` already). Without this bridge every call
+      // through `this.callbacks.onLog?.(...)` was a silent no-op —
+      // half the orchestrator's diagnostic surface (audio path,
+      // screen recording path, zoom lock state) never reached the
+      // panel or the persisted session_events.
+      onLog: (event: string, data?: Record<string, unknown>) => {
+        const m = /^([^:]+):(.+)$/.exec(event);
+        if (m) {
+          log(m[1], m[2], data);
+        } else {
+          // Unknown format: keep it but tag under a generic source so
+          // it's still findable.
+          log("audio-session", event, data);
+        }
+      },
     };
   }
+  /** Re-prime the Region Capture cropTarget on the active video
+   *  track. Public hook the page calls after layout-changing events
+   *  (fullscreen toggle) so the recording recovers a clean crop. */
+  public async refreshVideoCrop(): Promise<void> {
+    if (this.audio instanceof AudioSession) {
+      await this.audio.refreshVideoCrop();
+    }
+  }
 
-  /** Playback-only hook. Pushes every remaining utterance into the
-   *  orchestrator right now, regardless of where audio playback is.
-   *  Called before End & Save so scoring sees the full transcript even
-   *  if the user stopped playback early. No-op for live mic sessions. */
-  flushBeforeEnd() {
-    if (this.audio instanceof PlaybackSession) {
-      this.audio.flushAllRemaining();
+  /** Re-acquire the screen share after Chrome ended the original
+   *  track (typically caused by moving the browser window between
+   *  displays — Chrome invalidates tab-capture on display changes).
+   *  Audio + transcript are unaffected; this only restarts the
+   *  videoRecorder on a fresh share. Must be called from a user-
+   *  gesture handler. Returns true if recovery succeeded. */
+  public async resumeScreenShare(): Promise<boolean> {
+    if (this.audio instanceof AudioSession) {
+      return this.audio.resumeScreenShare();
+    }
+    return false;
+  }
+
+  /** Pause-then-refresh-then-resume around a known layout transition.
+   *  Same machinery the zoom keydown / wheel listeners use, just
+   *  triggered explicitly by the page when it's about to perform a
+   *  React-driven layout change that isn't observable from the audio
+   *  session itself (the canonical case is the Fullscreen toggle:
+   *  React re-renders the wrapper, the cropTarget element's bounding
+   *  box jumps, Chrome's Region Capture auto-tracking emits 1-3s of
+   *  garbled frames). The handler:
+   *    1. Pauses the videoRecorder immediately so no garbled frame
+   *       is encoded
+   *    2. After 500ms (layout settles, CSS transitions complete)
+   *       fires refreshVideoCrop() to re-bind cropTo to the
+   *       element's new bounds
+   *    3. Waits 2 RAFs for the new crop to flush through the
+   *       compositor, then resumes the recorder
+   *
+   *  Recording shows a frozen frame during the ~500ms transition —
+   *  much better than 1-3 seconds of garbled output. Caller does
+   *  NOT need to await; the transition runs async in the background. */
+  public triggerCropTransition(reason: string): void {
+    if (this.audio instanceof AudioSession) {
+      this.audio.triggerCropTransition(reason);
     }
   }
 
@@ -1125,6 +787,11 @@ export class LiveOrchestrator {
   async pause() {
     await this.audio?.pause();
     useStore.getState().setLiveStatus("paused");
+    // While paused, mic is released and no utterances arrive by
+    // definition — the silence check would always trigger. Stop it
+    // so a paused-and-walked-away session doesn't get auto-saved
+    // out from under the user. Resume re-arms.
+    this.cancelIdleCheck();
   }
 
   /** Resume after a paused live session. Re-acquires the mic, re-
@@ -1136,10 +803,72 @@ export class LiveOrchestrator {
   async resume() {
     await this.audio?.resume();
     useStore.getState().setLiveStatus("recording");
+    this.sessionLastResumedAt = Date.now();
+    this.idlePromptFired = false;
+    this.armIdleCheck();
+  }
+
+  /** Public hook the UI calls when the user clicks "Continue
+   *  recording" on the idle prompt — counts as activity, resets the
+   *  silence baseline so the prompt doesn't immediately re-fire and
+   *  auto-save doesn't trip in 3 more minutes. */
+  public notifyUserStillActive(): void {
+    this.lastTranscriptAt = Date.now();
+    this.idlePromptFired = false;
+    log("session", "idle-user-continue", {});
+  }
+
+  /** Periodic check: dispatch idle prompt at IDLE_PROMPT_MS, dispatch
+   *  auto-save at IDLE_AUTO_SAVE_MS. New utterances reset the baseline
+   *  via lastTranscriptAt; the user clicking "Continue" on the prompt
+   *  resets via notifyUserStillActive(). */
+  private armIdleCheck(): void {
+    this.cancelIdleCheck();
+    this.idleCheckTimer = setInterval(() => {
+      const status = useStore.getState().live.status;
+      if (status !== "recording") return;
+      // lastTranscriptAt = 0 means no utterance has EVER arrived
+      // since session start. Fall back to the resume timestamp so a
+      // session that starts and immediately goes silent (mic share
+      // issue, etc.) still triggers a prompt at the 2-min mark.
+      const refTime = this.lastTranscriptAt || this.sessionLastResumedAt;
+      if (refTime === 0) return;
+      const idleMs = Date.now() - refTime;
+
+      if (
+        idleMs >= LiveOrchestrator.IDLE_AUTO_SAVE_MS &&
+        typeof window !== "undefined"
+      ) {
+        // Auto-save threshold reached. Fire and stop the timer —
+        // the page will run the End & Save flow which calls stop()
+        // and clears state.
+        log("session", "idle-auto-save", { idleMs });
+        this.cancelIdleCheck();
+        window.dispatchEvent(new CustomEvent("ic:auto-save-requested"));
+        return;
+      }
+      if (
+        idleMs >= LiveOrchestrator.IDLE_PROMPT_MS &&
+        !this.idlePromptFired &&
+        typeof window !== "undefined"
+      ) {
+        this.idlePromptFired = true;
+        log("session", "idle-prompt", { idleMs });
+        window.dispatchEvent(new CustomEvent("ic:idle-prompt"));
+      }
+    }, LiveOrchestrator.IDLE_CHECK_INTERVAL_MS);
+  }
+
+  private cancelIdleCheck(): void {
+    if (this.idleCheckTimer) {
+      clearInterval(this.idleCheckTimer);
+      this.idleCheckTimer = null;
+    }
   }
 
   async stop() {
     log("session", "stop");
+    this.cancelIdleCheck();
     if (this.classifyDebounceTimer) {
       clearTimeout(this.classifyDebounceTimer);
       this.classifyDebounceTimer = null;
@@ -1147,6 +876,39 @@ export class LiveOrchestrator {
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer);
       this.silenceTimer = null;
+    }
+    // Cancel closing-detection timers up-front so they can't fire
+    // mid-stop and dispatch ic:closing-detected (which would pop
+    // a "session looks done?" prompt while the user is already in
+    // the End flow). disableClosingDetection() is the public path,
+    // also called from handleEndConfirm — this is belt-and-
+    // suspenders for paths that bypass that hook.
+    if (this.closingSilenceTimer) {
+      clearTimeout(this.closingSilenceTimer);
+      this.closingSilenceTimer = null;
+    }
+    if (this.closingHysteresisAutoTimer) {
+      clearTimeout(this.closingHysteresisAutoTimer);
+      this.closingHysteresisAutoTimer = null;
+    }
+    // Flush any residual listening hints onto the most recent
+    // question. Common case: hint fired during the interviewer's
+    // closing remarks ("here's what to expect from HR next week...")
+    // and the session ends before another Lead locks. Attaching to
+    // the last question keeps the hint in the transcript instead of
+    // silently dropping it.
+    if (this.pendingListeningHints.length > 0) {
+      const store = useStore.getState();
+      const lastQ = store.liveQuestions[store.liveQuestions.length - 1];
+      if (lastQ) {
+        this.drainPendingListeningHints(lastQ.id);
+      } else {
+        log("listen-hint", "drained-discarded", {
+          reason: "no-question-locked",
+          count: this.pendingListeningHints.length,
+        });
+        this.pendingListeningHints = [];
+      }
     }
     if (!this.audio) return;
     await this.audio.stop();
@@ -1158,6 +920,55 @@ export class LiveOrchestrator {
   private async onUtterance(text: string, dgSpeaker?: number, duration?: number) {
     const clean = text.trim();
     if (!clean) return;
+    // Belt-and-suspenders: drop any utterance that arrives after the
+    // session has been stopped. AudioSession's onWsMessage already
+    // gates by `stopped`, but the callback is bound at construction
+    // time and async classify responses can still race the teardown.
+    // `this.audio === null` is the orchestrator-level signal that
+    // stop() finished; once null, any further onUtterance call is a
+    // dangling Deepgram message from a half-closed socket and should
+    // not fan out into addUtterance / classify.
+    if (!this.audio) return;
+
+    // === Phantom-dg fold ===
+    // Must run BEFORE addUtterance (otherwise phantom dg pollutes
+    // liveUtterances and the rolling-window captions logic ends up
+    // showing fragmented single-word junk). Two cases:
+    //   (a) Already in fold map → remap silently.
+    //   (b) Brand-new dg with both roles already filled by OTHER dgs
+    //       → Deepgram minted a phantom speaker label; populate fold
+    //       map (default to the candidate role, which is by far the
+    //       common case — interviewer voice is more stable on a
+    //       headset/desk mic; candidate often shifts position and
+    //       trips diarization mid-session). All subsequent utterances
+    //       from this phantom dg also fold via case (a).
+    if (dgSpeaker !== undefined && !this.preIdentified) {
+      const mapped = this.dgFoldMap.get(dgSpeaker);
+      if (mapped !== undefined) {
+        log("roles", "fold-applied", { phantom: dgSpeaker, foldTo: mapped });
+        dgSpeaker = mapped;
+      } else {
+        const roles = useStore.getState().liveSpeakerRoles;
+        if (roles[dgSpeaker] === undefined) {
+          const candidateDgs = Object.entries(roles)
+            .filter(([, r]) => r === "candidate")
+            .map(([d]) => Number(d));
+          const interviewerDgs = Object.entries(roles)
+            .filter(([, r]) => r === "interviewer")
+            .map(([d]) => Number(d));
+          if (candidateDgs.length > 0 && interviewerDgs.length > 0) {
+            const foldTo = candidateDgs[0];
+            this.dgFoldMap.set(dgSpeaker, foldTo);
+            log("roles", "fold-mapped", {
+              phantom: dgSpeaker,
+              foldTo,
+              note: "both-roles-filled-fold-into-existing-candidate",
+            });
+            dgSpeaker = foldTo;
+          }
+        }
+      }
+    }
 
     this.recentTranscript = (this.recentTranscript + " " + clean).slice(-1200);
 
@@ -1171,31 +982,18 @@ export class LiveOrchestrator {
       this.cancelClosingSilenceTimer("substantive-utterance");
     }
 
-    {
-      const state = useStore.getState();
-      state.addUtterance({
-        id: rand("u"),
-        dgSpeaker,
-        text: clean,
-        atSeconds: state.live.elapsedSeconds,
-        duration,
-      });
-      // Debug log: every utterance we receive from Deepgram, with its
-      // raw speaker number + role (if already assigned) + text preview.
-      const role =
-        dgSpeaker !== undefined
-          ? state.liveSpeakerRoles[dgSpeaker]
-          : undefined;
-      log("utterance", "new", {
-        dg: dgSpeaker,
-        role: role ?? "?",
-        text: preview(clean, 100),
-      });
-    }
-
     // ===== LIVE-MODE MANUAL SPEAKER ASSIGNMENT =====
-    // Replaces the Haiku identify-speakers flow entirely for live mic
-    // sessions. When a new dgSpeaker appears:
+    // Run this BEFORE adding the utterance to the store. Otherwise the
+    // first utterance from a freshly-arrived dgSpeaker enters
+    // liveUtterances + the debug log with role="?" — even if the
+    // OPPOSITE-role auto-assign immediately commits the right role
+    // afterward, captions briefly flash "?" and the persisted
+    // `utterance:new` event records role="?" instead of the resolved
+    // role. Reordering means the role is committed FIRST, so the
+    // utterance log + captions render with the correct role on the
+    // very first frame the speaker appears.
+    //
+    // When a new dgSpeaker appears:
     //   (a) if another dgSpeaker already has a role committed, auto-
     //       assign the OPPOSITE role to this new one. Interviews are
     //       two-person by default, so one manual assignment fully
@@ -1261,12 +1059,36 @@ export class LiveOrchestrator {
       }
     }
 
+    {
+      const state = useStore.getState();
+      state.addUtterance({
+        id: rand("u"),
+        dgSpeaker,
+        text: clean,
+        atSeconds: state.live.elapsedSeconds,
+        duration,
+      });
+      // Debug log: every utterance we receive from Deepgram, with its
+      // raw speaker number + role (if already assigned) + text preview.
+      // Role lookup happens AFTER the assignment block above, so a
+      // newly-arrived dg that just got auto-tagged shows the resolved
+      // role here instead of "?".
+      const role =
+        dgSpeaker !== undefined
+          ? state.liveSpeakerRoles[dgSpeaker]
+          : undefined;
+      log("utterance", "new", {
+        dg: dgSpeaker,
+        role: role ?? "?",
+        text: preview(clean, 100),
+      });
+    }
+
     this.lastTranscriptAt = Date.now();
     // Short-circuit: when a pre-computed timeline is driving the UI
     // (upload mode with successful preanalyze), skip classify-moment +
     // commentary + hint triggers entirely. Utterances still landed in
     // liveUtterances above — that's all we need for the captions path.
-    if (this.usingTimeline) return;
     // LIVE-MODE GATE: don't classify moments or fire commentary until
     // both interviewer AND candidate roles have been confidently
     // identified. Without this, we'd run classify-moment with "Speaker
@@ -1428,24 +1250,25 @@ export class LiveOrchestrator {
   }
 
   /** True when the previously-displayed commentary still needs time to
-   *  be read. Used to gate listening hints + warm-up commentary
-   *  generation so a new piece doesn't overwrite something the user is
-   *  still absorbing. Q-A commentary is NOT gated on this (see the
-   *  note on lastCommentaryText above). */
-  private isStillBeingRead(): boolean {
-    if (!this.lastCommentaryText) return false;
-    const elapsed = Date.now() - this.lastCommentaryReadyAt;
-    const required = this.computeReadingTimeMs(this.lastCommentaryText);
-    return elapsed < required;
-  }
-
-  /** Update the shared reading-protection state. Called at the end of
-   *  any commentary stream that actually put content on screen. */
-  private markCommentaryDisplayed(text: string): void {
+  /** Update the per-kind reading-protection state. Called at the end
+   *  of any commentary stream that actually put content on screen.
+   *  Q-A commentary doesn't call this — it has its own minMs gate via
+   *  liveDisplayedComment. listen-hint and cand-q-cmt write here so
+   *  REPEATS within the same kind defer correctly without blocking the
+   *  OTHER kind. */
+  private markCommentaryDisplayed(
+    kind: "listen-hint" | "cand-q-cmt",
+    text: string
+  ): void {
     const trimmed = text.trim();
     if (!trimmed) return;
-    this.lastCommentaryText = trimmed;
-    this.lastCommentaryReadyAt = Date.now();
+    if (kind === "listen-hint") {
+      this.lastListenHintText = trimmed;
+      this.lastListenHintReadyAt = Date.now();
+    } else {
+      this.lastCandQCmtText = trimmed;
+      this.lastCandQCmtReadyAt = Date.now();
+    }
   }
 
   /**
@@ -1555,9 +1378,31 @@ export class LiveOrchestrator {
    *  Re-fires when applyMomentInner detects a NEW candidate question
    *  text (different from the prior one). Same question text → no fire,
    *  the existing commentary stays on screen. */
-  private async generateCandidateQuestionCommentary(candidateQuestion: string) {
-    const { liveJd, liveResume, commentLang, setLiveCandidateQuestionCommentary } =
-      useStore.getState();
+  private async generateCandidateQuestionCommentary(
+    candidateQuestion: string,
+    /** Question.id of the kind="candidate" row this commentary attaches
+     *  to. The orchestrator-side caller (applyMomentInner reverse-Q&A
+     *  branch) creates this row + passes the id through so the streamed
+     *  commentary can be persisted as a Comment(kind="cand-q-cmt") under
+     *  it on completion. Optional for backward compat — undefined means
+     *  "live-only, don't persist", which matches legacy behavior for any
+     *  pre-2026-05 callers. */
+    candidateQuestionId?: string
+  ) {
+    const {
+      liveJd,
+      liveResume,
+      liveInterviewerProfile,
+      liveInterviewerProfileSummary,
+      commentLang,
+      setLiveCandidateQuestionCommentary,
+    } = useStore.getState();
+    // Prefer the AI summary (~50 words) over the raw paste (~3000
+    // words) — same coaching signal at a fraction of the input tokens.
+    // Falls back to raw if the session-start summarization hasn't
+    // returned yet, to None if neither is available.
+    const interviewerProfileForCall =
+      liveInterviewerProfileSummary || liveInterviewerProfile;
     setLiveCandidateQuestionCommentary(""); // clear previous — streaming starts fresh
     log("cand-q-cmt", "request", {
       cqLen: candidateQuestion.length,
@@ -1569,6 +1414,7 @@ export class LiveOrchestrator {
       {
         jd: liveJd,
         resume: liveResume,
+        interviewerProfile: interviewerProfileForCall,
         question: "",
         answer: "",
         mode: "candidate_question",
@@ -1587,12 +1433,30 @@ export class LiveOrchestrator {
       }
     );
     if (accumulated !== null && !sawApiError && accumulated.length > 0) {
-      this.markCommentaryDisplayed(accumulated);
+      this.markCommentaryDisplayed("cand-q-cmt", accumulated);
       log("cand-q-cmt", "done", {
         chars: accumulated.length,
         readMs: this.computeReadingTimeMs(accumulated),
         preview: preview(accumulated, 100),
       });
+      // Persist this commentary stream as a Comment(kind="cand-q-cmt")
+      // under the candidate question. Without this, the in-memory
+      // commentary is lost when endLive snapshots the session, leaving
+      // PastView's Transcript with a candidate-question entry that has
+      // an empty comments[] array — defeating the entire reverse-Q&A
+      // surface. The store mutation matches what the listening-hint
+      // path does (addCommentToQuestion); the only difference is kind.
+      if (candidateQuestionId) {
+        const commentId = `cand-q-cmt-${Date.now().toString(36)}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+        useStore.getState().addCommentToQuestion(candidateQuestionId, {
+          id: commentId,
+          text: accumulated,
+          atSeconds: useStore.getState().live.elapsedSeconds,
+          kind: "cand-q-cmt",
+        });
+      }
     }
   }
 
@@ -1624,20 +1488,20 @@ export class LiveOrchestrator {
     if (newCharsSinceLastHint < LISTENING_HINT_TRIGGER_CHARS) return false;
     if (Date.now() - this.lastListeningHintAt < LISTENING_HINT_MIN_GAP_MS)
       return false;
-    // Reading-protection: don't clobber the previous hint while it's
-    // still inside its content-length-based min-display window. We
-    // reuse `lastCommentaryReadyAt` + `lastCommentaryText` which are
-    // already set by markCommentaryDisplayed at the end of every hint
-    // generation (and by Q-A / cand-q-cmt successes too). If the
-    // previous commentary slot is still being read, defer.
-    if (this.lastCommentaryReadyAt > 0 && this.lastCommentaryText) {
-      const required = computeMinDisplayMs(this.lastCommentaryText);
-      const elapsed = Date.now() - this.lastCommentaryReadyAt;
+    // Reading-protection: don't clobber the previous LISTENING HINT
+    // while it's still inside its content-length-based min-display
+    // window. Cross-kind defers (Q-A or cand-q-cmt blocking a listen-
+    // hint) were removed — those occupy different logical phases of
+    // the UI; a stale Q-A reading window shouldn't block a hint that
+    // belongs to the interviewer's current monologue.
+    if (this.lastListenHintReadyAt > 0 && this.lastListenHintText) {
+      const required = computeMinDisplayMs(this.lastListenHintText);
+      const elapsed = Date.now() - this.lastListenHintReadyAt;
       if (elapsed < required) {
         log("listen-hint", "deferred-reading", {
           elapsedMs: elapsed,
           requiredMs: required,
-          prev: preview(this.lastCommentaryText, 60),
+          prev: preview(this.lastListenHintText, 60),
         });
         return false;
       }
@@ -1656,8 +1520,18 @@ export class LiveOrchestrator {
     // generation time and wait for additional LISTENING_HINT_TRIGGER_CHARS
     // on top before allowing another hint (handled via lastListeningHintAt).
 
-    const { liveJd, liveResume, commentLang, setLiveListeningHint } =
-      useStore.getState();
+    const {
+      liveJd,
+      liveResume,
+      liveInterviewerProfile,
+      liveInterviewerProfileSummary,
+      commentLang,
+      setLiveListeningHint,
+    } = useStore.getState();
+    // See generateCandidateQuestionCommentary for the rationale —
+    // prefer the AI summary, fall back to the raw paste.
+    const interviewerProfileForCall =
+      liveInterviewerProfileSummary || liveInterviewerProfile;
 
     setLiveListeningHint(""); // clear any previous hint — streaming begins fresh
 
@@ -1672,6 +1546,7 @@ export class LiveOrchestrator {
         {
           jd: liveJd,
           resume: liveResume,
+          interviewerProfile: interviewerProfileForCall,
           question: "",
           answer: "",
           mode: "listening",
@@ -1689,16 +1564,58 @@ export class LiveOrchestrator {
       this.lastListeningHintBufferSize =
         this.interviewerMonologueBuffer.length;
       if (accumulated !== null && !sawApiError && accumulated.length > 0) {
-        this.markCommentaryDisplayed(accumulated);
+        this.markCommentaryDisplayed("listen-hint", accumulated);
+        // Buffer this hint for attachment to the next Lead question
+        // that locks. We don't have a question yet (state is
+        // interviewer_speaking by definition when hints fire), so we
+        // can't write it to the store directly — drainPendingListening
+        // Hints picks it up on the next commitLead / addFollowUpAndStart
+        // / archiveCurrentMainAndStartNew. Falls through to endLive's
+        // flush if the session ends before another Lead locks.
+        this.pendingListeningHints.push({
+          id: rand("c"),
+          text: accumulated,
+          atSeconds: useStore.getState().live.elapsedSeconds,
+          // Capture the monologue snapshot the AI just saw — see the
+          // pendingListeningHints type docblock for why time-window
+          // recovery doesn't work.
+          contextText: monologue,
+        });
         log("listen-hint", "done", {
           chars: accumulated.length,
           readMs: this.computeReadingTimeMs(accumulated),
           preview: preview(accumulated, 100),
+          buffered: this.pendingListeningHints.length,
         });
       }
     } finally {
       this.pendingListeningHint = false;
     }
+  }
+
+  /** Drain the buffered listening hints onto the given question as
+   *  listening-kind comments. Called from each Lead-commit path so the
+   *  hint that fired during the preceding interviewer monologue lands
+   *  under the question that monologue led into. No-op when buffer is
+   *  empty. */
+  private drainPendingListeningHints(questionId: string): void {
+    if (this.pendingListeningHints.length === 0) return;
+    const store = useStore.getState();
+    const drained = this.pendingListeningHints;
+    this.pendingListeningHints = [];
+    for (const h of drained) {
+      store.addCommentToQuestion(questionId, {
+        id: h.id,
+        text: h.text,
+        atSeconds: h.atSeconds,
+        kind: "listening",
+        contextText: h.contextText,
+      });
+    }
+    log("listen-hint", "drained-to-question", {
+      questionId,
+      count: drained.length,
+    });
   }
 
   // ----- moment state machine -----
@@ -1831,6 +1748,7 @@ export class LiveOrchestrator {
     if (next === prev) {
       // Classifier agrees with current state — clear pending counter.
       this.momentHysteresisPending = null;
+      this.cancelClosingHysteresisAutoTimer("classifier-agrees");
     } else if (next !== "question_finalized") {
       const p = this.momentHysteresisPending;
       if (!p || p.state !== next) {
@@ -1842,6 +1760,16 @@ export class LiveOrchestrator {
           count: 1,
           need: MOMENT_HYSTERESIS_THRESHOLD,
         });
+        // If the pending state is "closing", arm the silence auto-
+        // confirm timer (a real goodbye followed by silence won't
+        // produce another classify cycle to provide the second vote).
+        // Any other pending state cancels an in-flight closing auto-
+        // timer — we're no longer drifting toward closing.
+        if (next === "closing") {
+          this.armClosingHysteresisAutoTimer(summary, questionText, rel, candidateQuestion);
+        } else {
+          this.cancelClosingHysteresisAutoTimer("pending-flipped-away");
+        }
         return;
       }
       p.count += 1;
@@ -1856,11 +1784,13 @@ export class LiveOrchestrator {
       }
       // Vote passed the threshold — clear pending and commit.
       this.momentHysteresisPending = null;
+      this.cancelClosingHysteresisAutoTimer("vote-confirmed");
     } else {
       // question_finalized: bypass hysteresis. The 4-layer filter
       // decides whether to actually lock the Q; clear any stale
       // pending to avoid a chitchat vote holding across a real Q.
       this.momentHysteresisPending = null;
+      this.cancelClosingHysteresisAutoTimer("question-finalized");
     }
 
     try {
@@ -2016,23 +1946,39 @@ export class LiveOrchestrator {
       }
 
       // === Layer B: read-gate ===
-      // Don't replace an actively-displayed commentary while it's still
-      // inside its content-length-derived min-display window. A 472-char
-      // cand-q-cmt needs ~70s of reading time; firing a new one 6s
-      // later (because the classifier emitted a slightly different
+      // Don't replace an actively-displayed CAND-Q-CMT while it's still
+      // inside its content-length-derived min-display window. A 472-
+      // char cand-q-cmt needs ~70s of reading time; firing a new one
+      // 6s later (because the classifier emitted a slightly different
       // wording of the same intent that slipped past Jaccard, or even
       // a genuinely different question that arrived too fast) yanks
-      // it off screen mid-read. Drop, don't queue — by the time the
-      // gate clears, the conversation has moved on; queued commentary
-      // would be stale.
-      if (this.lastCommentaryReadyAt > 0 && this.lastCommentaryText) {
-        const required = computeMinDisplayMs(this.lastCommentaryText);
-        const elapsed = Date.now() - this.lastCommentaryReadyAt;
+      // it off screen mid-read.
+      //
+      // CAP at CAND_Q_MAX_READ_GATE_MS (25s): in the reverse-Q&A
+      // phase the candidate cycles through 3-5 questions in 1-2
+      // minutes — they're not stopping to fully reread a 70-second
+      // hint between each. Without a cap, the read-gate held the
+      // channel open long enough that 7 of 11 follow-up commentaries
+      // got dropped on the Uber session (post-mortem 2026-05-06).
+      // 25s is enough to skim a typical hint but short enough that
+      // a genuinely new candidate question gets coaching.
+      //
+      // Per-kind defer only: a stale listening-hint reading window
+      // does NOT block a fresh cand-q-cmt anymore. Phase has changed
+      // (interviewer monologue → reverse Q&A); the UI slot has
+      // already turned over.
+      const CAND_Q_MAX_READ_GATE_MS = 25_000;
+      if (this.lastCandQCmtReadyAt > 0 && this.lastCandQCmtText) {
+        const computed = computeMinDisplayMs(this.lastCandQCmtText);
+        const required = Math.min(computed, CAND_Q_MAX_READ_GATE_MS);
+        const elapsed = Date.now() - this.lastCandQCmtReadyAt;
         if (elapsed < required) {
           log("cand-q-cmt", "deferred-reading", {
             elapsedMs: elapsed,
             requiredMs: required,
-            prev: preview(this.lastCommentaryText, 60),
+            computedMs: computed,
+            cappedAt: CAND_Q_MAX_READ_GATE_MS,
+            prev: preview(this.lastCandQCmtText, 60),
             droppedCq: preview(cq, 60),
           });
           return;
@@ -2063,8 +2009,33 @@ export class LiveOrchestrator {
       // Lock + UI-side `!mainQuestion` gate together solve both.
       useStore.getState().setLiveLockedCandidateQuestion(cq);
       useStore.getState().setLiveCandidateQuestionCommentary("");
-      log("candidate-q", "new", { text: preview(cq, 80) });
-      void this.generateCandidateQuestionCommentary(cq);
+      // Persist this candidate question as a Question row with
+      // kind="candidate" so it survives endLive into PastView's
+      // Transcript. Without this row the AI commentary on the
+      // question (cand-q-cmt) would have no attachment point in the
+      // existing comments-belong-to-questions schema, and the entire
+      // reverse-Q&A phase would be lost from the Past view.
+      // ID prefix is "cand-q-" so it's visually distinct from the
+      // interviewer-question IDs ("q-…") in logs and DB queries.
+      const candQId = `cand-q-${Date.now().toString(36)}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      const askedAtSec = useStore.getState().live.elapsedSeconds;
+      useStore.getState().addQuestion({
+        id: candQId,
+        text: cq,
+        askedAtSeconds: askedAtSec,
+        comments: [],
+        kind: "candidate",
+        // parentQuestionId / answerText intentionally undefined — these
+        // are interviewer-question concepts that don't apply.
+      });
+      log("candidate-q", "new", {
+        text: preview(cq, 80),
+        candQId,
+        atSec: askedAtSec,
+      });
+      void this.generateCandidateQuestionCommentary(cq, candQId);
       return;
     }
 
@@ -2205,10 +2176,16 @@ export class LiveOrchestrator {
 
   /** Arm the 3-second silence timer when state enters "closing". A
    *  substantive utterance (>10 chars, see onUtterance) cancels it.
-   *  No-op once fired or once user opted to keep recording. */
+   *  Skips if we're inside the cooldown window from a prior fire or
+   *  user dismissal. */
   private armClosingSilenceTimer(): void {
-    if (this.closingDetectionDisabled) return;
-    if (this.closingDetectionFired) return;
+    const now = Date.now();
+    if (now < this.closingDetectionMutedUntil) {
+      log("closing", "muted", {
+        remainingMs: this.closingDetectionMutedUntil - now,
+      });
+      return;
+    }
     if (this.closingSilenceTimer) {
       clearTimeout(this.closingSilenceTimer);
     }
@@ -2217,7 +2194,8 @@ export class LiveOrchestrator {
     });
     this.closingSilenceTimer = setTimeout(() => {
       this.closingSilenceTimer = null;
-      if (this.closingDetectionDisabled) return;
+      const fireNow = Date.now();
+      if (fireNow < this.closingDetectionMutedUntil) return;
       // Verify we're STILL in closing at fire time. If the classifier
       // moved us back to interviewer_speaking / chitchat in the
       // intervening 3s (e.g. interviewer pivoted to "actually one more
@@ -2228,12 +2206,16 @@ export class LiveOrchestrator {
         log("closing", "abandoned", { stateNow });
         return;
       }
-      this.closingDetectionFired = true;
+      // Mute future fires for 30s so we don't re-fire while the modal
+      // is still on screen. The user's choice (Save / Continue) extends
+      // this — see disableClosingDetection.
+      this.closingDetectionMutedUntil =
+        fireNow + LiveOrchestrator.CLOSING_FIRE_COOLDOWN_MS;
       log("closing", "fired", {});
       // Dispatch to the UI. Caught by LiveView, which renders the
       // "Save now?" confirmation dialog. If the user picks "continue
-      // recording", they'll call disableClosingDetection() to silence
-      // future fires.
+      // recording", they'll call disableClosingDetection() which
+      // extends the mute window to a longer cooldown.
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("ic:closing-detected"));
       }
@@ -2251,14 +2233,151 @@ export class LiveOrchestrator {
     }
   }
 
+  /** Arm the silence auto-confirm timer for a pending closing transit.
+   *  See `closingHysteresisAutoTimer` doc for rationale. Args mirror
+   *  applyMomentInner so we can replay the commit at fire time with
+   *  the same context the original classify response carried. */
+  private armClosingHysteresisAutoTimer(
+    summary: string,
+    questionText: string,
+    rel: QuestionRelation,
+    candidateQuestion: string
+  ): void {
+    if (this.closingHysteresisAutoTimer) {
+      clearTimeout(this.closingHysteresisAutoTimer);
+    }
+    log("closing", "hysteresis-auto-armed", {
+      ms: LiveOrchestrator.CLOSING_SILENCE_AUTOCONFIRM_MS,
+    });
+    this.closingHysteresisAutoTimer = setTimeout(() => {
+      this.closingHysteresisAutoTimer = null;
+      // Re-check: pending might have flipped to a different state in
+      // the meantime, OR a fresh utterance might have transitioned us
+      // out of the "drifting toward closing" zone.
+      const p = this.momentHysteresisPending;
+      if (!p || p.state !== "closing") {
+        log("closing", "hysteresis-auto-skip", {
+          reason: "pending-not-closing",
+        });
+        return;
+      }
+      const msSinceLastUtterance = this.lastTranscriptAt
+        ? Date.now() - this.lastTranscriptAt
+        : Infinity;
+      if (
+        msSinceLastUtterance < LiveOrchestrator.CLOSING_SILENCE_AUTOCONFIRM_MS
+      ) {
+        log("closing", "hysteresis-auto-skip", {
+          reason: "speech-after-arm",
+          msSinceLastUtterance,
+        });
+        return;
+      }
+      // Treat the silence as the second confirmation vote. Clear the
+      // pending counter and commit the closing transit, which arms the
+      // 3-second silence-then-fire timer in armClosingSilenceTimer.
+      log("closing", "hysteresis-auto-confirm", {});
+      this.momentHysteresisPending = null;
+      try {
+        this.applyMomentInner(
+          "closing",
+          summary,
+          questionText,
+          rel,
+          candidateQuestion
+        );
+      } finally {
+        const after = useStore.getState().liveMomentState.state;
+        log("moment", "transit", {
+          from: "<auto-confirm>",
+          to: after,
+          rel,
+        });
+      }
+    }, LiveOrchestrator.CLOSING_SILENCE_AUTOCONFIRM_MS);
+  }
+
+  /** Cancel the closing hysteresis auto-confirm timer. Called whenever
+   *  hysteresis pending clears or flips to a non-closing state. */
+  private cancelClosingHysteresisAutoTimer(reason: string): void {
+    if (this.closingHysteresisAutoTimer) {
+      clearTimeout(this.closingHysteresisAutoTimer);
+      this.closingHysteresisAutoTimer = null;
+      log("closing", "hysteresis-auto-cancel", { reason });
+    }
+  }
+
   /** Public hook for the UI to call when the user picks "continue
-   *  recording" from the closing-detected dialog. Permanently disables
-   *  closing detection for the rest of this session so the dialog
-   *  doesn't keep popping every time the classifier re-enters closing. */
+   *  recording" from the closing-detected dialog. Mutes closing
+   *  detection for CLOSING_DISMISS_COOLDOWN_MS (default 5 min) — long
+   *  enough that the user isn't repeatedly nagged during ongoing small
+   *  talk, short enough that a real goodbye 5-10 minutes later still
+   *  triggers the prompt. The previous behavior of permanently
+   *  disabling for the session caused real end-of-interview goodbyes
+   *  to silently miss the prompt. */
   public disableClosingDetection(): void {
-    this.closingDetectionDisabled = true;
+    this.closingDetectionMutedUntil =
+      Date.now() + LiveOrchestrator.CLOSING_DISMISS_COOLDOWN_MS;
     this.cancelClosingSilenceTimer("user-dismissed-dialog");
-    log("closing", "disabled-by-user", {});
+    // Also cancel the hysteresis-auto-confirm timer. Without this,
+    // an in-flight 8s timer from a recent classifier "closing"
+    // proposal can fire AFTER the user has already clicked End,
+    // dispatching ic:closing-detected and popping the "Looks like
+    // the interview just wrapped up" prompt mid-stop. That prompt
+    // confused users into clicking through it during the End flow,
+    // routing through a SECOND handleEndConfirm and racing the
+    // first one to a corrupted save.
+    if (this.closingHysteresisAutoTimer) {
+      clearTimeout(this.closingHysteresisAutoTimer);
+      this.closingHysteresisAutoTimer = null;
+      log("closing", "hysteresis-auto-cancel", {
+        reason: "disable-closing-detection",
+      });
+    }
+    log("closing", "muted-cooldown", {
+      cooldownMs: LiveOrchestrator.CLOSING_DISMISS_COOLDOWN_MS,
+    });
+  }
+
+  /** Public hook for the UI to call AFTER the user picks a role from
+   *  the speaker-identity prompt (resolveSpeakerPrompt has already
+   *  committed the chosen dg's role).
+   *
+   *  Why this exists: the auto-assign branch in onUtterance ("if one
+   *  side has a role, the new dg gets the OPPOSITE role") only fires
+   *  when an unassigned dg PRODUCES an utterance. Common race:
+   *    1. dg:0 speaks first → prompt fires for dg:0
+   *    2. dg:1 speaks (still unassigned, prompt for dg:0 still up)
+   *       → fall-through (both roles unfilled, prompt already pending)
+   *    3. User tags dg:0 as interviewer
+   *    4. dg:1 doesn't speak again for a long time
+   *    → dg:1 never auto-assigns to candidate, captions stay broken.
+   *
+   *  Fix: when the prompt resolves, immediately walk knownDgSpeakers
+   *  and auto-assign any unassigned ones using the same OPPOSITE-role
+   *  rule. Since the prompt just committed exactly one role, every
+   *  other known dg gets the other role. */
+  public notifySpeakerPromptResolved(): void {
+    const state = useStore.getState();
+    const committed = state.liveSpeakerRoles;
+    const hasInterviewer = Object.values(committed).includes("interviewer");
+    const hasCandidate = Object.values(committed).includes("candidate");
+    // Both sides already filled or nothing to fill — nothing to do.
+    if (hasInterviewer === hasCandidate) return;
+    const fillRole: "interviewer" | "candidate" = hasInterviewer
+      ? "candidate"
+      : "interviewer";
+    const updates: Record<number, "interviewer" | "candidate"> = {};
+    for (const dg of this.knownDgSpeakers) {
+      if (committed[dg] === undefined) {
+        updates[dg] = fillRole;
+      }
+    }
+    if (Object.keys(updates).length === 0) return;
+    state.mergeSpeakerRoles(updates);
+    for (const [dg, role] of Object.entries(updates)) {
+      log("roles", "auto-after-resolve", { dg: Number(dg), role });
+    }
   }
 
   // ============================================================
@@ -2312,24 +2431,34 @@ export class LiveOrchestrator {
   }
 
   /** Layer 1: does the proposed Q text actually appear in the recent
-   *  interviewer transcript? Classifier can hallucinate — if the
-   *  proposed text shares <GROUNDING_MIN_TOKEN_MATCH of its non-stop
-   *  tokens with what the interviewer actually said in the last
-   *  GROUNDING_RECENT_SEC seconds, treat as a hallucination. Pure
-   *  local check, zero cost / zero latency. */
+   *  transcript? Classifier can hallucinate — if the proposed text
+   *  shares <GROUNDING_MIN_TOKEN_MATCH of its non-stop tokens with
+   *  what was actually said in the last GROUNDING_RECENT_SEC seconds,
+   *  treat as a hallucination. Pure local check, zero cost / zero
+   *  latency.
+   *
+   *  Diarization-fold safety: we no longer restrict the haystack to
+   *  utterances tagged "interviewer". Deepgram occasionally splits a
+   *  single candidate or interviewer into two phantom speaker IDs;
+   *  the live system folds them back later but during the few
+   *  seconds before fold-applied lands, real interviewer text can be
+   *  filed under "candidate". The Uber session post-mortem
+   *  (2026-05-06) caught this: 3 substantive interviewer questions
+   *  were L1-failed because their tokens lived in mis-tagged
+   *  utterances. Including the full transcript as the haystack still
+   *  catches the real hallucination case (fabricated text doesn't
+   *  appear in EITHER role's recent speech) without being defeated
+   *  by diarization wobble. */
   private isGrounded(questionText: string): boolean {
     const store = useStore.getState();
     const nowSec = store.live.elapsedSeconds;
     const recentCutoff = nowSec - GROUNDING_RECENT_SEC;
-    const roles = store.liveSpeakerRoles;
-    const interviewerText: string[] = [];
+    const recentText: string[] = [];
     for (const u of store.liveUtterances) {
       if (u.atSeconds < recentCutoff) continue;
-      if (u.dgSpeaker === undefined) continue;
-      if (roles[u.dgSpeaker] !== "interviewer") continue;
-      interviewerText.push(u.text.toLowerCase());
+      recentText.push(u.text.toLowerCase());
     }
-    const haystack = interviewerText.join(" ");
+    const haystack = recentText.join(" ");
     if (!haystack) return false;
     const tokens = questionText
       .toLowerCase()
@@ -2365,6 +2494,16 @@ export class LiveOrchestrator {
         : Number.POSITIVE_INFINITY;
     const priorWasCandidateQuestioning =
       sinceExitMs < REVERSE_QA_LEAD_COOLDOWN_MS;
+    // Maturity hints for the L2 verifier — relaxes the
+    // "still_setting_up" rejection in late-session sessions where
+    // short logistics questions ("Where are you located?") were
+    // historically being eaten by the verifier biased for setup-phase
+    // signals.
+    const store = useStore.getState();
+    const sessionElapsedSec = store.live.elapsedSeconds;
+    const priorLeadCount = store.liveQuestions.filter(
+      (q) => !q.parentQuestionId
+    ).length;
     try {
       const resp = await fetch("/api/classify-moment", {
         method: "POST",
@@ -2376,6 +2515,8 @@ export class LiveOrchestrator {
           mode: "confirm",
           candidateQuestion: questionText,
           priorWasCandidateQuestioning,
+          sessionElapsedSec,
+          priorLeadCount,
         }),
       });
       if (!resp.ok) return "still_setting_up";
@@ -2541,6 +2682,25 @@ export class LiveOrchestrator {
    *  Discard and let the next classify pass take another shot. */
   private cancelPendingOnInterviewerTurn(): void {
     if (!this.pendingLead) return;
+    // Don't cancel if the candidate has ALREADY substantively answered
+    // the pending Lead. In that case the interviewer's continuation is
+    // a follow-up reaction ("oh wait, I see Texas on your resume...")
+    // not "I wasn't done asking" — the original question landed, was
+    // answered, and the proposed Lead should still commit.
+    //
+    // Threshold mirrors REVERSE_QA_ANSWER_MIN_CHARS — same logic, same
+    // floor. Without this guard, late-session questions like "Where
+    // are you located?" got eaten by L3 every time the interviewer
+    // interjected after a brief candidate reply.
+    const REPLY_LANDED_MIN_CHARS = 30;
+    if (this.pendingAnswerBuffer.length >= REPLY_LANDED_MIN_CHARS) {
+      log("filter", "L3-interviewer-continued-ignored", {
+        reason: "candidate-already-answering",
+        answerChars: this.pendingAnswerBuffer.length,
+        text: preview(this.pendingLead.text, 60),
+      });
+      return;
+    }
     this.discardPendingLead("L3-interviewer-continued");
   }
 
@@ -2602,6 +2762,11 @@ export class LiveOrchestrator {
       comments: [],
     };
     store.addQuestion(q);
+    // Drain any listening hints that fired during the preceding
+    // interviewer monologue (typically the team intro / case setup
+    // before the first Lead) — they belong under this question in the
+    // PastView transcript.
+    this.drainPendingListeningHints(q.id);
     // Defensive: clear any locked Probe Q. Pre-anchored path means
     // there was no current Lead before, so no probe could be locked —
     // but if a prior session's state somehow leaked through, this is
@@ -2644,6 +2809,9 @@ export class LiveOrchestrator {
       parentQuestionId: parentId,
     };
     store.addQuestion(q);
+    // Drain any listening hints that fired during the preceding
+    // interviewer monologue onto this Probe.
+    this.drainPendingListeningHints(q.id);
     // Lock the Probe Q text. Mirrors the Lead-Q lock pattern: the Phase
     // bar's Probe sub-row should persist as long as this probe is the
     // active sub-question of the current Lead, even when the moment
@@ -2699,6 +2867,9 @@ export class LiveOrchestrator {
       comments: [],
     };
     store.addQuestion(q);
+    // Drain any listening hints that fired during the preceding
+    // interviewer monologue onto this new Lead.
+    this.drainPendingListeningHints(q.id);
     // Clear the locked Probe Q text — interviewer pivoted to a new Lead,
     // any prior probe is now stale.
     store.setLiveLockedProbeQuestion(null);
@@ -2915,8 +3086,19 @@ export class LiveOrchestrator {
     const bufferForThisComment = this.answerBuffer;
     this.answerBuffer = "";
 
-    const { liveJd, liveResume, commentLang, addCommentToQuestion, live } =
-      useStore.getState();
+    const {
+      liveJd,
+      liveResume,
+      liveInterviewerProfile,
+      liveInterviewerProfileSummary,
+      commentLang,
+      addCommentToQuestion,
+      live,
+    } = useStore.getState();
+    // See generateCandidateQuestionCommentary for the rationale —
+    // prefer the AI summary, fall back to the raw paste.
+    const interviewerProfileForCall =
+      liveInterviewerProfileSummary || liveInterviewerProfile;
 
     const commentId = rand("c");
     const emptyComment: Comment = {
@@ -2939,6 +3121,7 @@ export class LiveOrchestrator {
         {
           jd: liveJd,
           resume: liveResume,
+          interviewerProfile: interviewerProfileForCall,
           question: currentQ.text,
           answer: bufferForThisComment,
           priorComments: currentQ.comments.map((c) => c.text),
@@ -2987,10 +3170,12 @@ export class LiveOrchestrator {
       useStore.getState().setAnswerInProgress(false);
       this.lastCommentAt.set(currentQ.id, Date.now());
       if (!sawApiError && accumulated.length > 0) {
-        // Q-A isn't gated by the reading-protection check itself, but we
-        // update the shared state so subsequent listening hints / warm-up
-        // commentary wait for the Q-A observation to be read.
-        this.markCommentaryDisplayed(accumulated);
+        // Q-A commentary doesn't write to the shared reading-protection
+        // state anymore. Each kind tracks its own; Q-A is gated by
+        // liveDisplayedComment.minMs (set above) which is its native
+        // mechanism. Cross-kind blocking caused listening-hint reading
+        // windows to defer cand-q-cmt unnecessarily — fixed by the
+        // per-kind split.
         // Count this commentary against the escalating-threshold cap.
         const prevCount = this.commentCountPerQ.get(currentQ.id) ?? 0;
         this.commentCountPerQ.set(currentQ.id, prevCount + 1);

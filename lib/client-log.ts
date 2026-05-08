@@ -1,69 +1,39 @@
 /**
- * Client-side debug-log helper.
+ * Client-side debug-log helper. Thin wrapper around lib/debug-buffer.
  *
- * Every call is fire-and-forget: we never await the response, never
- * surface errors, never block the UI. The log is test-only
- * infrastructure — its failure must not break the live session.
+ * Older revisions POSTed every event to /api/debug-log which appended
+ * to a file under debug-logs/. The file path doesn't survive
+ * production deploys (one EB instance, restarts wipe local state,
+ * past sessions need their own log). Phase 2 moved logging into a
+ * client-side ring buffer that ships with the session POST at
+ * endLive — see lib/debug-buffer.ts.
  *
- * The `tSec` we pass is the session's elapsed seconds from the live
- * store, which is exactly the clock the user sees in the UI. That way
- * when they tell me "at 2:34 the commentary went blank", the log line
- * timestamp for that event will also be around `02:34` and I can grep
- * directly.
+ * Existing call sites (orchestrator.ts, app/app/page.tsx) keep using
+ * logClient(...) and resetClientLog() unchanged; only the
+ * implementation moved.
  */
 
 import { useStore } from "./store";
+import { pushDebugEvent, resetDebugBuffer } from "./debug-buffer";
 
-/** Append one event to the session log. Source/event should be short,
- *  consistent tags so I can grep across sessions (e.g. source="classify"
- *  event="request" | "response" | "error"). Data should be a small
- *  object or string — previews only, not full transcripts (the server
- *  truncates long payloads to 400 chars anyway). */
+/** Append one event to the in-memory session log. */
 export function logClient(
   source: string,
   event: string,
   data?: unknown
 ): void {
-  let tSec = 0;
+  let tSec: number | undefined;
   try {
     tSec = useStore.getState().live.elapsedSeconds;
   } catch {
-    /* store not mounted yet — fine, server falls back to wall clock */
+    /* store not mounted yet — buffer falls back to wall clock */
   }
-  const body = JSON.stringify({ tSec, source, event, data });
-  // keepalive lets the request complete even if the page is unloading.
-  try {
-    void fetch("/api/debug-log", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-      keepalive: true,
-    }).catch(() => {
-      /* swallow */
-    });
-  } catch {
-    /* swallow */
-  }
+  pushDebugEvent(source, event, data, tSec);
 }
 
-/** Rotate latest.log → prev.log and start a fresh session log.
- *  Called at the very start of a new interview session so the log's
- *  mm:ss clock matches the UI clock the user reads during the test. */
+/** Wipe the buffer at the start of a new session so timestamps line
+ *  up with the UI's mm:ss clock. */
 export function resetClientLog(): void {
-  try {
-    void fetch("/api/debug-log", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        reset: true,
-        source: "session",
-        event: "reset",
-      }),
-      keepalive: true,
-    }).catch(() => {
-      /* swallow */
-    });
-  } catch {
-    /* swallow */
-  }
+  resetDebugBuffer();
+  pushDebugEvent("session", "reset");
 }

@@ -61,7 +61,7 @@ export async function resetLog(): Promise<void> {
     /* latest.log doesn't exist yet */
   }
   const header =
-    `# Interview Coach debug log · session ${new Date().toISOString()}\n` +
+    `# puebulo debug log · session ${new Date().toISOString()}\n` +
     `# format: mm:ss.mmm  [source]  event  data\n`;
   try {
     await writeFile(LATEST, header, "utf8");

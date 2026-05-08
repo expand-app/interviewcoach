@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { ModalShell } from "./ModalShell";
+import { Button, Input } from "@/components/ui";
 
 interface Props {
   open: boolean;
@@ -48,32 +49,22 @@ export function PromptModal({
   return (
     <ModalShell open={open} onClose={onCancel}>
       <div className="p-7 px-8">
-        <h2 className="text-[18px] font-semibold mb-1.5 text-ink">{title}</h2>
+        <h2 className="text-[18px] font-semibold mb-1.5 text-text">{title}</h2>
         {description && (
-          <div className="text-sm text-ink-light mb-4 leading-relaxed">{description}</div>
+          <div className="text-sm text-text-muted mb-4 leading-relaxed">{description}</div>
         )}
-        <input
+        <Input
           ref={inputRef}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
           placeholder={placeholder}
-          className="w-full px-3 py-2 border border-rule-strong rounded-md text-sm text-ink bg-paper outline-none focus:border-accent focus:ring focus:ring-accent/20"
         />
         <div className="flex gap-2 justify-end mt-5">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 rounded-md text-sm font-medium border border-rule-strong bg-paper text-ink hover:bg-paper-hover"
-          >
-            {cancelLabel}
-          </button>
-          <button
-            onClick={submit}
-            disabled={!value.trim()}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-accent hover:bg-[#1a73d1] border border-accent text-white disabled:opacity-50 disabled:cursor-not-allowed"
-          >
+          <Button onClick={onCancel}>{cancelLabel}</Button>
+          <Button variant="primary" onClick={submit} disabled={!value.trim()}>
             {confirmLabel}
-          </button>
+          </Button>
         </div>
       </div>
     </ModalShell>

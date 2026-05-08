@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { ModalShell } from "./ModalShell";
+import { Button, Input } from "@/components/ui";
 
 interface Props {
   open: boolean;
@@ -64,30 +65,26 @@ export function EndSessionModal({
     <ModalShell open={open} onClose={onCancel}>
       <div className="relative p-7 px-8">
         {/* X close — explicitly cancels the End action and keeps the
-            live session running. Same effect as Escape / backdrop click,
-            but makes the option visually obvious for users who don't
-            know about Escape. */}
+            live session running. */}
         <button
           onClick={onCancel}
           aria-label="Close"
-          className="absolute top-3 right-3 w-7 h-7 inline-flex items-center justify-center rounded-md text-ink-lighter hover:text-ink hover:bg-paper-hover transition-colors"
+          className="absolute top-3 right-3 w-7 h-7 inline-flex items-center justify-center rounded-md text-text-subtle hover:text-text hover:bg-surface transition-colors"
         >
           <span className="text-[16px] leading-none">×</span>
         </button>
 
-        <h2 className="text-[18px] font-semibold mb-1.5 text-ink">
+        <h2 className="text-[18px] font-semibold mb-1.5 text-text">
           End this session?
         </h2>
-        <div className="text-sm text-ink-light mb-4 leading-relaxed">
-          This stops recording. You can save it to Past Sessions, or
-          discard it if it was a misstart. Closing this dialog (×)
-          keeps the live session running.
+        <div className="text-sm text-text-muted mb-4 leading-relaxed">
+          This stops recording. You can save it to Past Sessions or
+          discard it if it was a misstart. Click × (top-right) to keep
+          the live session running.
         </div>
 
-        <label className="block text-[12px] font-semibold text-ink-light mb-1">
-          Session name
-        </label>
-        <input
+        <label className="field-label">Session name</label>
+        <Input
           ref={inputRef}
           value={value}
           onChange={(e) => setValue(e.target.value)}
@@ -95,29 +92,22 @@ export function EndSessionModal({
             if (e.key === "Enter") submit();
           }}
           placeholder="Session name"
-          className="w-full px-3 py-2 border border-rule-strong rounded-md text-sm text-ink bg-paper outline-none focus:border-accent focus:ring focus:ring-accent/20"
         />
 
+        {/* Two-action footer: Discard (left, ghost button with error
+            tint on hover) / Save (right, primary). */}
         <div className="flex gap-2 justify-end mt-5 items-center">
-          <button
+          <Button
+            variant="ghost"
             onClick={onDiscard}
-            className="px-4 py-2 rounded-md text-sm font-medium border border-transparent text-ink-light hover:text-rose-700 hover:bg-rose-50 transition-colors mr-auto"
+            className="mr-auto"
+            style={{ color: "var(--color-text-muted)" }}
           >
             Discard (don&apos;t save)
-          </button>
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 rounded-md text-sm font-medium border border-rule-strong bg-paper text-ink hover:bg-paper-hover"
-          >
-            Keep recording
-          </button>
-          <button
-            onClick={submit}
-            disabled={!value.trim()}
-            className="px-4 py-2 rounded-md text-sm font-medium bg-accent hover:bg-[#1a73d1] border border-accent text-white disabled:opacity-50 disabled:cursor-not-allowed"
-          >
+          </Button>
+          <Button variant="primary" onClick={submit} disabled={!value.trim()}>
             Save
-          </button>
+          </Button>
         </div>
       </div>
     </ModalShell>

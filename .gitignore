@@ -25,6 +25,11 @@ yarn-error.log*
 .pnpm-debug.log*
 debug-classifications.jsonl
 /debug-logs/
+# Local dev server output + env-check scratch — generated on every
+# `npm run dev` / `npm run start` and on local env-validation runs.
+# Not useful in version control; dev.log can grow to multi-MB.
+dev.log
+envcheck.log
 
 # env files (all local environment files)
 .env
@@ -33,6 +38,15 @@ debug-classifications.jsonl
 
 # vercel
 .vercel
+
+# elastic beanstalk
+.elasticbeanstalk/
+*.zip
+
+# Local deploy staging — bundles, secrets-bearing option JSON,
+# version pointer. NEVER commit; everything in here is regenerated
+# on demand by .deploy/package.ps1 + the deploy CLI calls.
+.deploy/
 
 # typescript
 *.tsbuildinfo

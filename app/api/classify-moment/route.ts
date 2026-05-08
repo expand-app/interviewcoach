@@ -54,6 +54,17 @@ interface ClassifyBody {
    *  questions to the candidate. Set by the orchestrator within
    *  REVERSE_QA_LEAD_COOLDOWN_MS of the candidate_questioning exit. */
   priorWasCandidateQuestioning?: boolean;
+  /** For mode=confirm: how long the live session has been running, in
+   *  seconds. Used by the L2 verifier to relax the "still_setting_up"
+   *  rejection in mature sessions — by minute 20+ of a real interview,
+   *  the interviewer has been past the warm-up phase for a long time,
+   *  and a clean "Where are you located?" / "How many years of X?"
+   *  type question shouldn't be rejected as "still mid-setup". */
+  sessionElapsedSec?: number;
+  /** For mode=confirm: how many Lead questions have already locked in
+   *  this session. ≥ 2 means the session is firmly past introductions —
+   *  the L2 verifier should not be looking for setup-phase signals. */
+  priorLeadCount?: number;
 }
 
 /**
@@ -95,6 +106,28 @@ export async function POST(req: Request) {
   const candidateQuestion = (body.candidateQuestion || "").trim();
   const priorWasCandidateQuestioning =
     body.priorWasCandidateQuestioning === true;
+  const sessionElapsedSec = Number(body.sessionElapsedSec) || 0;
+  const priorLeadCount = Number(body.priorLeadCount) || 0;
+  // "Mature" session: >20 min in AND ≥2 Leads have already locked.
+  // Both conditions are required so brand-new sessions that just had
+  // long monologues don't accidentally trigger this relaxation.
+  // Maturity threshold: relaxes the L2 "still_setting_up" check
+  // once the session is past the typical warm-up phase. Lowered
+  // from `20 min + 2 leads` to `5 min + 1 lead` after observing
+  // false rejections on classic mid-session questions:
+  //   - Session ran 9 min, 1 lead locked (interviewer's role intro
+  //     monologue covered minutes 1-9)
+  //   - Interviewer pivoted: "Who are you? What drives you?
+  //     But more importantly, what questions can I answer for you?"
+  //   - Multi-sentence question with multiple "?" + trailing
+  //     framing → L2 conservatively returned "still_setting_up"
+  //   - Question got dropped, candidate's "tell me about yourself"
+  //     answer was attached to the wrong (earlier) Q in scoring
+  // After 5 min + 1 lead, the interviewer is firmly past
+  // mic-check / role-intro and any complete short-form question
+  // is genuinely a question, not setup.
+  const sessionIsMature =
+    sessionElapsedSec >= 5 * 60 && priorLeadCount >= 1;
 
   const client = getAnthropicClient();
 
@@ -111,9 +144,17 @@ export async function POST(req: Request) {
         reason: "no candidate question supplied",
       });
     }
-    const formatted = utterances
-      .map((u) => `[${u.speaker}]: ${u.text}`)
-      .join("\n");
+    // We DELIBERATELY strip speaker tags ([Interviewer]/[Candidate]) from
+    // the transcript here. Deepgram diarization mis-attributes routinely
+    // (back-channel overlap, short utterances, accent variation). The L2
+    // verifier was previously rejecting real interviewer questions just
+    // because the question text happened to land on a [Candidate] line —
+    // even with explicit prompt instructions to ignore the tag, the model
+    // kept anchoring on it. Easier to remove the temptation entirely:
+    // judge purely on question SHAPE + position in the transcript window.
+    // (Primary classifier already considered speaker labels before
+    // proposing the question, so no information is genuinely lost.)
+    const formatted = utterances.map((u) => `- ${u.text}`).join("\n");
     const confirmSystem = `You are a second-opinion verifier for an interview-assistant state machine. The primary classifier has proposed that the interviewer just finished asking the candidate a specific question. Your ONE job is to double-check that claim against the raw transcript.
 
 Return ONE of these verdicts:
@@ -123,6 +164,37 @@ Return ONE of these verdicts:
 
 Be strict. A fragment that ends with "and", "so", "um", "uh", "let me think", "actually", or any transition word is NOT done. If the proposed question text does not match something the interviewer literally said in the transcript, return "not_a_question".
 
+CANONICAL OPENING / TRANSITION QUESTIONS — always "done" if the proposed text matches one of these (or a close paraphrase) AND ends with a question mark:
+- "Tell me about yourself"
+- "Walk me through your resume" / "Walk me through your background"
+- "Who are you?" / "What drives you?" / "What makes you smile/happy?"
+- "What do you like to do outside of work?"
+- "Why this role?" / "Why are you interested in [Company/Team]?"
+These are stock interview prompts — when the interviewer asks one, they're explicitly inviting a candidate response, regardless of what they say AFTER (they may stack additional framing like "and then we'll get to your questions" — that's NOT them still setting up the question, it's them previewing the next agenda item). If the proposed text is one of these, return "done".
+
+CASE-STYLE PROMPTS WITH LONG SETUP — also always "done":
+A common interview pattern is a multi-sentence case prompt where most of the volume is hypothetical setup ("Imagine you are X working at Y…", "Consider a scenario where…", "Let's say you're the PM for product Z…", "We've noticed that…", "Your goal is to…") and the actual ask is the LAST sentence ("How would you approach this?", "What would you do?", "Walk me through your analysis", "What's your hypothesis?", "How do you prioritize?"). The bulk-is-setup shape MUST NOT be classified as "still_setting_up" — the setup is the QUESTION, and the trailing interrogative IS the directed ask. As long as the proposed text:
+  (a) ends with a clear interrogative clause (verb pattern like "how would you...", "what would you...", "walk me through...", "what's your...", or ends in "?"), AND
+  (b) was followed by an audible end-of-thought (interviewer paused, candidate started answering, or msSinceLastTranscript > 1500),
+return "done". Examples of case prompts that ARE "done":
+- "Imagine you're a strategy analyst for the Postmates team. Order frequency declined 15% over 3 months. Your goal is to analyze and recommend solutions. How would you approach this?"
+- "Consider a 2-sided marketplace where supply has dropped. What hypothesis would you test first?"
+- "We've launched a new pricing tier. CTR is up but revenue per user is flat. Walk me through your diagnosis."
+
+Distinguish from genuine "still_setting_up": that's when the interviewer is mid-sentence and just trailed off ("...so the question is — what would happen if..." with no closing verb), or stacks multiple competing asks without a final landed one ("...maybe what would happen, or maybe how you'd respond, or...").
+
+TRANSCRIPT FORMAT NOTE — speaker labels are intentionally NOT shown:
+
+The transcript below lists utterances in chronological order, one per line, with NO speaker labels. This is deliberate. The primary classifier has already considered which speaker said what before proposing this question; speaker diarization at the line level is unreliable (Deepgram mis-attributes routinely), so we removed those tags to prevent you from over-anchoring on them.
+
+YOUR JOB: judge on QUESTION SHAPE alone — does the proposed text read as a directed interviewer ask to the candidate ("Tell me about…", "Walk me through…", "How would you…", "What would you…", "Why did you…", "Based on …, what would you …?", "What solutions would you propose…?", "How do we…?"), and is it complete (not trailing off in a transition word)?
+
+You should NOT try to deduce speaker identity from the transcript. Specifically:
+- DO NOT return "not_a_question" with a reason like "the proposed text was said by the candidate" — you have no reliable signal for that, and the primary classifier already verified speaker assignment.
+- The presence of utterances after the proposed question is EXPECTED (the candidate responding, the interviewer adding a brief follow-up nudge). Don't read too much into who said the surrounding lines.
+
+Return "not_a_question" ONLY when the CONTENT itself isn't a directed interview question — pure narration ("so the way we usually look at this is…"), a declarative summary ("yeah, that makes sense"), an obvious clarification of an active ask ("can you give me an example of what you mean by scale?"), or admin chatter ("can you hear me?").
+
 Output (strict JSON, no prose):
 { "verdict": "done" | "still_setting_up" | "not_a_question", "reason": "<one short line>" }`;
 
@@ -130,17 +202,30 @@ Output (strict JSON, no prose):
       ? `
 
 CRITICAL CONTEXT — REVERSE-Q&A AFTERMATH:
-Just before this turn, the candidate was asking the interviewer questions ("any questions for me?" phase) and the interviewer is currently mid-answer. Be EXTRA STRICT:
+Just before this turn, the session was in the reverse-Q&A phase (candidate asking the interviewer questions, "any questions for me?"). The interviewer is currently in the middle of answering. Be EXTRA STRICT:
 
-- Mid-answer interviewers commonly use rhetorical fragments that are syntactically questions but contextually narration. Examples:
+- Mid-answer speakers commonly use rhetorical fragments that are syntactically questions but contextually narration. Examples:
     "...so you have to wonder, what are the default drivers? Well, they're..."
     "...and what makes a loan get approved? It's a mix of..."
     "...the question is — what would they pay? Right? So..."
-  These are NOT questions to the candidate; they're the interviewer thinking out loud. → "not_a_question".
+  These are NOT directed asks to the candidate; they're thinking out loud while answering. → "not_a_question".
 
-- Only return "done" if the interviewer has clearly STOPPED answering (not just briefly paused), the proposed text is at the end of the interviewer's turn, and the candidate is being directed to respond. Specifically: the interviewer's NEXT utterance after the proposed question (if any in transcript) should NOT continue the prior topic — if it does, the interviewer was still narrating.
+- Only return "done" if the proposed text is a CLEAN landed ask (not a fragment embedded in surrounding narration). The transcript line containing the proposed question should look like the END of a turn — not surrounded above and below by sentences continuing the same topic without a clear pivot to "OK, your turn".
 
-- When the proposed question text is in the MIDDLE of a continuous interviewer monologue (more interviewer utterances follow it without candidate interjection), default to "not_a_question".`
+- When the proposed question text appears in the MIDDLE of what looks like a continuous monologue (more lines on the same topic follow it without a topic break), default to "not_a_question".`
+      : "";
+
+    const matureSessionBias = sessionIsMature
+      ? `
+
+CRITICAL CONTEXT — MATURE SESSION:
+This session has been running for ${Math.floor(sessionElapsedSec / 60)} minutes and ${priorLeadCount} Lead questions have already locked. By this point in a real interview the interviewer is firmly past the "still setting up" phase — they've been asking and getting answers for a long time. Therefore:
+
+- DO NOT return "still_setting_up" for short, complete questions like "Where are you located?" / "How many years of X?" / "Are you open to relocating?" / "When can you start?". These are typical late-interview wrap-up / logistics questions and they are GENUINELY done — the interviewer asks them and waits for an answer.
+
+- "still_setting_up" should only fire here when the proposed text is itself an obvious fragment ending in a transition word ("and...", "so...", "um..."). A complete short question with a question mark or question word in a mature session is "done", not "still_setting_up".
+
+- "not_a_question" still applies for rhetorical/narrative fragments mid-answer; the maturity bias does NOT relax that check.`
       : "";
 
     const confirmUser = `Proposed question (from primary classifier):
@@ -153,7 +238,7 @@ Recent transcript:
 ${formatted}
 """
 
-Milliseconds since last transcript: ${msSinceLastTranscript}${reverseQaBias}
+Milliseconds since last transcript: ${msSinceLastTranscript}${reverseQaBias}${matureSessionBias}
 
 Verdict?`;
 
@@ -262,6 +347,40 @@ When in doubt about a non-question utterance, return state = "interviewer_speaki
     2. The candidate's most recent utterance IS a substantive question to the interviewer about the role / team / company / process — NOT a one-off clarification embedded in their own answer. Examples: "What does the team look like?", "How does the team measure success?", "What's the day-to-day for this role?", "What are the biggest challenges the team is facing?", "How is the on-call rotation set up?", "What's the next step after this interview?".
     3. NOT a clarification of an interview question they're trying to answer ("Can you give me an example of what you mean by scale?" while mid-answer — that stays interviewer_speaking).
 
+  == ENTRY GATE for candidate_questioning (CRITICAL — read carefully, this rule has TWO opposite failure modes) ==
+
+  **DECISION TREE** (apply in order — first match wins):
+
+  **STEP 1 — Hand-off detected? (this OVERRIDES everything else, including case-style Lead Questions)**
+  Scan the recent transcript for an EXPLICIT interviewer hand-off cue:
+    - "do you have any questions for me?" / "any questions for me/us?"
+    - "anything you want to ask?" / "anything else you want to chat about?"
+    - "we have time for your questions" / "we have a few minutes for your questions"
+    - "all (the) questions I have" / "I'm done with my questions, do you have any?"
+    - "before we wrap up, any questions on your end?"
+    - Variants like "or anything you want to chat about?" appended to a substantive question count too.
+
+  If a hand-off cue exists in the recent transcript AND the candidate's most recent substantive utterance is ANY question to the interviewer (about ANY topic — role, team, process, logistics, even something that sounds case-related like "do you travel for work?"), → **state = candidate_questioning**. Populate candidateQuestion with the candidate's question text.
+
+  **CRITICAL**: hand-off detection WINS even when currentMainQuestionText is a case-style Lead. Once the interviewer says "any questions for me?", the case is OVER — it doesn't matter what the prior Lead was. The candidate's questions are now reverse-Q&A. Do NOT apply the CASE-CLARIFICATION GUARD below in this branch.
+
+  Why this matters: a real bug we hit was the interviewer wrapping up the case ("Cool. I think we covered a lot of ground. Do you have any questions for me?"), the candidate then asked 3 substantive role/process questions ("does this involve travel?", "when do you do data analysis?", "how do you handle unfamiliar domains?"), but the classifier stayed locked on the case Lead from 15 minutes earlier and kept returning state=question_finalized for 250 seconds. Hand-off detection MUST short-circuit case-mode immediately.
+
+  **STEP 2 — No hand-off cue? Then apply CASE-CLARIFICATION GUARD.**
+  When currentMainQuestionText starts with hypothetical setup like "Imagine you are…", "Consider a scenario…", "Let's say you're…", "We have noticed that…", "We've launched…", "Your goal is to…" or contains "how would you approach this?", the candidate is in case-solving mode. The candidate's playbook: (1) restate problem, (2) ask scoping clarifications ("is it across all users?", "what time horizon?", "specific to one geography?"), (3) frame approach, (4) walk through analysis. Steps (1)-(2) involve candidate questions to interviewer that are PART OF SOLVING THE CASE, not reverse-Q&A. → state = interviewer_speaking, candidateQuestion = "".
+
+  **STEP 3 — No hand-off, not case-mid clarification? Apply general entry conditions.**
+  To enter candidate_questioning here, ALL must hold:
+    (a) The candidate has asked TWO consecutive substantive questions about role/team/process and the interviewer has been answering them — this implicitly establishes reverse-Q&A even without an explicit hand-off cue.
+    (b) The candidate's most recent question is itself substantive about role/team/company/process/next-steps.
+    (c) NOT a clarification of an interview question they're trying to answer.
+
+  **STEP 4 — Otherwise stay in current state.**
+
+  Symptoms of getting this wrong:
+  - WRONG (case-clarification leak): case-style Lead is locked, candidate asks "is it specific to LA?", classifier transitions to candidate_questioning. → STEP 2 should have caught this (no hand-off → guard applies → stay interviewer_speaking).
+  - WRONG (hand-off ignored): interviewer says "any questions for me?", candidate asks "does this involve travel?", classifier stays in question_finalized because the prior Lead was a case prompt. → STEP 1 should have caught this (hand-off cue present → transit to candidate_questioning regardless of case mode).
+
 == STICKINESS RULE for candidate_questioning (CRITICAL) ==
 If currentState is "candidate_questioning", the DEFAULT is to STAY in candidate_questioning. The interviewer answering the candidate's question — even at length, even with multiple paragraphs of detail — is the EXPECTED behavior in this phase, NOT a signal to exit. Do not exit just because the interviewer has been speaking for a while.
 
@@ -344,11 +463,109 @@ Summary writing style:
 
 The "question" / "candidateQuestion" field, when present:
 - Clean filler ("so uh", "okay so", "alright")
-- Preserve the speaker's wording — don't paraphrase meaning
-- Combine compound clauses into one coherent question
+- Combine compound clauses across utterances into one coherent question
 - FIX obvious speech-recognition errors where a word is clearly nonsensical in context and has a near-homophone that makes sense. Examples: "soft process" → "thought process", "sift system" → "system design", "hire ability" → "hireability", "sink about" → "think about", "resonating model" → "recommendation model". Only fix when the wrong word is genuinely meaningless in the sentence AND the intended word is a close phonetic match — when in doubt, preserve the original.
-- For the interviewer "question" field: REPHRASE collaborative / statement-style prompts into direct question form addressed to the candidate. Examples: "Let's start with the data" → "Can you start with the data?". Keep already-well-formed imperatives as-is.
-- For the candidate "candidateQuestion" field: keep the candidate's own phrasing — they're asking, so it's already a direct ask. Just clean filler and combine clauses.`;
+
+== VERBATIM-PHRASING RULE (CRITICAL — read this before writing the question field) ==
+
+The downstream filter REJECTS proposed questions whose tokens don't appear in the
+interviewer's actual recent speech. Aggressive paraphrasing into "standard interview
+question" form (e.g. "Tell me about yourself", "Design a recommendation system for X")
+will be discarded and the question will NEVER be locked, even though the interviewer
+clearly asked it. This has caused entire 4-minute self-introductions and 6-minute
+case-study setups to fire ZERO commentary.
+
+Therefore:
+
+1. **Use the interviewer's actual content words** (nouns, verbs, named entities) in the
+   question text. Do NOT swap in synonyms, do NOT replace casual phrasing with textbook
+   form, do NOT compress informal asks into a canonical question they didn't actually say.
+
+2. **Only minimally rephrase** to make the sentence grammatical / standalone. Allowed:
+   adding "Can you" / "Could you" in front of an imperative, joining two interviewer
+   utterances, dropping fillers. Disallowed: replacing the interviewer's keywords with
+   "standard" interview-vocabulary equivalents.
+
+3. **Concrete bad/good calibration** (these match real failure modes — internalize them):
+
+   Interviewer actually said: "Sure. Let's start with yourself intro maybe."
+   - BAD:  "Tell me about yourself."  ← "tell"/"about" never said → filter rejects, Q never locks
+   - BAD:  "Can you give a self-introduction?"  ← invented "give"/"self-introduction"
+   - GOOD: "Can you start with yourself intro?"  ← uses actual words "start"/"yourself"/"intro"
+   - GOOD: "Yourself intro maybe?"  ← even closer to verbatim, also fine
+
+   Interviewer actually said (across utterances): "we want to recommend several items
+   for the user … design a feature of this. How are you gonna give the results and
+   recommendations to a particular user."
+   - BAD:  "Design a recommendation system for Walmart."  ← invented "system", "Walmart"
+           context comes from JD not transcript → filter rejects
+   - BAD:  "How would you build a recommendation engine for Walmart's homepage?"
+           ← invented "engine", "homepage"
+   - GOOD: "How are you gonna give the results and recommendations to a particular user?"
+           ← uses interviewer's actual phrasing
+   - GOOD: "Design a feature to recommend several items for the user — how are you going
+           to give the results?"  ← combines two of the interviewer's utterances verbatim
+
+   Interviewer actually said: "Let's discuss a little bit on that. So for feature
+   engineering, how are we gonna deal with the all the data we have right now."
+   - GOOD: "For feature engineering, how are we going to deal with all the data we have?"
+   - BAD:  "Walk me through your feature engineering pipeline."  ← invented standard phrasing
+
+4. **Imperative → question conversion** still allowed when the interviewer used a clear
+   imperative ("Let's start with the data" → "Can you start with the data?"). But preserve
+   the noun phrase the interviewer used ("the data") — do NOT inflate it into a fuller
+   "data sources" / "data schema" / etc.
+
+5. **Compound questions across multiple utterances**: combining is fine and often
+   necessary, but the combined sentence's content words must come from the interviewer's
+   own utterances. Do NOT bridge with new vocabulary the interviewer never used.
+
+6. **For the candidate "candidateQuestion" field**: keep the candidate's own phrasing
+   — they're asking, so it's already a direct ask. Just clean filler and combine clauses.
+   Same verbatim-phrasing rule applies.
+
+== CANDQ-ATTRIBUTION RULE (CRITICAL — read this before populating candidateQuestion) ==
+
+candidateQuestion MUST be text that the CANDIDATE actually spoke in the recent
+transcript. NEVER paraphrase or pull text from interviewer turns.
+
+The most common failure mode: when the interviewer hands the floor over with
+"Any questions for me?" / "What questions do you have?" / "Fire away.", the
+state should transition to candidate_questioning, but candidateQuestion MUST
+be left empty UNTIL the candidate has actually asked their first question. Do
+NOT echo the interviewer's hand-off line into candidateQuestion. The phase bar
+in the UI displays this field as the candidate's question — putting the
+interviewer's words there is a visible attribution bug.
+
+Concrete examples (these match real failure modes — internalize them):
+
+  Interviewer actually said: "What questions do you have for me?"
+  Candidate has not yet spoken anything substantive.
+  → state: "candidate_questioning"
+  → candidateQuestion: ""  ← LEAVE EMPTY. Do NOT write "What questions do you have for me?"
+
+  Interviewer said: "Fire away."
+  Candidate said (next turn): "I read the JD. Huntington emphasized balance
+  sheet management — what's the biggest ALM challenge facing the bank?"
+  → state: "candidate_questioning"
+  → candidateQuestion: "What's the biggest ALM challenge facing the bank?"
+    ← Use the candidate's words.
+
+  Interviewer is mid-answer to a candidate question. Candidate hasn't started a
+  new question yet.
+  → state: "candidate_questioning" (sticky)
+  → candidateQuestion: <unchanged from last commit — keep the prior candidate
+    question text, don't replace with anything from the interviewer's answer>
+
+If the [speaker] tags in the transcript don't make speaker attribution
+unambiguous (rare but possible after diarization noise), prefer leaving
+candidateQuestion empty over guessing — the UI will show a generic "candidate
+preparing question" placeholder, which is better than displaying the
+interviewer's words as if the candidate said them.
+
+When you're tempted to "tidy up" the interviewer's wording into a more polished interview
+question, RESIST. The filter doesn't care about polish; it cares about token overlap with
+what was actually said. Preserve the speaker's words.`;
 
   const formatted = utterances
     .map((u) => `[${u.speaker}]: ${u.text}`)
@@ -457,10 +674,51 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
     const summary = (parsed.summary || "").trim();
     const question =
       state === "question_finalized" ? (parsed.question || "").trim() : "";
-    const respCandidateQuestion =
+    let respCandidateQuestion =
       state === "candidate_questioning"
         ? (parsed.candidateQuestion || "").trim()
         : "";
+    // Server-side guard against the model echoing interviewer hand-off
+    // lines into candidateQuestion. Even with the explicit
+    // CANDQ-ATTRIBUTION rule in the prompt, Haiku occasionally fills
+    // candQ with the interviewer's "what questions do you have" text
+    // when the candidate hasn't asked yet. Compare candQ against the
+    // recent interviewer utterances; if there's clear text overlap,
+    // clear it — the UI is better off showing a placeholder than
+    // mis-attributing speech.
+    if (respCandidateQuestion) {
+      const norm = (s: string) =>
+        s.toLowerCase().replace(/[^a-z0-9一-鿿]+/g, " ").trim();
+      const candNorm = norm(respCandidateQuestion);
+      // Pull recent interviewer utterances from the input transcript.
+      // `utterances` is the full sample the classifier saw; entries
+      // with role "interviewer" are the ones to check against.
+      const interviewerSpeech = utterances
+        .filter((u) => u.speaker === "interviewer")
+        .map((u) => norm(u.text))
+        .join(" ");
+      // Any 5+ word verbatim chunk of candQ appearing inside
+      // interviewer speech is enough to flag attribution as wrong.
+      const candTokens = candNorm.split(/\s+/).filter(Boolean);
+      if (candTokens.length >= 5) {
+        const window = 5;
+        let matched = false;
+        for (let i = 0; i <= candTokens.length - window; i++) {
+          const chunk = candTokens.slice(i, i + window).join(" ");
+          if (chunk && interviewerSpeech.includes(chunk)) {
+            matched = true;
+            break;
+          }
+        }
+        if (matched) {
+          console.warn(
+            "[classify-moment] candidateQuestion overlaps interviewer speech; clearing",
+            { candQ: respCandidateQuestion }
+          );
+          respCandidateQuestion = "";
+        }
+      }
+    }
     const rel = parsed.questionRelation;
     const questionRelation: QuestionRelation =
       rel === "new_topic" || rel === "follow_up" ? rel : null;
