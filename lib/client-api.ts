@@ -263,20 +263,27 @@ export async function resetPassword(args: {
   }
 }
 
-/** List the user's saved sessions for the sidebar / past list. */
+/** List the user's saved sessions for the sidebar / past list.
+ *
+ *  THROWS on failure (no userId yet, non-2xx, or network error) rather
+ *  than swallowing to `[]`. This distinction is load-bearing: the caller
+ *  (hydratePastSessions) persists a UX cache of this list and must NOT
+ *  overwrite a good cached list with an empty one just because a refresh
+ *  raced userId hydration or hit an Aurora cold-start 5xx. A thrown error
+ *  means "couldn't determine" (keep the cache + retry); a returned `[]`
+ *  means "server confirmed the user genuinely has no sessions". */
 export async function fetchPastSessions(): Promise<PastSessionListItem[]> {
-  if (!userId()) return [];
-  try {
-    const r = await fetch("/api/sessions", {
-      headers: authHeaders(),
-      cache: "no-store",
-    });
-    if (!r.ok) return [];
-    const data = (await r.json()) as { sessions?: PastSessionListItem[] };
-    return data.sessions ?? [];
-  } catch {
-    return [];
+  const id = userId();
+  if (!id) throw new Error("fetchPastSessions: userId not ready");
+  const r = await fetch("/api/sessions", {
+    headers: { "x-user-id": id },
+    cache: "no-store",
+  });
+  if (!r.ok) {
+    throw new Error(`fetchPastSessions: HTTP ${r.status}`);
   }
+  const data = (await r.json()) as { sessions?: PastSessionListItem[] };
+  return data.sessions ?? [];
 }
 
 /** Load full session detail: top-level fields + questions + comments.

@@ -445,8 +445,33 @@ export const useStore = create<StoreState>()(
     // the sidebar renders from pastSessionList until the user clicks
     // an entry, at which point loadPastSession fetches the full
     // detail and inserts it into pastSessions.
-    const list = await fetchPastSessions();
-    set({ pastSessionList: list });
+    //
+    // Robustness: fetchPastSessions() THROWS on failure (userId not
+    // ready, non-2xx, Aurora cold-start 5xx, network blip) and only
+    // returns an array on a confirmed-200 response. We retry a few
+    // times with backoff so a transient failure — or a refresh that
+    // raced userId hydration — recovers on its own. Critically, on
+    // total failure we DO NOT touch pastSessionList: the persisted UX
+    // cache stays on screen instead of being wiped to "No past
+    // sessions yet". Overwriting with an empty list only happens when
+    // the server actually confirms the user has none.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const list = await fetchPastSessions();
+        set({ pastSessionList: list });
+        return;
+      } catch {
+        // Backoff: 300ms, 600ms, 1200ms. Gives Zustand persist +
+        // userId backfill time to settle and Aurora time to wake.
+        if (attempt < 3) {
+          await new Promise((r) => setTimeout(r, 300 * 2 ** attempt));
+        }
+      }
+    }
+    // All attempts failed — leave the cached list untouched.
+    console.warn(
+      "[hydratePastSessions] refresh failed after retries; keeping cached list"
+    );
   },
   loadPastSession: async (id) => {
     // Lazy-load the full Session detail. If we've already got it in
