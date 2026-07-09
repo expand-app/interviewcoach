@@ -42,8 +42,16 @@ import type { Comment, Question, Utterance } from "@/types/session";
  *  a real interviewer jumps in quickly; the instant verbal ack (see
  *  ACK pool) covers the model-decision latency after this fires. */
 const ANSWER_SILENCE_MS = 2800;
-/** Minimum answer length before silence can complete the turn. */
+/** Minimum answer length before the SHORT silence can complete the
+ *  turn. Longer answers complete faster (they're clearly done). */
 const ANSWER_MIN_CHARS = 20;
+/** A short answer ("No, not yet.", "Yes, at Google.") — under
+ *  ANSWER_MIN_CHARS — still needs to complete, just after a slightly
+ *  longer beat so the candidate has room to keep going. Without this
+ *  branch a brief answer stalls the interview forever: the old tick()
+ *  only completed answers ≥20 chars and only nudged answers of
+ *  length 0, so 1-19 chars fell through every branch. */
+const SHORT_ANSWER_SILENCE_MS = 5000;
 /** Re-ask the question once if the user hasn't said anything. */
 const REASK_AFTER_MS = 15_000;
 /** Nudge toward the Skip button after this long with no answer. */
@@ -58,13 +66,13 @@ const TTS_TAIL_MS = 300;
  *  completes — masking the next-turn model call (~2-3s) the way a
  *  real interviewer's "mm-hm, got it" masks their thinking. Audio is
  *  prefetched at session start so playback is zero-latency. */
-const ACKS_EN = [
-  "Mm-hm, got it.",
-  "Okay, thank you.",
-  "I see.",
-  "Alright, that makes sense.",
-];
-const ACKS_ZH = ["嗯,明白了。", "好的。", "了解。", "嗯,可以。"];
+// Kept to brief backchannels — the model's transition already opens
+// with a substantive echo of the answer, so a long canned ack on top
+// would read as a robotic double-acknowledgment. A short "Mm-hm."
+// just fills the decision latency the way a real interviewer's
+// backchannel does.
+const ACKS_EN = ["Mm-hm.", "Right.", "Okay.", "Got it."];
+const ACKS_ZH = ["嗯。", "好。", "嗯嗯。", "明白。"];
 
 interface StartArgs {
   plan: RetakePlan;
@@ -75,6 +83,28 @@ interface StartArgs {
 
 function rid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Token-overlap similarity in [0,1], sized against the SMALLER set —
+ *  a short transcription fragment of a longer TTS line still scores
+ *  high. CJK text (no spaces) falls back to per-character tokens. */
+function tokenOverlap(a: string, b: string): number {
+  const norm = (s: string): string[] => {
+    const cleaned = s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "");
+    const words = cleaned.split(/\s+/).filter(Boolean);
+    // CJK: whitespace tokenization yields 1-2 giant tokens — split to
+    // characters instead so overlap is meaningful.
+    if (words.length <= 2 && /[一-鿿]/.test(cleaned)) {
+      return cleaned.replace(/\s+/g, "").split("");
+    }
+    return words;
+  };
+  const ta = new Set(norm(a));
+  const tb = new Set(norm(b));
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let inter = 0;
+  for (const w of ta) if (tb.has(w)) inter++;
+  return inter / Math.min(ta.size, tb.size);
 }
 
 export class MockInterviewer {
@@ -88,9 +118,28 @@ export class MockInterviewer {
   private ttsDest: MediaStreamAudioDestinationNode | null = null;
   private activeTts: TtsHandle | null = null;
   /** Prefetched ack audio (aura only) — played instantly when a turn
-   *  completes. */
-  private ackBuffers: AudioBuffer[] = [];
+   *  completes. Text kept alongside so the echo guard can match the
+   *  ack's own transcription. */
+  private ackBuffers: Array<{ text: string; buf: AudioBuffer }> = [];
   private nextAckIdx = 0;
+  /** Everything the AI spoke recently — the echo guard matches
+   *  incoming transcriptions against these. Needed because Deepgram
+   *  finalizes an utterance 0.5-2s AFTER its audio ends, i.e. well
+   *  past the ttsWindowUntil tail — without text matching, the AI's
+   *  own words get misclassified as candidate speech, polluting the
+   *  answer and endlessly refreshing lastSpeechAt (the interview
+   *  then never advances). */
+  private recentTtsLines: Array<{ text: string; at: number }> = [];
+  /** In-flight next-turn decision — aborted when the candidate keeps
+   *  talking during "deciding" (barge-in: the played ack reads as a
+   *  natural backchannel "mm-hm" and the AI goes back to listening). */
+  private decideAbort: AbortController | null = null;
+  /** Monotonic turn counter. completeTurn() captures it; a barge-in
+   *  (or a new turn, or stop()) bumps it, so an in-flight decision
+   *  that resolves after the bump knows it's stale and bails. Using a
+   *  counter instead of a phase re-read avoids TS control-flow
+   *  narrowing pitfalls and covers every invalidation path. */
+  private turnSeq = 0;
   /** Serializes ALL spoken output (acks, questions, wrapup) so an ack
    *  still playing when the next question's audio is ready can't
    *  overlap it. */
@@ -119,6 +168,7 @@ export class MockInterviewer {
   private questionAskedAt = 0;
   private reasked = false;
   private skipNudged = false;
+  private idleFired = false;
   /** Wall-clock until which finalized utterances belong to the AI
    *  (TTS playing + tail). */
   private ttsWindowUntil = 0;
@@ -142,6 +192,21 @@ export class MockInterviewer {
     this.followupDepth = 0;
     this.answerBuffer = "";
     this.transcriptLog = [];
+    // Full per-session reset — the controller is a process-lifetime
+    // singleton (getMockInterviewer), so any field left over from a
+    // previous retake would corrupt this one.
+    this.currentQuestionId = null;
+    this.currentLeadId = null;
+    this.currentQuestionText = "";
+    this.lastSpeechAt = 0;
+    this.questionAskedAt = 0;
+    this.reasked = false;
+    this.skipNudged = false;
+    this.idleFired = false;
+    this.ttsWindowUntil = 0;
+    this.recentTtsLines = [];
+    this.decideAbort = null;
+    this.turnSeq = 0;
 
     // TTS output context + capture destination. The RetakeModal's
     // two-step flow (Generate → separate Start click) means start()
@@ -178,7 +243,13 @@ export class MockInterviewer {
     await this.audio.start();
     if (this.audio.isStopped) {
       // start() aborted internally (it already surfaced the reason and
-      // dispatched ic:session-aborted).
+      // dispatched ic:session-aborted). Close the TTS context we just
+      // opened so it doesn't leak (start() never got to stop()).
+      if (this.ttsCtx && this.ttsCtx.state !== "closed") {
+        void this.ttsCtx.close().catch(() => {});
+      }
+      this.ttsCtx = null;
+      this.ttsDest = null;
       throw new Error("audio session failed to start");
     }
 
@@ -199,7 +270,7 @@ export class MockInterviewer {
       const acks = args.plan.language === "zh" ? ACKS_ZH : ACKS_EN;
       for (const a of acks) {
         void fetchAuraBuffer(this.ttsCtx, a)
-          .then((b) => this.ackBuffers.push(b))
+          .then((b) => this.ackBuffers.push({ text: a, buf: b }))
           .catch(() => {});
       }
     }
@@ -244,6 +315,9 @@ export class MockInterviewer {
   async stop(): Promise<void> {
     this.stopped = true;
     this.phase = "ended";
+    // Invalidate any in-flight turn decision + abort its request.
+    this.turnSeq += 1;
+    this.decideAbort?.abort();
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
@@ -326,10 +400,20 @@ export class MockInterviewer {
     return useStore.getState().live.elapsedSeconds;
   }
 
+  /** Single source of truth for the call phase: assigns the INTERNAL
+   *  state-machine field AND mirrors it to the store for the UI.
+   *  (An earlier version only wrote the store — `this.phase` then
+   *  never reached "listening", the tick()/completeTurn guards never
+   *  passed, and the interview went permanently silent after the
+   *  first question: the "interviewer can't hear the candidate"
+   *  field report.) */
   private setPhase(
-    p: "greeting" | "asking" | "listening" | "thinking" | "wrapup" | "ended"
+    p: "greeting" | "asking" | "listening" | "deciding" | "wrapup" | "ended"
   ) {
-    useStore.getState().setRetakePhase(p);
+    this.phase = p;
+    useStore
+      .getState()
+      .setRetakePhase(p === "deciding" ? "thinking" : p);
   }
 
   /** Prefetch one utterance's audio (aura only; null → speak() will
@@ -353,6 +437,17 @@ export class MockInterviewer {
       if (!this.tts || this.stopped) return;
       this.audio?.setMicGain(0);
       this.ttsWindowUntil = Number.MAX_SAFE_INTEGER; // until playback resolves
+      // Register for the echo guard BEFORE playback so even the very
+      // first transcription fragments match. Only SUBSTANTIAL lines
+      // (questions, greeting, transitions) — never the short acks:
+      // a 1-3 word ack would spuriously match a candidate's short
+      // reply and swallow it. Short acks also finalize inside the
+      // playback window anyway, so they don't need the late-arrival
+      // guard.
+      if (text.trim().split(/\s+/).length >= 5) {
+        this.recentTtsLines.push({ text, at: Date.now() });
+        if (this.recentTtsLines.length > 6) this.recentTtsLines.shift();
+      }
       try {
         let handle: TtsHandle | null = null;
         if (this.tts.name === "aura" && this.ttsCtx) {
@@ -393,9 +488,16 @@ export class MockInterviewer {
       } finally {
         this.activeTts = null;
         this.ttsWindowUntil = Date.now() + TTS_TAIL_MS;
-        // Restore mic after the tail unless the user muted themselves.
+        // Restore mic after the tail — but ONLY if no newer TTS window
+        // has opened since. Back-to-back speaks (ack → question) chain
+        // through the queue: the NEXT run() sets ttsWindowUntil = MAX
+        // before this timer fires, so this check skips the restore and
+        // lets the next utterance's own finally handle it. Without the
+        // guard, this timer would unmute the mic mid-question and the
+        // AI's voice would bleed into the candidate's audio.
         setTimeout(() => {
           if (this.stopped) return;
+          if (Date.now() < this.ttsWindowUntil) return; // newer window
           const userMuted = useStore.getState().retakeMicMuted;
           this.audio?.setMicGain(userMuted ? 0 : 1);
         }, TTS_TAIL_MS);
@@ -413,15 +515,36 @@ export class MockInterviewer {
     if (this.stopped || !this.plan) return;
     if (this.tts?.name === "aura") {
       if (this.ackBuffers.length === 0) return; // pool not ready yet
-      const buf =
+      const ack =
         this.ackBuffers[this.nextAckIdx % this.ackBuffers.length];
       this.nextAckIdx += 1;
-      void this.speak("", Promise.resolve(buf));
+      void this.speak(ack.text, Promise.resolve(ack.buf));
     } else {
       const acks = this.plan.language === "zh" ? ACKS_ZH : ACKS_EN;
       void this.speak(acks[this.nextAckIdx % acks.length]);
       this.nextAckIdx += 1;
     }
+  }
+
+  /** Echo guard: is this transcription actually the AI's own recent
+   *  speech coming back through the aux mix (or the speakers)?
+   *  Deepgram finalization lags the audio by 0.5-2s, so the
+   *  ttsWindowUntil check alone misses late arrivals — match the
+   *  TEXT against everything spoken in the last 12s instead. */
+  private isTtsEcho(text: string): boolean {
+    // Only substantial incoming utterances are echo-eligible. A short
+    // candidate reply ("Yes.", "No, not really.") must ALWAYS pass
+    // through as candidate speech even if its few words happen to
+    // appear in the question — the real echo we're catching is a
+    // late-finalized QUESTION tail, which is long.
+    if (text.trim().split(/\s+/).length < 5) return false;
+    const now = Date.now();
+    this.recentTtsLines = this.recentTtsLines.filter(
+      (l) => now - l.at < 12_000
+    );
+    return this.recentTtsLines.some(
+      (l) => tokenOverlap(text, l.text) >= 0.6
+    );
   }
 
   private async runGreeting(): Promise<void> {
@@ -485,6 +608,7 @@ export class MockInterviewer {
     this.answerBuffer = "";
     this.reasked = false;
     this.skipNudged = false;
+    this.idleFired = false;
 
     this.setPhase("asking");
     store.setRetakeCaption(text);
@@ -511,9 +635,14 @@ export class MockInterviewer {
     };
     store.addUtterance(u);
 
-    if (inTtsWindow) {
-      // AI's own voice coming back through the aux mix — label its
-      // diarization id as interviewer for PastView role resolution.
+    if (inTtsWindow || this.isTtsEcho(text)) {
+      // AI's own voice coming back through the aux mix. The window
+      // catches transcriptions that finalize DURING playback; the
+      // text-similarity guard catches the ones Deepgram finalizes
+      // 0.5-2s AFTER playback ended (past the window tail) — those
+      // must never count as candidate speech or the answer gets
+      // polluted with the AI's own words and lastSpeechAt never goes
+      // quiet. Label the diarization id for PastView role resolution.
       if (dgSpeaker !== undefined) {
         store.mergeSpeakerRoles({ [dgSpeaker]: "interviewer" });
       }
@@ -526,6 +655,16 @@ export class MockInterviewer {
     }
     this.lastSpeechAt = Date.now();
     window.dispatchEvent(new CustomEvent("ic:retake-speech"));
+    if (this.phase === "deciding" && this.currentQuestionId) {
+      // Barge-in: the candidate kept talking after the completion
+      // heuristic fired. Invalidate the in-flight decision (turnSeq++)
+      // and go back to listening — the ack that just played reads as a
+      // natural backchannel ("mm-hm"), exactly what a real interviewer
+      // does when you pause mid-thought. The answer keeps accumulating.
+      this.turnSeq += 1;
+      this.decideAbort?.abort();
+      this.setPhase("listening");
+    }
     if (this.phase === "listening" && this.currentQuestionId) {
       this.answerBuffer = this.answerBuffer
         ? `${this.answerBuffer} ${text.trim()}`
@@ -542,10 +681,15 @@ export class MockInterviewer {
     const sinceSpeech = now - this.lastSpeechAt;
     const sinceAsked = now - this.questionAskedAt;
 
-    // Answer complete?
+    // Answer complete? Substantive answer → short beat; brief answer
+    // ("No.", "Yes, at Google.") → longer beat so we don't cut the
+    // candidate off mid-thought, but still ALWAYS complete (the stall
+    // bug: 1-19 chars used to match no branch at all).
+    const hasContent = this.answerBuffer.length > 0;
+    const longEnough = this.answerBuffer.length >= ANSWER_MIN_CHARS;
     if (
-      this.answerBuffer.length >= ANSWER_MIN_CHARS &&
-      sinceSpeech >= ANSWER_SILENCE_MS
+      hasContent &&
+      sinceSpeech >= (longEnough ? ANSWER_SILENCE_MS : SHORT_ANSWER_SILENCE_MS)
     ) {
       void this.completeTurn("silence");
       return;
@@ -567,7 +711,8 @@ export class MockInterviewer {
           })
         );
       }
-      if (sinceAsked >= IDLE_END_AFTER_MS) {
+      if (!this.idleFired && sinceAsked >= IDLE_END_AFTER_MS) {
+        this.idleFired = true;
         window.dispatchEvent(new CustomEvent("ic:retake-idle"));
       }
     }
@@ -577,8 +722,8 @@ export class MockInterviewer {
     source: "silence" | "user-done" | "user-skip"
   ): Promise<void> {
     if (this.phase !== "listening" || !this.plan) return;
-    this.phase = "deciding";
-    this.setPhase("thinking");
+    const seq = ++this.turnSeq;
+    this.setPhase("deciding");
 
     const answered = this.answerBuffer;
     const qId = this.currentQuestionId;
@@ -588,14 +733,10 @@ export class MockInterviewer {
     // the answer lands — the next-turn model call below takes 2-3s
     // and dead air there is what makes the pacing feel robotic. The
     // speak queue guarantees the real transition waits for the ack.
+    // If the user keeps talking (barge-in), the same ack retroactively
+    // reads as a backchannel "mm-hm" — natural either way.
     if (answered.trim() && source !== "user-skip") {
       this.playAck();
-    }
-
-    // Silent coaching — one commentary call per answered turn. Fire
-    // and forget; the comment lands on the question whenever it lands.
-    if (answered.trim() && qId && source !== "user-skip") {
-      void this.generateSilentComment(qId, qText, answered);
     }
 
     // Decide the next move.
@@ -608,10 +749,17 @@ export class MockInterviewer {
       action = isLast ? "wrapup" : "next";
       utterance = isLast ? "" : this.plan.slots[this.slotIndex + 1].question;
     } else {
+      this.decideAbort = new AbortController();
       try {
         const r = await fetch("/api/mock-interviewer/next-turn", {
           method: "POST",
           headers: { "content-type": "application/json" },
+          // Barge-in abort OR a 12s hard timeout — a hung decision must
+          // fall through to the scripted next question, never stall.
+          signal: AbortSignal.any([
+            this.decideAbort.signal,
+            AbortSignal.timeout(12_000),
+          ]),
           body: JSON.stringify({
             jd: this.jd,
             resume: this.resume,
@@ -635,29 +783,58 @@ export class MockInterviewer {
         action = data.result.action;
         utterance = data.result.utterance;
       } catch {
-        // Script of last resort: the pre-generated plan. Never stall.
+        // Stale turn (barge-in bumped turnSeq / aborted the fetch) —
+        // the candidate resumed talking; we're back in "listening"
+        // and this decision is void.
+        if (this.turnSeq !== seq) return;
+        // Anything else: script of last resort — the pre-generated
+        // plan. Never stall.
         action = isLast ? "wrapup" : "next";
         utterance = isLast
           ? ""
           : this.plan.slots[this.slotIndex + 1].question;
+      } finally {
+        this.decideAbort = null;
       }
     }
 
-    if (this.stopped) return;
+    // Stopped, or a barge-in bumped the turn between the fetch
+    // resolving and here — this decision is stale; drop it. The
+    // answer keeps growing and a fresh completeTurn re-decides.
+    if (this.stopped || this.turnSeq !== seq) return;
+
+    // Silent coaching — fires ONCE per committed turn, with the final
+    // answer text (a barge-in earlier would have produced a truncated
+    // duplicate if this ran before the decision committed).
+    if (answered.trim() && qId && source !== "user-skip") {
+      void this.generateSilentComment(qId, qText, answered);
+    }
+
+    // Guard against a premature "wrapup" while planned questions
+    // remain — the interview should cover the whole plan.
+    if (action === "wrapup" && !isLast) action = "next";
+
     if (action === "followup") {
       this.followupDepth += 1;
-      await this.askQuestion(utterance, { isFollowup: true });
+      // Prefetch the follow-up's audio NOW (parallel with the ack
+      // that's already playing) so speak() doesn't serialize a fresh
+      // fetch behind the ack — that added ~1s of dead air per turn.
+      await this.askQuestion(utterance, {
+        isFollowup: true,
+        prefetched: this.prefetch(utterance),
+      });
     } else if (action === "next") {
       this.slotIndex += 1;
       this.followupDepth = 0;
-      // The model's utterance already contains ack + question; use it
-      // as the spoken text but keep the Question row's text equal to
-      // what was actually asked (the whole utterance is fine — it IS
-      // what the interviewer said).
-      await this.askQuestion(
-        utterance || this.plan.slots[this.slotIndex]?.question || "",
-        { isFollowup: false }
-      );
+      // The model's utterance already contains echo + question; use it
+      // as the spoken text (it IS what the interviewer said). Prefetch
+      // its audio to remove the between-question pause.
+      const nextText =
+        utterance || this.plan.slots[this.slotIndex]?.question || "";
+      await this.askQuestion(nextText, {
+        isFollowup: false,
+        prefetched: this.prefetch(nextText),
+      });
     } else {
       await this.runWrapup();
     }
@@ -665,7 +842,6 @@ export class MockInterviewer {
 
   private async runWrapup(): Promise<void> {
     if (!this.plan || this.stopped) return;
-    this.phase = "wrapup";
     this.setPhase("wrapup");
     useStore.getState().setRetakeCaption(this.plan.closing);
     this.transcriptLog.push({
@@ -673,7 +849,6 @@ export class MockInterviewer {
       text: this.plan.closing,
     });
     await this.speak(this.plan.closing, this.prefetch(this.plan.closing));
-    this.phase = "ended";
     this.setPhase("ended");
     window.dispatchEvent(new CustomEvent("ic:retake-complete"));
   }

@@ -150,23 +150,39 @@ Return ONLY JSON: {"action": "followup" | "next" | "wrapup", "utterance": string
       .trim();
     const parsed = JSON.parse(jsonText) as NextTurnResult;
 
-    // Sanitize: clamp the model's choice to what the rules allow so a
-    // rogue "followup" at depth 2 can't loop the interview forever.
+    // Sanitize: clamp the model's choice to what the rules allow.
     let action = parsed.action;
-    if (action === "followup" && !canFollowup) {
+    // Unknown action string ("continue", "Follow-up", undefined, …)
+    // must NOT fall through the client's `else → wrapup` branch and
+    // end the interview early — normalize to the safe default.
+    if (action !== "followup" && action !== "next" && action !== "wrapup") {
       action = isLastSlot ? "wrapup" : "next";
     }
+    // A rogue "followup" when probing isn't allowed (depth 2 /
+    // !allowFollowups): move on, and DROP the probe utterance so the
+    // client falls back to the next planned question (keeping the
+    // probe text would skip a planned question).
+    let dropUtterance = false;
+    if (action === "followup" && !canFollowup) {
+      action = isLastSlot ? "wrapup" : "next";
+      dropUtterance = true;
+    }
+    // Model tried to wrap up while planned questions remain — keep going.
+    if (action === "wrapup" && !isLastSlot) action = "next";
     if (action === "next" && isLastSlot) action = "wrapup";
     const result: NextTurnResult = {
       action,
       utterance:
-        action === "wrapup" ? "" : (parsed.utterance ?? "").trim(),
+        action === "wrapup" || dropUtterance
+          ? ""
+          : (parsed.utterance ?? "").trim(),
       nextSlotIndex:
         action === "next" ? currentSlotIndex + 1 : currentSlotIndex,
     };
-    // An empty utterance on a non-wrapup action is useless — tell the
-    // client to fall back to the planned script.
-    if (result.action !== "wrapup" && !result.utterance) {
+    // An empty utterance on a non-wrapup action is only a problem when
+    // we're NOT intentionally dropping it (dropUtterance → the client
+    // uses the planned question). Otherwise fall back to the script.
+    if (result.action !== "wrapup" && !result.utterance && !dropUtterance) {
       return NextResponse.json(
         { error: "empty utterance from model" },
         { status: 502 }

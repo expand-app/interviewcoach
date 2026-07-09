@@ -570,14 +570,23 @@ export class AudioSession {
     //        varied mic distance. So all three flip to legacy config.
     const wantsTabAudio =
       (this.options.captureTabAudio ?? "auto") !== "off";
+    // Mock-interview mode (Retake): the AI interviewer's voice plays
+    // through the candidate's SPEAKERS and would otherwise bleed into
+    // the mic. We already gain-zero the mic during TTS windows, but
+    // echoCancellation ON is the real defense for residual bleed
+    // (and for candidates on speakers generally). auxAudioStream is
+    // the reliable signal that this is mock mode. Force the EC/NS-on,
+    // AGC-off profile even though captureTabAudio is "off" here.
+    const isMockMode = !!this.options.auxAudioStream;
+    const wantEcNs = wantsTabAudio || isMockMode;
     const useMic = this.options.useMic !== false; // default true
     if (useMic) {
       try {
         this.micStream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            echoCancellation: wantsTabAudio,
-            noiseSuppression: wantsTabAudio,
-            autoGainControl: !wantsTabAudio,
+            echoCancellation: wantEcNs,
+            noiseSuppression: wantEcNs,
+            autoGainControl: !wantEcNs,
             channelCount: 1,
           },
         });

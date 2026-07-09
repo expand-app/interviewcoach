@@ -55,10 +55,14 @@ export async function fetchAuraBuffer(
   text: string,
   voice?: string
 ): Promise<AudioBuffer> {
+  // Hard timeout: without it a hung /api/tts leaves the caller's mic
+  // gain-zeroed and ttsWindowUntil pinned to MAX (mock interviewer)
+  // → permanent silence. 8s is generous for a 1-3 sentence clip.
   const r = await fetch("/api/tts", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ text, voice }),
+    signal: AbortSignal.timeout(8000),
   });
   if (!r.ok) {
     throw new Error(`tts fetch failed: HTTP ${r.status}`);
