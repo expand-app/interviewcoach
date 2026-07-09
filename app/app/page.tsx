@@ -7,7 +7,9 @@ import { Topbar } from "@/components/Topbar";
 import { LiveView } from "@/components/LiveView";
 import { LiveDebugPanel } from "@/components/LiveDebugPanel";
 import { PastView } from "@/components/PastView";
+import { MockInterviewView } from "@/components/MockInterviewView";
 import { StartModal } from "@/components/modals/StartModal";
+import { RetakeModal } from "@/components/modals/RetakeModal";
 import { ConfirmModal } from "@/components/modals/ConfirmModal";
 import { PromptModal } from "@/components/modals/PromptModal";
 import { EndSessionModal } from "@/components/modals/EndSessionModal";
@@ -15,8 +17,11 @@ import { ModalShell } from "@/components/modals/ModalShell";
 import { useStore } from "@/lib/store";
 import { useTranslations } from "@/lib/i18n";
 import { getOrchestrator } from "@/lib/orchestrator";
+import { getMockInterviewer } from "@/lib/mockInterviewer";
 import { logClient } from "@/lib/client-log";
 import { isAdminUser } from "@/lib/auth-client";
+import type { Session } from "@/types/session";
+import type { RetakePlan } from "@/app/api/retake/plan/route";
 
 export default function Page() {
   const t = useTranslations();
@@ -209,10 +214,20 @@ export default function Page() {
   const setElapsed = useStore((s) => s.setElapsed);
   const setLiveStatus = useStore((s) => s.setLiveStatus);
   const resetLive = useStore((s) => s.resetLive);
+  const retake = useStore((s) => s.retake);
+  const startRetake = useStore((s) => s.startRetake);
+  const loadPastSession = useStore((s) => s.loadPastSession);
 
   // Modal state
   const [showStart, setShowStart] = useState(false);
   const [showEnd, setShowEnd] = useState(false);
+  // Retake flow state. `retakeParent` is the fully-loaded original
+  // session backing the RetakeModal (null while loading); the modal
+  // opens as soon as the request lands so the user sees the loading
+  // state instead of a dead click.
+  const [showRetakeModal, setShowRetakeModal] = useState(false);
+  const [retakeParent, setRetakeParent] = useState<Session | null>(null);
+  const [showRetakeEnd, setShowRetakeEnd] = useState(false);
 
   // Pending-session args. After the user clicks Start in the
   // StartModal, we stash the form args here instead of immediately
@@ -866,6 +881,105 @@ export default function Page() {
     endingRef.current = false;
   };
 
+  // ===== Retake (AI mock interview) flow =====
+
+  /** Sidebar/PastView entry point. Opens the modal immediately (it
+   *  shows its own loading row) and hydrates the full parent session
+   *  behind it — the sidebar list item has no questions to mirror. */
+  const handleRetakeRequest = (id: string) => {
+    setRetakeParent(null);
+    setShowRetakeModal(true);
+    void loadPastSession(id).then((s) => {
+      if (s) setRetakeParent(s);
+    });
+  };
+
+  /** Modal confirmed with a generated plan — flip the page into the
+   *  Zoom-style call view and start the mock interviewer. */
+  const handleRetakeStart = async ({
+    plan,
+    resume,
+  }: {
+    plan: RetakePlan;
+    resume: string;
+  }) => {
+    const parent = retakeParent;
+    if (!parent) return;
+    setShowRetakeModal(false);
+    // The call view renders in the selectedPastId===null branch.
+    selectPast(null);
+    endingRef.current = false;
+    startRetake({
+      parentId: parent.id,
+      parentTitle: parent.title,
+      plan,
+      jd: parent.jd,
+      resume,
+      interviewerProfile: parent.interviewerProfile,
+      interviewerProfileSummary: parent.interviewerProfileSummary,
+    });
+    try {
+      await getMockInterviewer().start({
+        plan,
+        jd: parent.jd,
+        resume,
+        interviewerProfileSummary: parent.interviewerProfileSummary,
+      });
+      // Timer + refresh guard key off "recording", same as live.
+      setLiveStatus("recording");
+    } catch {
+      // AudioSession already surfaced the reason (toast +
+      // ic:session-aborted where applicable). Reset to idle.
+      resetLive();
+    }
+  };
+
+  /** End-call confirm — the retake mirror of handleEndConfirm, minus
+   *  title generation (liveTitle was fixed at "Retake: <parent>" by
+   *  startRetake). Reuses the same post-session enrichment chain. */
+  const handleRetakeEnd = async () => {
+    if (endingRef.current) return;
+    endingRef.current = true;
+    setShowRetakeEnd(false);
+    // Snapshot BEFORE the await — same race protection as live end.
+    const snapshot = useStore.getState().snapshotForEnd();
+    const title =
+      useStore.getState().liveTitle || t("Retake session", "重练面试");
+    await getMockInterviewer().stop();
+    const win = window as unknown as {
+      __ic_audioUrl?: string;
+      __ic_videoUrl?: string;
+      __ic_videoSegmentUrls?: string[];
+      __ic_videoMime?: string;
+    };
+    const saved = endLive(title, win.__ic_audioUrl, win.__ic_videoUrl, snapshot, {
+      videoSegmentUrls: win.__ic_videoSegmentUrls,
+      videoMime: win.__ic_videoMime,
+    });
+    win.__ic_audioUrl = undefined;
+    win.__ic_videoUrl = undefined;
+    win.__ic_videoSegmentUrls = undefined;
+    win.__ic_videoMime = undefined;
+    selectPast(saved.id);
+    void scoreSessionAsync(saved);
+    void summarizeContextAsync(saved);
+    void expandSuggestionsAsync(saved);
+    endingRef.current = false;
+  };
+
+  // Wrapup finished (AI said goodbye) or 3min of silence → prompt the
+  // user to save & see their score. Listener depends on nothing
+  // mutable — attach once.
+  useEffect(() => {
+    const onDone = () => setShowRetakeEnd(true);
+    window.addEventListener("ic:retake-complete", onDone);
+    window.addEventListener("ic:retake-idle", onDone);
+    return () => {
+      window.removeEventListener("ic:retake-complete", onDone);
+      window.removeEventListener("ic:retake-idle", onDone);
+    };
+  }, []);
+
   const setPastSessionScoreError = useStore((s) => s.setPastSessionScoreError);
   const setPastSessionContext = useStore((s) => s.setPastSessionContext);
   const setPastSessionExpandedSuggestions = useStore(
@@ -1137,6 +1251,7 @@ export default function Page() {
           <Sidebar
             onRenameRequest={(id, title) => setRenameTarget({ id, title })}
             onDeleteRequest={(id, title) => setDeleteTarget({ id, title })}
+            onRetakeRequest={(id) => handleRetakeRequest(id)}
           />
         </div>
       )}
@@ -1188,6 +1303,13 @@ export default function Page() {
             Once a session has been started or a past session is
             selected, the topbar comes back with full chrome. */}
         {(() => {
+          // Retake call active — the call surface owns all controls
+          // (mute / next / end); the normal Topbar's Start/Pause/End
+          // cluster would fight it (Pause routes to the live
+          // orchestrator, which isn't even running).
+          if (retake !== null && selectedPastId === null) {
+            return null;
+          }
           const isPreSessionIdle =
             selectedPastId === null &&
             liveStatus === "idle" &&
@@ -1263,7 +1385,11 @@ export default function Page() {
             </>
           );
         })()}
-        {selectedPastId === null ? (
+        {selectedPastId === null && retake !== null ? (
+          <div className="flex-1 min-h-0 p-3">
+            <MockInterviewView onEndRequest={() => setShowRetakeEnd(true)} />
+          </div>
+        ) : selectedPastId === null ? (
           <LiveView
             isFullscreen={isFullscreen}
             onToggleFullscreen={() => {
@@ -1286,7 +1412,7 @@ export default function Page() {
             onStartRequest={handleStart}
           />
         ) : (
-          <PastView />
+          <PastView onRetakeRequest={(id) => handleRetakeRequest(id)} />
         )}
       </main>
 
@@ -1377,6 +1503,31 @@ export default function Page() {
         open={showStart}
         onCancel={() => setShowStart(false)}
         onStart={handleStartConfirm}
+      />
+
+      {/* Retake pre-start modal: resume edit + plan generation. */}
+      <RetakeModal
+        open={showRetakeModal}
+        parent={retakeParent}
+        onCancel={() => setShowRetakeModal(false)}
+        onStart={(args) => void handleRetakeStart(args)}
+      />
+
+      {/* Retake end-call confirm. Opens from the red End-call button,
+          from ic:retake-complete (AI finished its closing script) and
+          from ic:retake-idle (3min silence). Saving runs the same
+          score/summarize/expand chain as a live session. */}
+      <ConfirmModal
+        open={showRetakeEnd}
+        title={t("End the mock interview?", "结束模拟面试?")}
+        description={t(
+          "Your answers will be saved and scored — comments and suggested answers appear right after.",
+          "你的回答将被保存并评分——点评与建议答案随后即可查看。"
+        )}
+        confirmLabel={t("Save & see my score", "保存并查看评分")}
+        cancelLabel={t("Keep going", "继续面试")}
+        onCancel={() => setShowRetakeEnd(false)}
+        onConfirm={() => void handleRetakeEnd()}
       />
 
       {/* Couldn't-start modal. Surfaced when AudioSession's

@@ -165,14 +165,20 @@ export async function GET(req: Request, ctx: RouteCtx) {
     speaker_roles: Record<string, "interviewer" | "candidate">;
     score: unknown;
     score_error: string | null;
+    parent_session_id: string | null;
+    session_mode: string | null;
+    parent_title: string | null;
   }>(
-    `SELECT id, title, jd, resume, started_at, duration_seconds,
-            audio_s3_key, video_s3_key, video_mov_s3_key,
-            jd_summary, resume_summary,
-            interviewer_profile, interviewer_profile_summary,
-            speaker_roles, score, score_error
-     FROM sessions
-     WHERE id = $1 AND user_id = $2`,
+    `SELECT s.id, s.title, s.jd, s.resume, s.started_at, s.duration_seconds,
+            s.audio_s3_key, s.video_s3_key, s.video_mov_s3_key,
+            s.jd_summary, s.resume_summary,
+            s.interviewer_profile, s.interviewer_profile_summary,
+            s.speaker_roles, s.score, s.score_error,
+            s.parent_session_id, s.session_mode,
+            parent.title AS parent_title
+     FROM sessions s
+     LEFT JOIN sessions parent ON parent.id = s.parent_session_id
+     WHERE s.id = $1 AND s.user_id = $2`,
     [id, userId]
   );
   if (sessR.rows.length === 0) {
@@ -295,6 +301,9 @@ export async function GET(req: Request, ctx: RouteCtx) {
       speakerRoles: s.speaker_roles ?? {},
       score: s.score ?? undefined,
       scoreError: s.score_error ?? undefined,
+      parentSessionId: s.parent_session_id ?? undefined,
+      sessionMode: s.session_mode === "retake" ? "retake" : "live",
+      parentTitle: s.parent_title ?? undefined,
       questions: qsR.rows.map((q) => ({
         id: q.id,
         parentQuestionId: q.parent_question_id ?? undefined,

@@ -68,6 +68,10 @@ export interface PastSessionListItem {
   durationSeconds: number;
   hasScore: boolean;
   scoreError?: string;
+  /** 'retake' = AI-interviewer mock session. Absent/'live' = regular. */
+  sessionMode?: "live" | "retake";
+  /** Original session id when sessionMode === 'retake'. */
+  parentSessionId?: string;
 }
 
 /** Sign-in handshake: ensures a row exists in `users` for this
@@ -368,6 +372,8 @@ export async function postSession(
           speakerRoles,
           score: session.score,
           scoreError: session.scoreError,
+          parentSessionId: session.parentSessionId,
+          sessionMode: session.sessionMode,
         },
         questions: session.questions.map((q) => ({
           id: q.id,

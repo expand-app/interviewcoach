@@ -162,6 +162,28 @@ export interface AudioSessionOptions {
    *  resume() if the session is paused). User-declined silently falls
    *  back to no video — audio path is unaffected. */
   captureVideo?: boolean;
+  /** What captureVideo records. "screen" (default) is the existing
+   *  share-this-tab + Region Capture path. "camera" records the
+   *  user's webcam via getUserMedia instead — used by the Retake
+   *  (mock interview) flow, where the artifact to review is the
+   *  candidate on camera, not our UI. Camera mode skips ALL of the
+   *  screen-path machinery (crop, zoom-lock transitions, share-ended
+   *  watchdog) and, unlike the screen path, camera denial is
+   *  NON-fatal: the session continues audio-only. */
+  videoSource?: "screen" | "camera";
+  /** Extra audio stream mixed into the recording + STT feed alongside
+   *  the mic. The Retake flow passes the TTS output's
+   *  MediaStreamDestination stream here so the AI interviewer's voice
+   *  is (a) audible in the saved recording and (b) transcribed by
+   *  Deepgram — giving interviewer utterances in the transcript with
+   *  zero extra plumbing. Forces the Web-Audio mixing path even when
+   *  tab audio is absent. */
+  auxAudioStream?: MediaStream;
+  /** Per-instance overrides merged over the default Deepgram query
+   *  (model/language/etc). The Retake flow uses this for
+   *  Chinese-language sessions ({ language: "zh", model: "nova-2" })
+   *  since the default is pinned to nova-3/en. */
+  sttQueryOverrides?: Record<string, string>;
 }
 
 /** Check whether the current default audio output is likely an earphone /
@@ -356,6 +378,32 @@ export class AudioSession {
    *  + the same mixed audio destination Deepgram receives. Held so we
    *  can release it cleanly on stop. */
   private videoStream: MediaStream | null = null;
+  /** Webcam stream when options.videoSource === "camera". Held both
+   *  for teardown and so the call UI can render a live self-view tile
+   *  (via getCameraStream()). Video track feeds videoRecorder; the
+   *  camera's own audio is never used (mic is captured separately). */
+  private cameraStream: MediaStream | null = null;
+  /** Gain node between the mic source and the mixed destination.
+   *  Only exists on the Web-Audio mixing path (tab audio or
+   *  auxAudioStream present). setMicGain() drives it: the Retake flow
+   *  zeroes it while TTS plays (echo guard) and the call UI's mute
+   *  button toggles it. */
+  private micGainNode: GainNode | null = null;
+
+  /** Live webcam stream for the self-view tile, or null when camera
+   *  capture is off / was denied. */
+  public getCameraStream(): MediaStream | null {
+    return this.cameraStream;
+  }
+
+  /** Set the mic's contribution to the recording + STT mix. 0 = muted,
+   *  1 = normal. No-op when the session isn't on the mixing path
+   *  (plain mic-only live sessions don't need it). */
+  public setMicGain(v: number): void {
+    if (this.micGainNode) {
+      this.micGainNode.gain.value = v;
+    }
+  }
   /** Wall-clock when the CURRENT run-segment started (i.e. last
    *  start() / resume() call). Reset on each resume, so it only
    *  measures the active recording slice. Pause/resume cycles
@@ -631,23 +679,40 @@ export class AudioSession {
 
     // 1b) Build the stream handed to MediaRecorder + Deepgram. Four
     //     branches:
-    //       (a) mic + tab → mix via Web Audio
+    //       (a) mic + (tab and/or aux) → mix via Web Audio
     //       (b) mic only  → use mic directly
     //       (c) tab only  → use tab audio directly (useMic === false)
     //       (d) neither   → no audio source, abort
+    //
+    //     The aux stream (Retake TTS output) forces the mixing path
+    //     so the AI voice reaches both the recording and Deepgram.
+    //     The mic goes through a GainNode on this path so the Retake
+    //     controller can zero it while TTS plays (echo guard) and the
+    //     call UI can implement mute.
     const hasTabAudio =
       !!this.tabStream && this.tabStream.getAudioTracks().length > 0;
-    if (this.micStream && hasTabAudio) {
+    const auxStream = this.options.auxAudioStream ?? null;
+    if (this.micStream && (hasTabAudio || auxStream)) {
       this.audioContext = new AudioContext();
       const dest = this.audioContext.createMediaStreamDestination();
+      this.micGainNode = this.audioContext.createGain();
       this.audioContext
         .createMediaStreamSource(this.micStream)
-        .connect(dest);
-      this.audioContext
-        .createMediaStreamSource(
-          new MediaStream(this.tabStream!.getAudioTracks())
-        )
-        .connect(dest);
+        .connect(this.micGainNode);
+      this.micGainNode.connect(dest);
+      if (hasTabAudio) {
+        this.audioContext
+          .createMediaStreamSource(
+            new MediaStream(this.tabStream!.getAudioTracks())
+          )
+          .connect(dest);
+      }
+      if (auxStream) {
+        this.audioContext.createMediaStreamSource(auxStream).connect(dest);
+        this.callbacks.onLog?.("audio:aux-mixed", {
+          auxTracks: auxStream.getAudioTracks().length,
+        });
+      }
       this.mediaStream = dest.stream;
     } else if (this.micStream) {
       this.mediaStream = this.micStream;
@@ -688,7 +753,69 @@ export class AudioSession {
     //     If they decline / pick the wrong source / browser doesn't
     //     support it, we log a soft error and continue without video.
     //     Audio path is unaffected.
-    if (this.options.captureVideo) {
+    if (this.options.captureVideo && this.options.videoSource === "camera") {
+      // ============================================================
+      // Camera path (Retake / mock interview). Records the user's
+      // webcam instead of a screen share. Deliberately skips ALL of
+      // the screen machinery below: no Region Capture crop, no
+      // zoom-lock transition listeners, no share-ended watchdog —
+      // none of it applies to a camera track. Camera denial is
+      // NON-fatal: the retake continues audio-only and the call UI
+      // shows an avatar in the self-view tile.
+      // ============================================================
+      this.callbacks.onLog?.("video:begin", { source: "camera" });
+      try {
+        this.cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280, max: 1920 },
+            height: { ideal: 720, max: 1080 },
+            frameRate: { ideal: 30, max: 30 },
+          },
+          audio: false,
+        });
+        const camTracks = this.cameraStream.getVideoTracks();
+        if (camTracks.length === 0) {
+          for (const t of this.cameraStream.getTracks()) t.stop();
+          this.cameraStream = null;
+          this.callbacks.onLog?.("video:camera-no-tracks");
+        } else {
+          const audioTracks = this.mediaStream.getAudioTracks();
+          this.videoStream = new MediaStream([
+            ...camTracks,
+            ...audioTracks,
+          ]);
+          this.callbacks.onLog?.("video:camera-stream-built", {
+            videoTracks: camTracks.length,
+            audioTracks: audioTracks.length,
+          });
+          camTracks[0].addEventListener("ended", () => {
+            // Camera unplugged / OS revoked permission mid-call.
+            // Finalize the current segment; audio keeps going.
+            this.callbacks.onLog?.("video:camera-track-ended", {});
+            if (
+              this.videoRecorder &&
+              this.videoRecorder.state !== "inactive"
+            ) {
+              try {
+                this.videoRecorder.stop();
+              } catch {
+                /* already stopping */
+              }
+            }
+          });
+        }
+      } catch (e) {
+        const err = e as { name?: string; message?: string };
+        this.cameraStream = null;
+        this.callbacks.onLog?.("video:camera-denied", {
+          name: err?.name ?? "unknown",
+          message: err?.message ?? String(e),
+        });
+        this.callbacks.onError(
+          "Camera unavailable — continuing with audio only."
+        );
+      }
+    } else if (this.options.captureVideo) {
       this.callbacks.onLog?.("video:begin", {
         hadTabAudio: !!this.tabStream,
       });
@@ -1133,7 +1260,15 @@ export class AudioSession {
       return;
     }
 
-    const url = `wss://api.deepgram.com/v1/listen?${DEEPGRAM_QUERY}`;
+    // Per-instance query: defaults + caller overrides (e.g. the Retake
+    // flow's Chinese sessions pass { language: "zh", model: "nova-2" }).
+    const queryParams = new URLSearchParams(DEEPGRAM_QUERY);
+    for (const [k, v] of Object.entries(
+      this.options.sttQueryOverrides ?? {}
+    )) {
+      queryParams.set(k, v);
+    }
+    const url = `wss://api.deepgram.com/v1/listen?${queryParams.toString()}`;
     let ws: WebSocket;
     try {
       ws = new WebSocket(url, [scheme, token]);
@@ -2025,9 +2160,14 @@ export class AudioSession {
     this.selfTabStream?.getTracks().forEach((t) => {
       try { t.stop(); } catch { /* ignore */ }
     });
+    this.cameraStream?.getTracks().forEach((t) => {
+      try { t.stop(); } catch { /* ignore */ }
+    });
     this.micStream = null;
     this.tabStream = null;
     this.selfTabStream = null;
+    this.cameraStream = null;
+    this.micGainNode = null;
     this.mediaStream = null;
     this.videoStream = null;
     if (this.audioContext && this.audioContext.state !== "closed") {
@@ -2346,9 +2486,14 @@ export class AudioSession {
     this.selfTabStream?.getTracks().forEach((t) => {
       try { t.stop(); } catch { /* ignore */ }
     });
+    this.cameraStream?.getTracks().forEach((t) => {
+      try { t.stop(); } catch { /* ignore */ }
+    });
     this.micStream = null;
     this.tabStream = null;
     this.selfTabStream = null;
+    this.cameraStream = null;
+    this.micGainNode = null;
 
     // STEP 2: Tell Deepgram we're done so it flushes the final transcript.
     if (this.ws?.readyState === WebSocket.OPEN) {

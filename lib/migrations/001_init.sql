@@ -327,3 +327,17 @@ CREATE TABLE IF NOT EXISTS session_shares (
 -- returning the existing row).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_shares_session_active
   ON session_shares(session_id) WHERE revoked_at IS NULL;
+
+-- =====================================================================
+-- Retake sessions — an AI-interviewer mock session generated from a
+-- completed original. parent_session_id links the retake to the
+-- session it mirrors (SET NULL on parent delete: the retake remains
+-- reviewable on its own). session_mode distinguishes 'live' (default,
+-- covers all legacy rows) from 'retake'.
+-- =====================================================================
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL;
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS session_mode TEXT NOT NULL DEFAULT 'live';
+CREATE INDEX IF NOT EXISTS idx_sessions_parent
+  ON sessions(parent_session_id);

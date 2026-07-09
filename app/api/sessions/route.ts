@@ -23,9 +23,12 @@ export async function GET(req: Request) {
     duration_seconds: number;
     has_score: boolean;
     score_error: string | null;
+    session_mode: string | null;
+    parent_session_id: string | null;
   }>(
     `SELECT id, title, started_at, duration_seconds,
-            (score IS NOT NULL) AS has_score, score_error
+            (score IS NOT NULL) AS has_score, score_error,
+            session_mode, parent_session_id
      FROM sessions
      WHERE user_id = $1
      ORDER BY started_at DESC, created_at DESC`,
@@ -39,6 +42,8 @@ export async function GET(req: Request) {
       durationSeconds: row.duration_seconds,
       hasScore: row.has_score,
       scoreError: row.score_error ?? undefined,
+      sessionMode: row.session_mode === "retake" ? "retake" : "live",
+      parentSessionId: row.parent_session_id ?? undefined,
     })),
   });
 }
@@ -108,6 +113,10 @@ interface SaveBody {
     speakerRoles?: Record<number | string, "interviewer" | "candidate">;
     score?: unknown;
     scoreError?: string;
+    // Retake support (2026-07). Absent on legacy clients → defaults
+    // ('live', no parent) keep old payloads working unchanged.
+    parentSessionId?: string;
+    sessionMode?: "live" | "retake";
   };
   questions: SavedQuestion[];
   utterances?: SavedUtterance[];
@@ -145,10 +154,12 @@ export async function POST(req: Request) {
          id, user_id, title, jd, resume, started_at, duration_seconds,
          audio_s3_key, video_s3_key, jd_summary, resume_summary,
          interviewer_profile, interviewer_profile_summary,
-         speaker_roles, score, score_error
+         speaker_roles, score, score_error,
+         parent_session_id, session_mode
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
-         $8, $9, $10, $11, $12, $13, $14, $15, $16
+         $8, $9, $10, $11, $12, $13, $14, $15, $16,
+         $17, $18
        )
        ON CONFLICT (id) DO NOTHING`,
       [
@@ -168,6 +179,8 @@ export async function POST(req: Request) {
         JSON.stringify(s.speakerRoles ?? {}),
         s.score === undefined ? null : JSON.stringify(s.score),
         s.scoreError ?? null,
+        s.parentSessionId ?? null,
+        s.sessionMode === "retake" ? "retake" : "live",
       ]
     );
 

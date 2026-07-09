@@ -347,6 +347,47 @@ interface StoreState {
   ) => Session;
   /** Wipe live state (after End & Save, or a hard reset). */
   resetLive: () => void;
+
+  // ===== Retake (AI mock interview) slice =====
+  /** Non-null while a retake call is active (or being started). Holds
+   *  the parent link + the generated interview plan. The plan lives
+   *  only in memory — refresh mid-retake loses the run (same contract
+   *  as live sessions). */
+  retake: {
+    parentId: string;
+    parentTitle: string;
+    plan: import("@/app/api/retake/plan/route").RetakePlan;
+  } | null;
+  /** Coarse call phase, written by the mock-interviewer controller,
+   *  read by MockInterviewView (drives the speaking/thinking
+   *  animations). */
+  retakePhase:
+    | "greeting"
+    | "asking"
+    | "listening"
+    | "thinking"
+    | "wrapup"
+    | "ended";
+  /** Current question text — the call view's caption bar. */
+  retakeCaption: string;
+  /** Call-UI mute state (user-toggled; distinct from the automatic
+   *  TTS-window muting the controller does). */
+  retakeMicMuted: boolean;
+  /** Enter retake mode: performs the same live-state reset as
+   *  startLive, then overlays the retake fields. liveTitle is set
+   *  immediately (no /api/session-title call for retakes). */
+  startRetake: (args: {
+    parentId: string;
+    parentTitle: string;
+    plan: import("@/app/api/retake/plan/route").RetakePlan;
+    jd: string;
+    resume: string;
+    interviewerProfile?: string;
+    interviewerProfileSummary?: string;
+  }) => void;
+  setRetakePhase: (p: StoreState["retakePhase"]) => void;
+  setRetakeCaption: (text: string) => void;
+  setRetakeMicMuted: (muted: boolean) => void;
 }
 
 const emptyLive: LiveState = {
@@ -507,6 +548,10 @@ export const useStore = create<StoreState>()(
       resumeSummary: partial.resumeSummary,
       interviewerProfile: partial.interviewerProfile,
       interviewerProfileSummary: partial.interviewerProfileSummary,
+      speakerRoles: partial.speakerRoles,
+      parentSessionId: partial.parentSessionId,
+      sessionMode: partial.sessionMode,
+      parentTitle: partial.parentTitle,
     };
     set((state) => ({ pastSessions: [full, ...state.pastSessions] }));
     return full;
@@ -673,6 +718,38 @@ export const useStore = create<StoreState>()(
       live: { status: "starting", elapsedSeconds: 0, currentQuestionId: null },
     }),
 
+  // ===== Retake (AI mock interview) slice =====
+  retake: null,
+  retakePhase: "greeting",
+  retakeCaption: "",
+  retakeMicMuted: false,
+  startRetake: ({
+    parentId,
+    parentTitle,
+    plan,
+    jd,
+    resume,
+    interviewerProfile,
+    interviewerProfileSummary,
+  }) => {
+    // Same reset as startLive…
+    get().startLive(jd, resume, interviewerProfile);
+    // …then overlay retake state. Title is fixed up-front — no
+    // /api/session-title call; "Retake: <parent>" is exactly what the
+    // sidebar should show.
+    set({
+      retake: { parentId, parentTitle, plan },
+      retakePhase: "greeting",
+      retakeCaption: "",
+      retakeMicMuted: false,
+      liveTitle: `Retake: ${parentTitle}`,
+      liveInterviewerProfileSummary: interviewerProfileSummary || "",
+    });
+  },
+  setRetakePhase: (p) => set({ retakePhase: p }),
+  setRetakeCaption: (text) => set({ retakeCaption: text }),
+  setRetakeMicMuted: (muted) => set({ retakeMicMuted: muted }),
+
   addQuestion: (q) =>
     set((s) => ({
       liveQuestions: [...s.liveQuestions, q],
@@ -809,6 +886,11 @@ export const useStore = create<StoreState>()(
     // FIRST thing PastView renders for this session.
     const willConcat = (videoMeta?.videoSegmentUrls?.length ?? 0) > 0;
 
+    // Retake sessions carry the parent link + mode marker so the
+    // sidebar can badge them and PastView can link back to the
+    // original. Read BEFORE the reset below wipes `retake`.
+    const retakeCtx = s.retake;
+
     const session: Session = {
       id: `sess-${Date.now()}`,
       title,
@@ -822,6 +904,9 @@ export const useStore = create<StoreState>()(
       audioUrl,
       videoUrl,
       videoConcatPending: willConcat,
+      sessionMode: retakeCtx ? "retake" : "live",
+      parentSessionId: retakeCtx?.parentId,
+      parentTitle: retakeCtx?.parentTitle,
       interviewerProfile: captured.interviewerProfile || undefined,
       // Snapshot the AI summary captured at session start so the
       // PastView Context block can render immediately without waiting
@@ -841,6 +926,8 @@ export const useStore = create<StoreState>()(
           durationSeconds: session.durationSeconds,
           hasScore: false,
           scoreError: undefined,
+          sessionMode: session.sessionMode,
+          parentSessionId: session.parentSessionId,
         },
         ...state.pastSessionList,
       ],
@@ -862,6 +949,10 @@ export const useStore = create<StoreState>()(
       liveLockedProbeQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
+      retake: null,
+      retakePhase: "greeting" as const,
+      retakeCaption: "",
+      retakeMicMuted: false,
       live: emptyLive,
     }));
     // Fire-and-forget server save + Phase 3 upload chain. Errors
@@ -983,6 +1074,10 @@ export const useStore = create<StoreState>()(
       liveLockedProbeQuestion: null,
       liveCandidateQuestioningSince: null,
       liveSpeakerPrompt: null,
+      retake: null,
+      retakePhase: "greeting",
+      retakeCaption: "",
+      retakeMicMuted: false,
       live: emptyLive,
     }),
     }),

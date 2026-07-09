@@ -11,9 +11,15 @@ import { isAdminUser } from "@/lib/auth-client";
 interface Props {
   onRenameRequest: (id: string, currentTitle: string) => void;
   onDeleteRequest: (id: string, title: string) => void;
+  /** Launch the Retake (AI mock interview) flow for a past session. */
+  onRetakeRequest: (id: string, title: string) => void;
 }
 
-export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
+export function Sidebar({
+  onRenameRequest,
+  onDeleteRequest,
+  onRetakeRequest,
+}: Props) {
   const t = useTranslations();
   const router = useRouter();
   // Phase 2: the sidebar reads the lightweight pastSessionList that
@@ -34,6 +40,8 @@ export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
           durationSeconds: s.durationSeconds,
           hasScore: Boolean(s.score),
           scoreError: s.scoreError,
+          sessionMode: s.sessionMode,
+          parentSessionId: s.parentSessionId,
         }));
   const selectedPastId = useStore((s) => s.selectedPastId);
   const selectPast = useStore((s) => s.selectPast);
@@ -264,11 +272,33 @@ export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
               <span className="truncate flex-1 leading-snug" title={s.title}>
                 {s.title}
               </span>
+              {s.sessionMode === "retake" && (
+                <span
+                  className="shrink-0 text-[9.5px] font-semibold uppercase tracking-wide rounded px-1 py-px border border-border text-text-subtle"
+                  title={t("AI mock interview", "AI 模拟面试")}
+                >
+                  {t("Retake", "重练")}
+                </span>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation();
                   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                  setMenuPos({ x: rect.right + 4, y: rect.top });
+                  // Open BELOW the button, right-aligned to the button's
+                  // right edge. The previous "open to the right of the
+                  // button" layout pushed the dropdown into the main
+                  // content area where its right portion got hidden
+                  // behind the PastView pane's stacking context — only
+                  // "Re…" / "De…" peeked out from the sidebar edge.
+                  // Growing leftward from the button's right edge keeps
+                  // the menu inside the 240px sidebar (its 180px
+                  // min-width fits comfortably). Clamp left ≥ 8 so the
+                  // menu never goes off the left edge.
+                  const MENU_W = 180;
+                  setMenuPos({
+                    x: Math.max(8, rect.right - MENU_W),
+                    y: rect.bottom + 4,
+                  });
                   setMenuFor(s.id);
                 }}
                 className={`w-6 h-6 grid place-items-center rounded text-text-subtle hover:bg-bg hover:text-text shrink-0 transition-opacity ${
@@ -431,9 +461,20 @@ export function Sidebar({ onRenameRequest, onDeleteRequest }: Props) {
       {menuFor && (
         <div
           ref={menuRef}
-          className="fixed bg-bg border border-border-strong rounded-md min-w-[180px] p-1 z-[70]"
+          className="fixed bg-bg border border-border-strong rounded-md min-w-[180px] p-1 z-[100]"
           style={{ left: menuPos.x, top: menuPos.y, boxShadow: "var(--shadow-lg)" }}
         >
+          <button
+            onClick={() => {
+              const s = sidebarSessions.find((x) => x.id === menuFor);
+              if (s) onRetakeRequest(s.id, s.title);
+              setMenuFor(null);
+            }}
+            className="w-full px-2.5 py-1.5 rounded text-sm hover:bg-surface text-left"
+          >
+            {t("Retake interview", "重练这场面试")}
+          </button>
+          <div className="h-px bg-border my-1" />
           <button
             onClick={() => {
               const s = pastSessions.find((x) => x.id === menuFor);

@@ -2054,12 +2054,18 @@ export function InterviewTranscript({
   );
 }
 
-export function PastView() {
+export function PastView({
+  onRetakeRequest,
+}: {
+  /** Launch the Retake (AI mock interview) flow for this session. */
+  onRetakeRequest?: (id: string, title: string) => void;
+} = {}) {
   const t = useTranslations();
   const selectedPastId = useStore((s) => s.selectedPastId);
   const pastSessions = useStore((s) => s.pastSessions);
   const pastSessionList = useStore((s) => s.pastSessionList);
   const loadPastSession = useStore((s) => s.loadPastSession);
+  const selectPastFromHeader = useStore((s) => s.selectPast);
   const setPastSessionScore = useStore((s) => s.setPastSessionScore);
   // userId is required by requestPlaybackUrl (auth header). When
   // user signs in optimistically, userId is undefined for the first
@@ -2530,7 +2536,34 @@ export function PastView() {
             <div className="text-[13px] text-text-subtle mt-2" style={{ fontFamily: "var(--font-mono)" }}>
               {dateStr} · {fmt(session.durationSeconds)}
             </div>
+            {/* Retake lineage: this session IS a retake → link back to
+                the original it mirrors. Parent may be gone (deleted)
+                — then show nothing (parentSessionId null'd by FK). */}
+            {session.sessionMode === "retake" && session.parentSessionId && (
+              <button
+                type="button"
+                onClick={() => selectPastFromHeader(session.parentSessionId!)}
+                className="text-[12.5px] text-text-muted hover:text-text underline underline-offset-2 mt-1.5 print:hidden"
+              >
+                {t("Retake of", "重练自")}:{" "}
+                {session.parentTitle || t("original session", "原面试")}
+              </button>
+            )}
           </div>
+          {/* "Retake this interview" — only on ORIGINAL sessions (a
+              retake of a retake is out of scope for v1) that have
+              questions to mirror. */}
+          {onRetakeRequest &&
+            session.sessionMode !== "retake" &&
+            session.questions.length > 0 && (
+              <button
+                type="button"
+                onClick={() => onRetakeRequest(session.id, session.title)}
+                className="btn btn-secondary btn-sm shrink-0 print:hidden"
+              >
+                {t("Retake this interview", "重练这场面试")}
+              </button>
+            )}
           {/* Actions menu. Icon-only ghost button (32×32, no border,
               transparent until hover) —same visual language as the
               Sidebar's "More options" affordance on past-session

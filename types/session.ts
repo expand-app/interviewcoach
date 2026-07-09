@@ -395,6 +395,20 @@ export interface Session {
    *  String(dgSpeaker) for safety. Empty object when no roles were
    *  assigned (e.g. session ended before identification). */
   speakerRoles?: Record<string, "interviewer" | "candidate">;
+  /** When this session is a Retake (AI-interviewer mock session
+   *  generated from a completed original), the id of the original
+   *  session it mirrors. Undefined for regular live sessions and for
+   *  retakes whose parent was later deleted (DB uses ON DELETE SET
+   *  NULL so the retake stays reviewable on its own). */
+  parentSessionId?: string;
+  /** Distinguishes a regular 'live' coaching session from an AI-run
+   *  'retake' mock interview. Undefined on legacy rows — treat
+   *  undefined as 'live'. */
+  sessionMode?: "live" | "retake";
+  /** Title of the parent session, resolved server-side via JOIN on
+   *  GET /api/sessions/:id purely for display ("Retake of: …").
+   *  Never persisted as a column. */
+  parentTitle?: string;
 }
 
 /** Transient state during a live recording. */
