@@ -32,6 +32,12 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
   const [jdExpanded, setJdExpanded] = useState(false);
+  // Two-step flow: Generate (slow, 5-10s Sonnet call) → separate
+  // "Start interview" click. The second click is NOT just UX — the
+  // browser's autoplay policy requires a FRESH user gesture right
+  // before the AudioContexts + mic/camera acquisition happen, or the
+  // whole audio graph can come up suspended (silent mic, silent TTS).
+  const [plan, setPlan] = useState<RetakePlan | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -39,6 +45,7 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
       setGenerating(false);
       setError("");
       setJdExpanded(false);
+      setPlan(null);
     }
   }, [open, parent]);
 
@@ -73,7 +80,11 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
       if (!r.ok || !data.plan) {
         throw new Error(data.error || `plan generation failed (${r.status})`);
       }
-      onStart({ plan: data.plan, resume: resume.trim() });
+      // Hold the plan; the user's NEXT click ("Start interview")
+      // hands off — that click is the fresh gesture the audio
+      // pipeline needs.
+      setPlan(data.plan);
+      setGenerating(false);
     } catch (e) {
       setError(
         e instanceof Error && /failed \(4\d\d\)/.test(e.message)
@@ -194,21 +205,42 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
           </p>
         ) : null}
 
+        {plan && (
+          <p
+            className="mb-3 leading-snug"
+            style={{ fontSize: "0.8125rem", color: "var(--color-text)" }}
+          >
+            {t(
+              `Interview ready — ${plan.slots.length} questions prepared. Click Start when you are.`,
+              `面试已就绪——已准备 ${plan.slots.length} 道问题。准备好了就点开始。`
+            )}
+          </p>
+        )}
+
         <div className="flex gap-2 justify-end">
           <Button onClick={onCancel} disabled={generating}>
             {t("Cancel", "取消")}
           </Button>
-          <Button
-            variant="primary"
-            disabled={!canStart}
-            onClick={handleGenerate}
-          >
-            {generating
-              ? t("Generating interview…", "正在生成面试…")
-              : error
-                ? t("Retry", "重试")
-                : t("Generate & start", "生成并开始")}
-          </Button>
+          {plan ? (
+            <Button
+              variant="primary"
+              onClick={() => onStart({ plan, resume: resume.trim() })}
+            >
+              {t("Start interview", "开始面试")}
+            </Button>
+          ) : (
+            <Button
+              variant="primary"
+              disabled={!canStart}
+              onClick={handleGenerate}
+            >
+              {generating
+                ? t("Generating interview…", "正在生成面试…")
+                : error
+                  ? t("Retry", "重试")
+                  : t("Generate interview", "生成面试")}
+            </Button>
+          )}
         </div>
       </div>
     </ModalShell>

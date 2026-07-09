@@ -31,6 +31,34 @@ export function MockInterviewView({ onEndRequest }: Props) {
   const [captionsOn, setCaptionsOn] = useState(true);
   const [camReady, setCamReady] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  // "Hearing you" plumbing. The controller dispatches ic:retake-speech
+  // on every candidate interim/final — we track recency to (a) pulse a
+  // green dot on the self tile while the user talks and (b) surface a
+  // "can't hear you" warning if a listening phase goes 8s+ without a
+  // single speech signal (dead mic / wrong input device / suspended
+  // audio graph — the field report was exactly this, invisible).
+  const [lastHeardAt, setLastHeardAt] = useState(0);
+  const [listenStartedAt, setListenStartedAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const onSpeech = () => setLastHeardAt(Date.now());
+    window.addEventListener("ic:retake-speech", onSpeech);
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      window.removeEventListener("ic:retake-speech", onSpeech);
+      clearInterval(tick);
+    };
+  }, []);
+  useEffect(() => {
+    if (phase === "listening") setListenStartedAt(Date.now());
+  }, [phase]);
+  const hearingYou = now - lastHeardAt < 2000;
+  const micLooksDead =
+    phase === "listening" &&
+    !micMuted &&
+    listenStartedAt > 0 &&
+    now - listenStartedAt > 8000 &&
+    lastHeardAt < listenStartedAt;
 
   // Attach the webcam stream to the self-view tile. The camera is
   // acquired inside MockInterviewer.start() (async, after mount), so
@@ -218,7 +246,36 @@ export function MockInterviewView({ onEndRequest }: Props) {
               {t("Muted", "已静音")}
             </span>
           )}
+          {!micMuted && hearingYou && (
+            <span
+              className="absolute bottom-1.5 left-1.5 flex items-center gap-1 text-[10px] font-medium rounded px-1 py-px"
+              style={{ background: "rgba(0,0,0,0.6)", color: "#5eea9f" }}
+            >
+              <span
+                className="w-1.5 h-1.5 rounded-full animate-pulse"
+                style={{ background: "#5eea9f" }}
+              />
+              {t("Hearing you", "听到了")}
+            </span>
+          )}
         </div>
+
+        {/* Dead-mic warning: listening 8s+ with zero speech signal. */}
+        {micLooksDead && (
+          <div
+            className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-md px-3.5 py-2 text-[12.5px] font-medium"
+            style={{
+              background: "rgba(229,72,77,0.15)",
+              border: "1px solid rgba(229,72,77,0.5)",
+              color: "#ff9b9e",
+            }}
+          >
+            {t(
+              "Can't hear you — check that the right microphone is allowed, then click anywhere on this page.",
+              "听不到你的声音——请检查麦克风权限/设备是否正确,然后在页面任意处点击一下。"
+            )}
+          </div>
+        )}
 
         {/* Silent-coaching notice (top-left, quiet) */}
         <span
@@ -265,12 +322,7 @@ export function MockInterviewView({ onEndRequest }: Props) {
           onClick={() => setCaptionsOn((v) => !v)}
         />
         <CallButton
-          label={t("Done — next question", "答完了,下一题")}
-          disabled={phase !== "listening"}
-          onClick={() => interviewer.forceCompleteTurn()}
-        />
-        <CallButton
-          label={t("Skip", "跳过")}
+          label={t("Skip question", "跳过这题")}
           disabled={phase !== "listening"}
           onClick={() => interviewer.skipQuestion()}
         />

@@ -45,6 +45,79 @@ export interface TtsProvider {
   speak(text: string, opts?: TtsSpeakOptions): Promise<TtsHandle>;
 }
 
+/** Fetch + decode one Aura utterance into a playable AudioBuffer.
+ *  Split out from speak() so callers can PREFETCH audio ahead of
+ *  when it's needed (ack pool, next-question preload) — the fetch +
+ *  decode is the dominant latency (~0.5-1.5s); playback of a decoded
+ *  buffer is instant. */
+export async function fetchAuraBuffer(
+  ctx: AudioContext,
+  text: string,
+  voice?: string
+): Promise<AudioBuffer> {
+  const r = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text, voice }),
+  });
+  if (!r.ok) {
+    throw new Error(`tts fetch failed: HTTP ${r.status}`);
+  }
+  const bytes = await r.arrayBuffer();
+  // decodeAudioData detaches the buffer — no copy needed.
+  return ctx.decodeAudioData(bytes);
+}
+
+/** Play an already-decoded buffer. Resumes a suspended context first
+ *  (autoplay policy can suspend contexts created outside a user
+ *  gesture — the #1 cause of "the AI is silent / the mic mix is
+ *  dead"). */
+export function playAuraBuffer(
+  ctx: AudioContext,
+  audioBuffer: AudioBuffer,
+  captureInto?: MediaStreamAudioDestinationNode
+): TtsHandle {
+  if (ctx.state === "suspended") {
+    void ctx.resume().catch(() => {});
+  }
+  const source = ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(ctx.destination);
+  if (captureInto) {
+    source.connect(captureInto);
+  }
+
+  let resolveDone!: () => void;
+  const done = new Promise<void>((res) => {
+    resolveDone = res;
+  });
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    try {
+      source.disconnect();
+    } catch {
+      /* already disconnected */
+    }
+    resolveDone();
+  };
+  source.onended = finish;
+  source.start();
+
+  return {
+    done,
+    cancel: () => {
+      try {
+        source.stop();
+      } catch {
+        /* not started / already stopped */
+      }
+      finish();
+    },
+  };
+}
+
 /** Deepgram Aura via the /api/tts proxy. English voices only. */
 export const auraProvider: TtsProvider = {
   name: "aura",
@@ -52,61 +125,8 @@ export const auraProvider: TtsProvider = {
   async speak(text, opts) {
     const ctx = opts?.audioContext;
     if (!ctx) throw new Error("auraProvider.speak requires audioContext");
-
-    const r = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, voice: opts?.voice }),
-    });
-    if (!r.ok) {
-      throw new Error(`tts fetch failed: HTTP ${r.status}`);
-    }
-    const bytes = await r.arrayBuffer();
-    // decodeAudioData detaches the buffer — no copy needed.
-    const audioBuffer = await ctx.decodeAudioData(bytes);
-
-    // Some browsers auto-suspend contexts created before a user
-    // gesture; resume defensively (no-op when already running).
-    if (ctx.state === "suspended") {
-      await ctx.resume().catch(() => {});
-    }
-
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
-    if (opts?.captureInto) {
-      source.connect(opts.captureInto);
-    }
-
-    let resolveDone!: () => void;
-    const done = new Promise<void>((res) => {
-      resolveDone = res;
-    });
-    let finished = false;
-    const finish = () => {
-      if (finished) return;
-      finished = true;
-      try {
-        source.disconnect();
-      } catch {
-        /* already disconnected */
-      }
-      resolveDone();
-    };
-    source.onended = finish;
-    source.start();
-
-    return {
-      done,
-      cancel: () => {
-        try {
-          source.stop();
-        } catch {
-          /* not started / already stopped */
-        }
-        finish();
-      },
-    };
+    const audioBuffer = await fetchAuraBuffer(ctx, text, opts?.voice);
+    return playAuraBuffer(ctx, audioBuffer, opts?.captureInto);
   },
 };
 

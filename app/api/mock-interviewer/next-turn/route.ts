@@ -124,7 +124,9 @@ ${
 # Decision rules
 - May you ask a follow-up now? ${canFollowup ? "YES (at most one more level)" : "NO (move on)"}
 - Follow up ONLY if the answer left a specific, concrete thread worth probing (a claim without evidence, an interesting decision, a vague area the role cares about). A complete, well-evidenced answer → move on.
-- When moving on: 1 short natural acknowledgment sentence, then ask the next planned question. You may lightly rephrase it to connect to the conversation, but keep its topic and difficulty identical.
+- ECHO THE CANDIDATE: open your utterance by briefly reflecting ONE specific detail from their answer, mirroring their own words — like a real interviewer ("Cutting the pipeline latency from four hours to twenty minutes — that's a serious win."). One short sentence, genuinely reactive, never generic filler like "great answer". Vary the phrasing across turns.
+- After the echo: for "followup", ask your probe; for "next", transition naturally into the next planned question ("...I'd like to switch gears a bit —"). You may lightly rephrase the planned question to connect to the conversation, but keep its topic and difficulty identical.
+- Keep the WHOLE utterance under 3 sentences — brisk, conversational momentum, no dead air.
 - When this was the last planned question and you're not following up → action "wrapup" (utterance empty).
 - Speak in ${language === "zh" ? "Chinese" : "English"}. Natural spoken style — it will be read aloud by TTS. No lists, no stage directions, no quotes around the question.
 

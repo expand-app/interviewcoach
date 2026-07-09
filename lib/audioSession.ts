@@ -404,6 +404,17 @@ export class AudioSession {
       this.micGainNode.gain.value = v;
     }
   }
+
+  /** Gesture-driven backstop for the autoplay policy: if the mixing
+   *  AudioContext is stuck "suspended" (created outside a user
+   *  gesture), call this from any pointerdown/keydown handler to
+   *  bring the graph — and with it the mic → Deepgram feed — back
+   *  to life. Safe to call repeatedly. */
+  public resumeAudioGraph(): void {
+    if (this.audioContext && this.audioContext.state === "suspended") {
+      void this.audioContext.resume().catch(() => {});
+    }
+  }
   /** Wall-clock when the CURRENT run-segment started (i.e. last
    *  start() / resume() call). Reset on each resume, so it only
    *  measures the active recording slice. Pause/resume cycles
@@ -694,6 +705,21 @@ export class AudioSession {
     const auxStream = this.options.auxAudioStream ?? null;
     if (this.micStream && (hasTabAudio || auxStream)) {
       this.audioContext = new AudioContext();
+      // Autoplay policy: a context created OUTSIDE a user-gesture
+      // window starts "suspended" — the whole mixing graph then
+      // produces silence (mic never reaches Deepgram or the
+      // recorder, TTS never reaches the mix). This bit the Retake
+      // flow, whose start runs several seconds after the click
+      // (plan generation in between). Resume defensively and log
+      // the state so a still-suspended context is visible in
+      // diagnostics; resumeAudioGraph() is the gesture-driven
+      // backstop.
+      if (this.audioContext.state === "suspended") {
+        void this.audioContext.resume().catch(() => {});
+      }
+      this.callbacks.onLog?.("audio:context-state", {
+        state: this.audioContext.state,
+      });
       const dest = this.audioContext.createMediaStreamDestination();
       this.micGainNode = this.audioContext.createGain();
       this.audioContext
