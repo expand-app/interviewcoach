@@ -519,13 +519,13 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
 
       try {
-        // Opus 4.7 — same model as the batch analysis endpoints, so
-        // live and recorded produce commentary with identical voice and
-        // reasoning quality. Opus has higher first-token latency than
-        // Sonnet, but because we stream token-by-token the candidate
-        // starts seeing text within ~1s — acceptable for this use case.
+        // Sonnet 4.5 — chosen over Opus for live commentary: much lower
+        // first-token latency (the comment lands while the candidate is
+        // still on the topic), ~1/5 the cost, and near-Opus quality on
+        // this read-the-answer-and-coach task. Streamed token-by-token,
+        // so the candidate sees text almost immediately.
         const messageStream = client.messages.stream({
-          model: "claude-opus-4-7",
+          model: "claude-sonnet-4-5",
           max_tokens: 600,
           system: systemForMode,
           messages: [{ role: "user", content: userMsg }],

@@ -191,8 +191,11 @@ ${userCommentsBlock}
 Produce JSON with your findings.`;
 
   try {
+    // Sonnet 4.5 — this is an internal batch diagnostic (not user-
+    // facing, low call volume); Sonnet handles the structured
+    // transcript+log analysis well at a fraction of Opus's cost.
     const resp = await client.messages.create({
-      model: "claude-opus-4-7",
+      model: "claude-sonnet-4-5",
       max_tokens: 8000,
       system,
       messages: [{ role: "user", content: user }],
