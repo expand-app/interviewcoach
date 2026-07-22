@@ -63,20 +63,27 @@ const CAPTIONS_LANE_HEIGHT_PX = 60;
 // never resizes the box) — so nothing shifts mid-recording and no
 // 花屏 can occur.
 const PHONE_BOX_MAX_WIDTH_PX = 440; // ≈ iPhone logical width
-// FIXED height for the commentary pane in phone mode. Tall enough that a
-// full-budget comment (≈80 字 / 40 words) + the 15-30 word "Try this"
-// fits at the enlarged phone font (measured: holds ~185 字 + a ~20-word
-// Try this). Content past this clips internally rather than resizing the
-// pane — required so the card's Region Capture bbox stays stable.
-const COMMENTARY_PHONE_HEIGHT_PX = 680;
+// FIXED height for the commentary pane in phone mode. Holds a full-budget
+// comment (≈80 字 / 40 words, measured ~160 字) + the 15-30 word "Try
+// this" at the enlarged phone font. Content past this clips internally
+// rather than resizing the pane — required so the card's Region Capture
+// bbox stays stable. Sized (with the capped question bar below) so the
+// captions section always stays visible inside the fixed card.
+const COMMENTARY_PHONE_HEIGHT_PX = 620;
+// Cap on the phone-mode question bar (Lead + Probe). Without a cap a very
+// long question would grow unbounded and push the captions (+ Re-tag,
+// which the user needs) off the bottom of the fixed card. Beyond this the
+// question scrolls internally; captions always stays put. ~6-7 lines at
+// the enlarged phone font.
+const PHONE_QUESTION_MAX_HEIGHT_PX = 260;
 // Phone-mode card is a FIXED height (not auto) for the same reason wide
 // mode is: the card IS the Region Capture crop target, and ANY size
 // change during recording (e.g. the question bar growing when a new
 // question arrives) moves its bounding box → 花屏 in the saved video.
-// Sized to hold the question bar + the 680px commentary pane + captions
-// with slack; content past this clips internally (like wide mode).
-//   question bar ≈ 160 + commentary (mt-4 + 680) ≈ 696 + captions 151
-//   ≈ 1007 → 1080 leaves headroom for a 2-3 line question.
+// Sized so the CAPPED question bar + commentary pane + captions all fit
+// with slack, so captions/Re-tag are always visible:
+//   question ≤ (mt-4 16 + 260) + commentary (mt-4 16 + 620) + captions 151
+//   ≈ 1063 → 1080 leaves ~17px slack.
 const PHONE_CARD_HEIGHT_PX = 1080;
 // Wide-mode max-width the boxes animate FROM. A concrete px (not
 // `none`/`100%`) so the max-width transition is smooth in both
@@ -1472,13 +1479,20 @@ function BarShell({
   return (
     <div
       className={
-        "px-5 py-4 flex flex-col justify-center shrink-0 w-full " +
+        "px-5 py-4 flex flex-col shrink-0 w-full " +
+        // Phone mode: top-align + internal scroll so a very long question
+        // scrolls WITHIN a capped height instead of pushing the captions
+        // (+ Re-tag) off the bottom of the fixed card. Wide mode keeps the
+        // original vertically-centered look.
         (phoneMode
-          ? "mx-auto mt-4 rounded-2xl border border-border"
-          : "border-b border-border")
+          ? "justify-start overflow-y-auto no-scrollbar mx-auto mt-4 rounded-2xl border border-border"
+          : "justify-center border-b border-border")
       }
       style={{
         minHeight: PHASE_MIN_HEIGHT_PX,
+        // Cap the phone-mode question bar so it can't grow unbounded and
+        // shove the captions section out of the fixed-height card.
+        maxHeight: phoneMode ? PHONE_QUESTION_MAX_HEIGHT_PX : undefined,
         maxWidth: phoneMode ? PHONE_BOX_MAX_WIDTH_PX : WIDE_BOX_MAX_WIDTH_PX,
         transition: LAYOUT_TRANSITION,
       }}
