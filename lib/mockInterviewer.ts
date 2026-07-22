@@ -35,6 +35,8 @@ import {
 } from "./ttsClient";
 import type { RetakePlan } from "@/app/api/retake/plan/route";
 import type { Comment, Question, Utterance } from "@/types/session";
+import type { IMockInterviewer, StartArgs } from "./mockInterviewerShared";
+import { RealtimeMockInterviewer } from "./mockInterviewerRealtime";
 
 // ===== tuning =====
 /** Answer counts as complete after this much silence (no interim or
@@ -74,13 +76,6 @@ const TTS_TAIL_MS = 300;
 const ACKS_EN = ["Mm-hm.", "Right.", "Okay.", "Got it."];
 const ACKS_ZH = ["嗯。", "好。", "嗯嗯。", "明白。"];
 
-interface StartArgs {
-  plan: RetakePlan;
-  jd: string;
-  resume: string;
-  interviewerProfileSummary?: string;
-}
-
 function rid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -107,7 +102,7 @@ function tokenOverlap(a: string, b: string): number {
   return inter / Math.min(ta.size, tb.size);
 }
 
-export class MockInterviewer {
+export class MockInterviewer implements IMockInterviewer {
   private audio: AudioSession | null = null;
   private plan: RetakePlan | null = null;
   private jd = "";
@@ -917,9 +912,21 @@ export class MockInterviewer {
   }
 }
 
-// Singleton, mirroring getOrchestrator().
-let instance: MockInterviewer | null = null;
-export function getMockInterviewer(): MockInterviewer {
-  if (!instance) instance = new MockInterviewer();
+// Singleton, mirroring getOrchestrator(). The Retake engine is chosen
+// by NEXT_PUBLIC_RETAKE_ENGINE:
+//   - "openai" → RealtimeMockInterviewer (OpenAI Realtime voice, WebRTC)
+//   - anything else / unset → MockInterviewer (Aura TTS + Deepgram STT)
+// Defaults to the Aura engine so merging/deploying this code does NOT
+// change behavior until the env var is flipped (and OPENAI_API_KEY is
+// set on the server). Both implement IMockInterviewer, so the call UI
+// and page wiring are identical either way.
+let instance: IMockInterviewer | null = null;
+export function getMockInterviewer(): IMockInterviewer {
+  if (!instance) {
+    instance =
+      process.env.NEXT_PUBLIC_RETAKE_ENGINE === "openai"
+        ? new RealtimeMockInterviewer()
+        : new MockInterviewer();
+  }
   return instance;
 }

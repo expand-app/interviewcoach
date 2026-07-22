@@ -184,6 +184,14 @@ export interface AudioSessionOptions {
    *  Chinese-language sessions ({ language: "zh", model: "nova-2" })
    *  since the default is pinned to nova-3/en. */
   sttQueryOverrides?: Record<string, string>;
+  /** Skip the Deepgram WebSocket entirely — capture + mix + record the
+   *  audio, but produce NO transcripts from AudioSession. Used by the
+   *  Retake OpenAI-realtime engine, where the candidate's and AI's
+   *  transcripts come from OpenAI's realtime events instead. The
+   *  MediaRecorder still runs (recording/download unaffected) and the
+   *  aux mixing still applies (AI voice → recording). Default false —
+   *  the live path and the Aura-TTS Retake path keep Deepgram STT. */
+  disableStt?: boolean;
 }
 
 /** Check whether the current default audio output is likely an earphone /
@@ -1260,7 +1268,18 @@ export class AudioSession {
     // 2-3) Open the Deepgram WebSocket and start feeding audio. Extracted
     //      into a helper so the same path is reusable from
     //      scheduleReconnect() when the socket dies mid-session.
-    await this.openWs(/* isReconnect */ false);
+    if (this.options.disableStt) {
+      // Realtime engine: no Deepgram socket. Start the recorder
+      // directly (normally openWs's first-open triggers it) so the
+      // mixed mic+AI-voice stream is still captured; transcripts come
+      // from OpenAI. The chunk-send path is already guarded by
+      // `this.ws?.readyState === OPEN`, so with no socket the recorder
+      // simply accumulates audioChunks for the final recording.
+      this.callbacks.onLog?.("stt:disabled", {});
+      this.startRecording();
+    } else {
+      await this.openWs(/* isReconnect */ false);
+    }
 
     this.startTime = Date.now();
   }
