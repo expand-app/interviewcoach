@@ -49,6 +49,42 @@ const CAPTIONS_HEADING_HEIGHT_PX = 28;
  *  caption font also shrunk — same line-count visible per lane. */
 const CAPTIONS_LANE_HEIGHT_PX = 60;
 
+// ── "Live 演示" phone layout ──────────────────────────────────────
+// A pre-recording presentation toggle: the two output boxes (LIVE
+// COMMENTARY + LIVE CAPTIONS) switch from the default wide-flat
+// (iPad-ish) shape to a narrow-tall (iPhone-ish) shape, staying
+// vertically stacked. ONLY the two boxes change — the question bar
+// (header), side rails, and everything else stay put.
+//
+// Safe w.r.t. Region Capture because the toggle is LOCKED during
+// recording (same gate as the fullscreen button): the layout is set
+// before Begin, the crop bbox is computed once at that stable size,
+// and each box keeps a FIXED height (content overflows internally,
+// never resizes the box) — so nothing shifts mid-recording and no
+// 花屏 can occur.
+const PHONE_BOX_MAX_WIDTH_PX = 440; // ≈ iPhone logical width
+// FIXED height for the commentary pane in phone mode. Tall enough that a
+// full-budget comment (≈80 字 / 40 words) + the 15-30 word "Try this"
+// fits at the enlarged phone font (measured: holds ~185 字 + a ~20-word
+// Try this). Content past this clips internally rather than resizing the
+// pane — required so the card's Region Capture bbox stays stable.
+const COMMENTARY_PHONE_HEIGHT_PX = 680;
+// Phone-mode card is a FIXED height (not auto) for the same reason wide
+// mode is: the card IS the Region Capture crop target, and ANY size
+// change during recording (e.g. the question bar growing when a new
+// question arrives) moves its bounding box → 花屏 in the saved video.
+// Sized to hold the question bar + the 680px commentary pane + captions
+// with slack; content past this clips internally (like wide mode).
+//   question bar ≈ 160 + commentary (mt-4 + 680) ≈ 696 + captions 151
+//   ≈ 1007 → 1080 leaves headroom for a 2-3 line question.
+const PHONE_CARD_HEIGHT_PX = 1080;
+// Wide-mode max-width the boxes animate FROM. A concrete px (not
+// `none`/`100%`) so the max-width transition is smooth in both
+// directions. ≈ the card's inner content width (max-w-1080 − px-6).
+const WIDE_BOX_MAX_WIDTH_PX = 1032;
+const LAYOUT_TRANSITION =
+  "max-width 340ms cubic-bezier(0.4,0,0.2,1), height 340ms cubic-bezier(0.4,0,0.2,1)";
+
 /** Split commentary text on the `---SAY---` marker that the model
  *  emits at the end of every commentary / hint, separating the
  *  observation from the English suggested-answer script. The marker is
@@ -133,9 +169,13 @@ function computePaneMinDisplayMs(text: string): number {
 function CommentaryBody({
   html,
   tone,
+  phoneMode = false,
 }: {
   html: string;
   tone: "commentary" | "hint";
+  /** "Live 演示" layout: enlarge the text so mobile livestream
+   *  viewers (watching a cropped narrow slice) can read it clearly. */
+  phoneMode?: boolean;
 }) {
   const { commentary, suggestion } = splitCommentary(html);
   // Until the model has emitted any commentary text yet, render the
@@ -153,7 +193,10 @@ function CommentaryBody({
   // inside the fixed-height commentary panel.
   const SuggestionBlock = suggestion ? (
     <div
-      className="mt-3 rounded-sm text-[14.5px] leading-relaxed text-text-muted"
+      className={
+        "mt-3 rounded-sm leading-relaxed text-text-muted " +
+        (phoneMode ? "text-[19px]" : "text-[14.5px]")
+      }
       style={{
         padding: "var(--space-3)",
         background: "var(--color-bg)",
@@ -194,7 +237,12 @@ function CommentaryBody({
             jump every time the panel switches between them. Same
             content-budget caps apply (40 words / 80 字 — see
             /api/commentary listening-hint prompt). */}
-        <div className="flex-1 min-w-0 px-4 py-4 text-[17px] leading-normal text-text prose-live">
+        <div
+          className={
+            "flex-1 min-w-0 px-4 py-4 leading-normal text-text prose-live " +
+            (phoneMode ? "text-[23px]" : "text-[17px]")
+          }
+        >
           <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
           {SuggestionBlock}
         </div>
@@ -217,7 +265,12 @@ function CommentaryBody({
     // alongside the Try-this block. /api/commentary budgets
     // trimmed to 80 字 / 40 words so the model doesn't overshoot
     // and produce content that gets clipped.
-    <div className="w-full px-4 py-4 text-[17px] leading-normal text-text prose-live animate-appear">
+    <div
+      className={
+        "w-full px-4 py-4 leading-normal text-text prose-live animate-appear " +
+        (phoneMode ? "text-[23px]" : "text-[17px]")
+      }
+    >
       <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
       {SuggestionBlock}
     </div>
@@ -227,10 +280,16 @@ function CommentaryBody({
 export function LiveView({
   isFullscreen = false,
   onToggleFullscreen,
+  phoneMode = false,
+  onTogglePhoneMode,
   onStartRequest,
 }: {
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
+  /** "Live 演示" layout — the two output boxes go narrow + tall.
+   *  Set before recording; locked once recording starts. */
+  phoneMode?: boolean;
+  onTogglePhoneMode?: () => void;
   /** Called when the empty-state "Start a new session" button is
    *  clicked. Same handler the Topbar Start button calls — opens
    *  StartModal. Optional so LiveView still works in isolation. */
@@ -677,7 +736,16 @@ export function LiveView({
             className="sticky top-0 z-10 relative border border-border rounded-lg overflow-hidden bg-bg flex flex-col mb-6"
             style={
               isFullscreen
-                ? undefined
+                ? // Fullscreen: height driven by content; a fullscreen
+                  // toggle is a deliberate one-off layout change with its
+                  // own crop refresh.
+                  undefined
+                : phoneMode
+                ? // Phone mode: FIXED height (not auto) so the card's
+                  // Region Capture bbox never changes mid-recording when
+                  // the question bar grows on a new question → no 花屏.
+                  // Taller than wide mode to fit the narrow-tall boxes.
+                  { height: PHONE_CARD_HEIGHT_PX }
                 : {
                     // Fixed height — keeps the element's bounding
                     // box stable while content flows inside
@@ -722,59 +790,124 @@ export function LiveView({
                 phase, status="starting") and is then committed for
                 the duration. Escape key is similarly gated in
                 app/page.tsx. */}
-            {onToggleFullscreen && (() => {
-              const fullscreenLocked =
+            {/* Top-right control cluster. Both toggles are LOCKED during
+                active recording (recording / paused) — the user picks
+                the layout BEFORE clicking Begin, then it's committed for
+                the duration. Toggling either mid-recording would move /
+                resize the Region Capture crop target → 花屏 in the saved
+                video, so we gate them off. */}
+            {(onTogglePhoneMode || onToggleFullscreen) && (() => {
+              const controlsLocked =
                 live.status === "recording" || live.status === "paused";
               return (
-              <button
-                type="button"
-                onClick={fullscreenLocked ? undefined : onToggleFullscreen}
-                disabled={fullscreenLocked}
-                title={
-                  fullscreenLocked
-                    ? t(
-                        "Fullscreen is locked during recording — set this before you click Begin.",
-                        "录制期间无法切换全屏 —— 请在点击 Begin 之前设置好。"
-                      )
-                    : isFullscreen
-                      ? t("Exit fullscreen (Esc)", "退出全屏 (Esc)")
-                      : t("Fullscreen", "全屏")
-                }
-                className="absolute top-2 right-2 z-10 btn btn-ghost btn-sm print:hidden"
-              >
-                {/* Fullscreen toggle icon — SVG instead of Unicode
-                    `⤡` / `⤢` since those glyphs fall back inconsistently
-                    on some font stacks. Two arrows pointing into / out
-                    of the corners of a square. */}
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 14 14"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
-                >
-                  {isFullscreen ? (
-                    /* Exit: arrows pointing IN (toward center) */
-                    <>
-                      <path d="M6 2v3H3M2 6h3V3M8 12V9h3M12 8H9v3" />
-                    </>
-                  ) : (
-                    /* Enter: arrows pointing OUT (toward corners) */
-                    <>
-                      <path d="M3 6V3h3M11 3h-3v3M3 8v3h3M11 8v3H8" />
-                    </>
-                  )}
-                </svg>
-                <span>
-                  {isFullscreen
-                    ? t("Exit", "退出全屏")
-                    : t("Fullscreen", "全屏")}
-                </span>
-              </button>
+              <div className="absolute top-2 right-2 z-10 flex items-center gap-1.5 print:hidden">
+                {/* "Live 演示" — narrow-tall (iPhone-ish) vs default
+                    wide-flat (iPad-ish) box layout. */}
+                {onTogglePhoneMode && (
+                  <button
+                    type="button"
+                    onClick={controlsLocked ? undefined : onTogglePhoneMode}
+                    disabled={controlsLocked}
+                    aria-pressed={phoneMode}
+                    title={
+                      controlsLocked
+                        ? t(
+                            "Layout is locked during recording — set this before you click Begin.",
+                            "录制期间无法切换布局 —— 请在点击 Begin 之前设置好。"
+                          )
+                        : phoneMode
+                          ? t("Switch to wide layout", "切换回宽屏布局")
+                          : t("Switch to Live-demo layout", "切换到 Live 演示布局")
+                    }
+                    className="btn btn-ghost btn-sm"
+                  >
+                    {/* Phone / tablet frame icon. Portrait rounded rect
+                        when we'd switch INTO phone mode; wider rect when
+                        we'd switch back to the default layout. */}
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 14 14"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      {phoneMode ? (
+                        /* back-to-wide: landscape frame */
+                        <rect x="1.5" y="3.5" width="11" height="7" rx="1.2" />
+                      ) : (
+                        /* to-phone: portrait frame */
+                        <>
+                          <rect x="3.5" y="1.5" width="7" height="11" rx="1.5" />
+                          <line x1="6" y1="10.7" x2="8" y2="10.7" />
+                        </>
+                      )}
+                    </svg>
+                    <span>
+                      {phoneMode
+                        ? t("Wide", "宽屏")
+                        : t("Live demo", "Live 演示")}
+                    </span>
+                  </button>
+                )}
+                {/* Fullscreen toggle — lives inside the card so there's
+                    always a one-click exit even when the Topbar is
+                    auto-hidden in fullscreen. */}
+                {onToggleFullscreen && (
+                  <button
+                    type="button"
+                    onClick={controlsLocked ? undefined : onToggleFullscreen}
+                    disabled={controlsLocked}
+                    title={
+                      controlsLocked
+                        ? t(
+                            "Fullscreen is locked during recording — set this before you click Begin.",
+                            "录制期间无法切换全屏 —— 请在点击 Begin 之前设置好。"
+                          )
+                        : isFullscreen
+                          ? t("Exit fullscreen (Esc)", "退出全屏 (Esc)")
+                          : t("Fullscreen", "全屏")
+                    }
+                    className="btn btn-ghost btn-sm"
+                  >
+                    {/* Fullscreen toggle icon — SVG instead of Unicode
+                        `⤡` / `⤢` since those glyphs fall back
+                        inconsistently on some font stacks. Two arrows
+                        pointing into / out of the corners of a square. */}
+                    <svg
+                      width="12"
+                      height="12"
+                      viewBox="0 0 14 14"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden="true"
+                    >
+                      {isFullscreen ? (
+                        /* Exit: arrows pointing IN (toward center) */
+                        <>
+                          <path d="M6 2v3H3M2 6h3V3M8 12V9h3M12 8H9v3" />
+                        </>
+                      ) : (
+                        /* Enter: arrows pointing OUT (toward corners) */
+                        <>
+                          <path d="M3 6V3h3M11 3h-3v3M3 8v3h3M11 8v3H8" />
+                        </>
+                      )}
+                    </svg>
+                    <span>
+                      {isFullscreen
+                        ? t("Exit", "退出全屏")
+                        : t("Fullscreen", "全屏")}
+                    </span>
+                  </button>
+                )}
+              </div>
               );
             })()}
             {/* (1) Current Question — fixed-height top bar.
@@ -851,6 +984,7 @@ export function LiveView({
                 ),
                 probeHeader: t("Probe Question", "追问"),
               }}
+              phoneMode={phoneMode}
             />
 
             {/* (2) Live Commentary — fixed pane, content tuned to fit.
@@ -876,6 +1010,7 @@ export function LiveView({
                 observing: t("AI is observing…", "AI 正在观察…"),
               }}
               isFullscreen={isFullscreen}
+              phoneMode={phoneMode}
             />
 
             {/* (3) Live Captions — two speaker lanes stacked, fixed.
@@ -1131,6 +1266,7 @@ function CurrentQuestionBar({
   lockedCandidateQuestionText,
   lockedProbeQuestionText,
   labels,
+  phoneMode = false,
 }: {
   state: MomentStateKind;
   summary: string;
@@ -1174,11 +1310,14 @@ function CurrentQuestionBar({
     awaitingIdentity: string;
     probeHeader: string;
   };
+  /** "Live 演示" layout: narrow + center the question bar in sync
+   *  with the output boxes. */
+  phoneMode?: boolean;
 }) {
   // Pre-confirmation: roles not identified yet → neutral placeholder.
   if (!rolesConfirmed && hasUtterances) {
     return (
-      <BarShell>
+      <BarShell phoneMode={phoneMode}>
         <Eyebrow className="animate-pulse-dot">
           {labels.awaitingIdentity}
         </Eyebrow>
@@ -1190,7 +1329,7 @@ function CurrentQuestionBar({
   // vertical space but doesn't show a stale phase label.
   if (!hasUtterances && !mainQuestion && !summary) {
     return (
-      <BarShell>
+      <BarShell phoneMode={phoneMode}>
         <Eyebrow>{labels.waitingForFirst}</Eyebrow>
       </BarShell>
     );
@@ -1216,9 +1355,9 @@ function CurrentQuestionBar({
         ? candidateAskingText
         : lockedCandidateQuestionText ?? liveCandidateQuestionText;
     return (
-      <BarShell>
+      <BarShell phoneMode={phoneMode}>
         <Eyebrow className="block mb-2">{labels.candidateAskingHeader}</Eyebrow>
-        <QuestionBubble>
+        <QuestionBubble phoneMode={phoneMode}>
           {text && text.trim().length > 0 ? text : "…"}
         </QuestionBubble>
       </BarShell>
@@ -1231,9 +1370,9 @@ function CurrentQuestionBar({
   // 2 or 3 lines. Question readability beats holding a rigid frame.
   if (mainQuestion) {
     return (
-      <BarShell>
+      <BarShell phoneMode={phoneMode}>
         <Eyebrow className="block mb-2">{labels.leadHeader}</Eyebrow>
-        <QuestionBubble>{mainQuestion.text}</QuestionBubble>
+        <QuestionBubble phoneMode={phoneMode}>{mainQuestion.text}</QuestionBubble>
 
         {/* Probe Question sub-row. Shown whenever EITHER:
             (a) followUp Question object is resolved from currentQuestionId
@@ -1245,7 +1384,15 @@ function CurrentQuestionBar({
         {(followUp || lockedProbeQuestionText) && (
           <div className="mt-3 pl-3 border-l-2 border-border">
             <Eyebrow as="div" className="mb-1">{labels.probeHeader}</Eyebrow>
-            <div className="text-[15px] leading-snug text-text-muted">
+            <div
+              className={
+                "leading-snug text-text-muted " +
+                // Scale up in phone mode alongside the lead question, but
+                // kept a step below it (1.15rem vs the lead's 1.4rem) so
+                // the lead-vs-probe hierarchy still reads.
+                (phoneMode ? "text-[1.15rem]" : "text-[15px]")
+              }
+            >
               {followUp?.text ?? lockedProbeQuestionText}
             </div>
           </div>
@@ -1259,10 +1406,15 @@ function CurrentQuestionBar({
   // tail after reverse Q&A. Shows the moment summary so the user
   // always knows what's happening.
   return (
-    <BarShell>
+    <BarShell phoneMode={phoneMode}>
       <Eyebrow className="block mb-2">{labels.interviewOngoingHeader}</Eyebrow>
       {summary ? (
-        <div className="text-[16px] leading-relaxed text-text-muted">
+        <div
+          className={
+            "leading-relaxed text-text-muted " +
+            (phoneMode ? "text-[1.3rem]" : "text-[16px]")
+          }
+        >
           {summary}
         </div>
       ) : (
@@ -1282,9 +1434,21 @@ function CurrentQuestionBar({
  *  surrounding eyebrow ("LEAD QUESTION" etc.) above provides the
  *  semantic label, so the text doesn't need extra decoration to
  *  signal "this is what's on the table". */
-function QuestionBubble({ children }: { children: React.ReactNode }) {
+function QuestionBubble({
+  children,
+  phoneMode = false,
+}: {
+  children: React.ReactNode;
+  /** "Live 演示" layout: enlarge the question text for mobile viewers. */
+  phoneMode?: boolean;
+}) {
   return (
-    <div className="text-[1.0625rem] leading-snug text-text font-medium">
+    <div
+      className={
+        "leading-snug text-text font-medium " +
+        (phoneMode ? "text-[1.4rem]" : "text-[1.0625rem]")
+      }
+    >
       {children}
     </div>
   );
@@ -1296,11 +1460,28 @@ function QuestionBubble({ children }: { children: React.ReactNode }) {
  *  shows in full — readability beats holding a rigid rectangle. The
  *  py-3 padding gives the question text room to breathe regardless of
  *  whether it's 1 line or 3. */
-function BarShell({ children }: { children: React.ReactNode }) {
+function BarShell({
+  children,
+  phoneMode = false,
+}: {
+  children: React.ReactNode;
+  /** "Live 演示" layout: the question bar narrows + centers in sync
+   *  with the two output boxes below it, forming one narrow column. */
+  phoneMode?: boolean;
+}) {
   return (
     <div
-      className="border-b border-border px-5 py-4 flex flex-col justify-center shrink-0"
-      style={{ minHeight: PHASE_MIN_HEIGHT_PX }}
+      className={
+        "px-5 py-4 flex flex-col justify-center shrink-0 w-full " +
+        (phoneMode
+          ? "mx-auto mt-4 rounded-2xl border border-border"
+          : "border-b border-border")
+      }
+      style={{
+        minHeight: PHASE_MIN_HEIGHT_PX,
+        maxWidth: phoneMode ? PHONE_BOX_MAX_WIDTH_PX : WIDE_BOX_MAX_WIDTH_PX,
+        transition: LAYOUT_TRANSITION,
+      }}
     >
       {children}
     </div>
@@ -1329,6 +1510,7 @@ function CommentarySection({
   overrideText,
   labels,
   isFullscreen = false,
+  phoneMode = false,
 }: {
   state: MomentStateKind;
   currentQuestion: Question | undefined;
@@ -1364,6 +1546,8 @@ function CommentarySection({
    *  using the default 16:9-derived fixed height. Prevents whitespace
    *  below the captions in fullscreen mode. */
   isFullscreen?: boolean;
+  /** "Live 演示" layout: this box goes narrow (centered) + taller. */
+  phoneMode?: boolean;
 }) {
   // Re-render when the displayed comment's min-window expires so the
   // "AI is observing…" indicator can appear.
@@ -1551,8 +1735,21 @@ function CommentarySection({
   // acceptable trade for rock-stable recording.
   return (
     <div
-      className="flex flex-col border-b border-border shrink-0 overflow-hidden"
-      style={{ height: COMMENTARY_TOTAL_HEIGHT_PX }}
+      className={
+        "flex flex-col shrink-0 overflow-hidden w-full " +
+        // Phone mode: narrow centered card with its own border/rounding.
+        // Wide mode: full-width section divided by a bottom border.
+        (phoneMode
+          ? "mx-auto mt-4 rounded-2xl border border-border"
+          : "border-b border-border")
+      }
+      style={{
+        height: phoneMode
+          ? COMMENTARY_PHONE_HEIGHT_PX
+          : COMMENTARY_TOTAL_HEIGHT_PX,
+        maxWidth: phoneMode ? PHONE_BOX_MAX_WIDTH_PX : WIDE_BOX_MAX_WIDTH_PX,
+        transition: LAYOUT_TRANSITION,
+      }}
     >
       <div
         className="flex items-center px-5 shrink-0"
@@ -1603,17 +1800,19 @@ function CommentarySection({
             <CommentaryBody
               html={candidateQuestionCommentary || "…"}
               tone="commentary"
+              phoneMode={phoneMode}
             />
           ) : showListeningHint ? (
             // Listening hint visual treatment: thicker left border +
             // smaller font so the user can tell at a glance this is
             // in-the-moment coaching ("listen for X") vs post-answer
             // evaluative commentary.
-            <CommentaryBody html={listeningHint} tone="hint" />
+            <CommentaryBody html={listeningHint} tone="hint" phoneMode={phoneMode} />
           ) : isShowing && displayedComment ? (
             <CommentaryBody
               html={displayedComment.text || "…"}
               tone="commentary"
+              phoneMode={phoneMode}
             />
           ) : null}
         </div>
