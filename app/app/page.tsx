@@ -258,6 +258,13 @@ export default function Page() {
   // — the screen recording still captures only the card whether
   // fullscreen is on or off.
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // "Live 演示" layout — the two output boxes (LIVE COMMENTARY + LIVE
+  // CAPTIONS) switch from wide-flat (iPad-ish) to narrow-tall
+  // (iPhone-ish), staying vertically stacked. Purely a pre-recording
+  // presentation choice: the in-card toggle is locked once recording
+  // starts (same gate as fullscreen), so the crop bbox is fixed before
+  // Begin and no 花屏 can occur. Nothing outside the two boxes moves.
+  const [phoneMode, setPhoneMode] = useState(false);
   // Fullscreen toggle DOES change the cropTarget's layout — the
   // height: 580 lock in LiveView is conditionally removed when
   // isFullscreen=true, AND the sidebar/PageTitle hide so the card
@@ -1408,6 +1415,14 @@ export default function Page() {
                 getOrchestrator().triggerCropTransition("fullscreen");
               }
               setIsFullscreen((v) => !v);
+            }}
+            phoneMode={phoneMode}
+            onTogglePhoneMode={() => {
+              // Layout-only, pre-recording toggle. The in-card button is
+              // disabled while recording/paused, so this never fires
+              // mid-recording — no crop transition / recorder pause is
+              // needed (unlike fullscreen).
+              setPhoneMode((v) => !v);
             }}
             onStartRequest={handleStart}
           />
