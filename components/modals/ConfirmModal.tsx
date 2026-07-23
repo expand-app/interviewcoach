@@ -13,6 +13,12 @@ interface Props {
    *  "danger" = error-color confirm for destructive actions like
    *  Discard, Delete, Sign-out-without-saving. */
   tone?: "primary" | "danger";
+  /** Optional third action, rendered left of Cancel in the error
+   *  color's text (destructive-but-secondary, e.g. "Exit without
+   *  saving" on the retake end dialog). Omit for the standard
+   *  two-button layout. */
+  altLabel?: string;
+  onAlt?: () => void;
   onCancel: () => void;
   onConfirm: () => void;
 }
@@ -24,6 +30,8 @@ export function ConfirmModal({
   confirmLabel,
   cancelLabel,
   tone = "primary",
+  altLabel,
+  onAlt,
   onCancel,
   onConfirm,
 }: Props) {
@@ -47,6 +55,14 @@ export function ConfirmModal({
         <h2 className="text-[18px] font-semibold mb-1.5 text-text">{title}</h2>
         <div className="text-sm text-text-muted mb-5 leading-relaxed">{description}</div>
         <div className="flex gap-2 justify-end mt-4">
+          {altLabel && onAlt && (
+            <Button
+              onClick={onAlt}
+              style={{ color: "var(--color-error)", marginRight: "auto" }}
+            >
+              {altLabel}
+            </Button>
+          )}
           <Button onClick={onCancel}>{cancelLabel}</Button>
           <Button variant="primary" onClick={onConfirm} style={dangerStyle}>
             {confirmLabel}

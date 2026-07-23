@@ -959,6 +959,32 @@ export default function Page() {
     }
   };
 
+  /** "Exit without saving" on the retake end dialog: stop the call and
+   *  throw the session away — no save, no scoring, nothing in the
+   *  sidebar. Mirrors the abort path's cleanup (stop + clear the
+   *  window.__ic_* recording artifacts + reset to idle). */
+  const handleRetakeDiscard = async () => {
+    if (endingRef.current) return;
+    endingRef.current = true;
+    setShowRetakeEnd(false);
+    try {
+      await getMockInterviewer().stop();
+    } finally {
+      const win = window as unknown as {
+        __ic_audioUrl?: string;
+        __ic_videoUrl?: string;
+        __ic_videoSegmentUrls?: string[];
+        __ic_videoMime?: string;
+      };
+      win.__ic_audioUrl = undefined;
+      win.__ic_videoUrl = undefined;
+      win.__ic_videoSegmentUrls = undefined;
+      win.__ic_videoMime = undefined;
+      resetLive();
+      endingRef.current = false;
+    }
+  };
+
   /** End-call confirm — the retake mirror of handleEndConfirm, minus
    *  title generation (liveTitle was fixed at "Retake: <parent>" by
    *  startRetake). Reuses the same post-session enrichment chain. */
@@ -1559,6 +1585,8 @@ export default function Page() {
         )}
         confirmLabel={t("Save & see my score", "保存并查看评分")}
         cancelLabel={t("Keep going", "继续面试")}
+        altLabel={t("Exit without saving", "直接退出(不保存)")}
+        onAlt={() => void handleRetakeDiscard()}
         onCancel={() => setShowRetakeEnd(false)}
         onConfirm={() => void handleRetakeEnd()}
       />
