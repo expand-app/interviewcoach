@@ -44,8 +44,37 @@ const IDLE_END_AFTER_MS = 3 * 60_000;
 const SPK_INTERVIEWER = 0;
 const SPK_CANDIDATE = 1;
 
+/** Wait this long after the AI's response.done before re-opening the
+ *  uplink mic — the AI audio track keeps PLAYING OUT for a beat after
+ *  generation finishes, and that tail would otherwise be transcribed
+ *  as candidate speech. */
+const UPLINK_REOPEN_DELAY_MS = 600;
+/** A candidate "answer" whose token overlap with a recent AI line is
+ *  at/above this is the AI's own voice echoing back — drop it. */
+const ECHO_OVERLAP_THRESHOLD = 0.6;
+
 function rid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Token-overlap similarity in [0,1] against the smaller set. CJK falls
+ *  back to per-character tokens. (Same idea as the Aura engine's echo
+ *  guard.) */
+function tokenOverlap(a: string, b: string): number {
+  const norm = (s: string): string[] => {
+    const cleaned = s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "");
+    const words = cleaned.split(/\s+/).filter(Boolean);
+    if (words.length <= 2 && /[一-鿿]/.test(cleaned)) {
+      return cleaned.replace(/\s+/g, "").split("");
+    }
+    return words;
+  };
+  const ta = new Set(norm(a));
+  const tb = new Set(norm(b));
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let inter = 0;
+  for (const w of ta) if (tb.has(w)) inter++;
+  return inter / Math.min(ta.size, tb.size);
 }
 
 type Phase =
@@ -85,6 +114,13 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   private pendingIsFollowup = false;
   /** Guard so one candidate answer drives exactly one decision. */
   private answerHandledForTurn = false;
+  /** User pressed the mute button (distinct from the automatic
+   *  during-AI-speech uplink muting). */
+  private userMuted = false;
+  /** Recent AI spoken lines — the echo guard matches candidate
+   *  transcripts against these. */
+  private recentAiLines: string[] = [];
+  private reopenTimer: ReturnType<typeof setTimeout> | null = null;
 
   private lastSpeechAt = 0;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -195,6 +231,10 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
     }
+    if (this.reopenTimer) {
+      clearTimeout(this.reopenTimer);
+      this.reopenTimer = null;
+    }
     try {
       this.session?.cancelResponse();
     } catch {
@@ -218,11 +258,45 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   }
 
   setUserMuted(muted: boolean): void {
+    this.userMuted = muted;
     useStore.getState().setRetakeMicMuted(muted);
-    // Mute BOTH the OpenAI uplink (so it stops hearing you) and the
-    // recording mic.
-    this.session?.setMicEnabled(!muted);
+    // Recording mic follows the button immediately. The OpenAI uplink
+    // is only opened when we're actually listening (and not muted) —
+    // never while the AI is speaking (echo).
     this.audio?.setMicGain(muted ? 0 : 1);
+    this.session?.setMicEnabled(!muted && this.phase === "listening");
+  }
+
+  // ===== echo control =====
+  //
+  // The OpenAI uplink mic is CLOSED whenever the AI is speaking, and
+  // only re-opened a beat after the AI's audio finishes — otherwise the
+  // AI's own voice (through the speakers) is transcribed as the
+  // candidate's answer. This mirrors the Aura engine's mic-gain guard.
+
+  /** Speak an AI turn: close the uplink first so the AI's voice can't
+   *  be captured as candidate input, then request the turn. */
+  private aiSay(instructions: string): void {
+    if (this.reopenTimer) {
+      clearTimeout(this.reopenTimer);
+      this.reopenTimer = null;
+    }
+    this.session?.setMicEnabled(false);
+    this.session?.requestSpeak(instructions);
+  }
+
+  /** Enter listening: re-open the uplink after a short tail so the AI's
+   *  audio playout can drain first. */
+  private enterListening(): void {
+    if (this.stopped) return;
+    this.setPhase("listening");
+    this.lastSpeechAt = Date.now();
+    if (this.reopenTimer) clearTimeout(this.reopenTimer);
+    this.reopenTimer = setTimeout(() => {
+      this.reopenTimer = null;
+      if (this.stopped || this.phase !== "listening") return;
+      this.session?.setMicEnabled(!this.userMuted);
+    }, UPLINK_REOPEN_DELAY_MS);
   }
 
   skipQuestion(): void {
@@ -280,7 +354,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.setPhase("greeting");
     useStore.getState().setRetakeCaption(this.plan.greeting);
     this.expectingQuestion = false;
-    this.session?.requestSpeak(
+    this.aiSay(
       `Greet the candidate warmly and say, in your own natural words: "${this.plan.greeting}". Do not ask a question yet.`
     );
     // On response.done we advance to the first slot question.
@@ -299,7 +373,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.expectingQuestion = true;
     this.answerHandledForTurn = false;
     this.setPhase("asking");
-    this.session?.requestSpeak(
+    this.aiSay(
       `Ask the candidate this question, in your own natural words (one or two sentences): "${slot.question}"`
     );
   }
@@ -307,6 +381,15 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   /** Candidate finished an answer (OpenAI final transcript). */
   private onCandidateAnswer(text: string): void {
     if (this.stopped || !text.trim()) return;
+
+    // Echo guard: if this "answer" closely matches a line the AI just
+    // spoke, it's the AI's own voice bleeding into the mic — drop it
+    // (do NOT append, do NOT advance). The real answer will follow.
+    const isEcho = this.recentAiLines.some(
+      (line) => tokenOverlap(text, line) >= ECHO_OVERLAP_THRESHOLD
+    );
+    if (isEcho) return;
+
     this.lastSpeechAt = Date.now();
     this.idleFired = false;
 
@@ -351,7 +434,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       this.expectingQuestion = true;
       this.answerHandledForTurn = false;
       this.setPhase("asking");
-      this.session?.requestSpeak(
+      this.aiSay(
         `The candidate just said: "${answer.slice(0, 600)}". Ask ONE short, natural follow-up question that digs into a specific part of what they said. One sentence.`
       );
       return;
@@ -373,7 +456,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.answerHandledForTurn = false;
     this.setPhase("asking");
     // Ack + next question in ONE natural turn (no dead air).
-    this.session?.requestSpeak(
+    this.aiSay(
       `Briefly acknowledge the candidate's answer in a few words, then ask the next question in your own natural words: "${slot.question}"`
     );
   }
@@ -383,7 +466,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.setPhase("wrapup");
     this.expectingQuestion = false;
     useStore.getState().setRetakeCaption(this.plan.closing);
-    this.session?.requestSpeak(
+    this.aiSay(
       `Wrap up the interview: briefly thank the candidate and say, naturally: "${this.plan.closing}". Do not ask anything else.`
     );
     // ic:retake-complete fires on the wrapup response.done.
@@ -392,6 +475,10 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   /** An AI spoken turn's transcript is final. */
   private onAiTranscript(text: string): void {
     if (this.stopped || !text.trim()) return;
+    // Feed the echo guard: candidate transcripts matching a recent AI
+    // line are the AI's own voice bleeding back through the mic.
+    this.recentAiLines.push(text);
+    if (this.recentAiLines.length > 4) this.recentAiLines.shift();
     // Persist as an interviewer utterance for the transcript.
     this.addUtterance(text, SPK_INTERVIEWER);
     useStore.getState().setRetakeCaption(text);
@@ -432,10 +519,10 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       window.dispatchEvent(new CustomEvent("ic:retake-complete"));
       return;
     }
-    // asking → listening: the AI finished posing the question.
+    // asking → listening: the AI finished posing the question. Re-open
+    // the uplink mic after a short tail (enterListening).
     if (this.phase === "asking") {
-      this.lastSpeechAt = Date.now();
-      this.setPhase("listening");
+      this.enterListening();
     }
   }
 
@@ -561,6 +648,10 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     if (this.idleTimer) {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
+    }
+    if (this.reopenTimer) {
+      clearTimeout(this.reopenTimer);
+      this.reopenTimer = null;
     }
     this.session?.close();
     this.session = null;
