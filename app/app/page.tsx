@@ -1177,6 +1177,11 @@ export default function Page() {
             resume: saved.resume,
             questions: saved.questions,
             durationSeconds: saved.durationSeconds,
+            // Retakes get a stricter, code-enforced insufficient gate
+            // and never route to the coach-notes-as-evidence fallback
+            // (every retake answer has a rich silent-coaching comment,
+            // which misfired that heuristic and inflated scores).
+            sessionMode: saved.sessionMode,
             // Mirror the user's commentary language preference: if
             // they ran the live session in English, the post-session
             // score should match. Reading from the store at fire

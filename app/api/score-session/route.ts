@@ -25,6 +25,15 @@ interface ScoreBody {
    *  events log. Older clients that don't pass this still work —
    *  the events are simply skipped. */
   sessionId?: string;
+  /** "retake" = AI mock-interview session. Changes two things:
+   *  (1) the legacy/bucketing-bug fallback NEVER applies (retakes
+   *  always carry reliable answerText, and every answered question
+   *  gets a rich silent-coaching comment by design — the
+   *  comments-beat-answers heuristic would misfire on every thin
+   *  retake and grade off coach notes); (2) the insufficient gate is
+   *  enforced IN CODE, deterministically, instead of relying on the
+   *  model to honor the prompt's soft gate. */
+  sessionMode?: "live" | "retake";
 }
 
 // Five canonical rubric dimensions. The MAX (= per-session weight) is
@@ -178,7 +187,16 @@ export async function POST(req: Request) {
   // legacy. The downstream INSUFFICIENT gate (≥3 Qs with ≥60 chars,
   // ≥1000 total) still applies — bucketing-bug back-fill just chooses
   // which evidence channel to grade from, it doesn't bypass the bar.
+  // Retakes are excluded from the bucketing-bug fallback: the bug it
+  // compensates for never existed on the retake path (answers are
+  // written straight from realtime transcripts), while the trigger
+  // condition is ALWAYS nearly met (each answered Q gets a long
+  // silent-coaching comment). Without this exclusion, a 3-minute
+  // retake with two throwaway answers routed legacy and scored 66
+  // off the coach notes — bypassing the evidence bar entirely.
+  const isRetake = body.sessionMode === "retake";
   const looksBucketingBugged =
+    !isRetake &&
     !naivelyLegacy &&
     qsWithAnswerEvidence < qsWithCommentEvidence &&
     qsWithCommentEvidence >= 2;
@@ -337,6 +355,44 @@ export async function POST(req: Request) {
         lang,
       },
     });
+  }
+
+  // HARD insufficient gate for retakes — enforced in code, BEFORE any
+  // model call. The prompt's soft gate proved bypassable: the model
+  // can decide rich coach notes are "enough" and grade a 3-minute
+  // session with two throwaway answers. For retakes, answerText is
+  // ground truth (realtime transcripts), so the bar is mechanical:
+  // ≥3 answered questions (≥60 chars each) totaling ≥1000 chars, or
+  // no scorecard. Deterministic, reproducible, and saves a Sonnet call.
+  if (isRetake && (questionsWithAnswers < 3 || totalAnswerChars < 1000)) {
+    const summary = `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithAnswers} with substantive candidate answers (${totalAnswerChars} chars total) over ${Math.round(durationSeconds / 60)} min. Full scoring needs ≥ 3 answered questions totaling ≥ 1000 chars of candidate speech.`;
+    const score: SessionScore = {
+      total: 0,
+      totalMax: 0,
+      percent: 0,
+      verdict: "insufficient_data",
+      summary,
+      dimensions: DIMENSIONS.map((d) => ({
+        key: d.key,
+        label: d.label,
+        max: 0,
+        score: null,
+        justification: "Not judged — insufficient transcript content.",
+      })),
+      improvements: [],
+    };
+    if (sessionId) {
+      logSessionEvent(sessionId, {
+        source: "score",
+        event: "complete",
+        data: {
+          verdict: "insufficient_data",
+          path: "hard-gate-retake",
+          elapsedMs: Date.now() - t0,
+        },
+      });
+    }
+    return NextResponse.json({ score });
   }
 
   const rubricBlock = DIMENSIONS.map(

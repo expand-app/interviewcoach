@@ -2397,6 +2397,9 @@ export function PastView({
             resume: session.resume,
             questions: session.questions,
             durationSeconds: session.durationSeconds,
+            // Retakes: stricter code-enforced insufficient gate; no
+            // coach-notes-as-evidence fallback (see score route).
+            sessionMode: session.sessionMode,
             // Re-score in whatever language the user is currently
             // set to. Lets the user toggle CN→EN and refresh an old
             // session's score in English without re-running the
