@@ -41,6 +41,14 @@ const IDLE_END_AFTER_MS = 3 * 60_000;
 /** A candidate "answer" whose token overlap with a recent AI line is
  *  at/above this is the AI's own voice echoing back — drop it. */
 const ECHO_OVERLAP_THRESHOLD = 0.6;
+/** Speakerphone echo defense: while the AI is speaking, the OpenAI
+ *  uplink is DUCKED to this gain (not muted — a real, close-to-mic
+ *  voice still clears the raised VAD threshold, so barge-in works),
+ *  which drops residual speaker echo below detection. */
+const DUCK_GAIN = 0.22;
+/** Keep the duck for a beat after response.done — the audio track
+ *  keeps playing out (and echoing) briefly after generation ends. */
+const DUCK_RELEASE_MS = 500;
 
 // Synthetic diarization ids so PastView's speaker-role resolution works
 // exactly as with Deepgram (we KNOW the roles here — no diarization).
@@ -88,6 +96,13 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   private audio: AudioSession | null = null;
   private session: OpenAiRealtimeSession | null = null;
   private micStream: MediaStream | null = null;
+  /** Uplink processing chain (speakerphone ducking): raw mic →
+   *  GainNode → MediaStreamDestination; the DESTINATION's track is
+   *  what OpenAI hears, so lowering the gain while the AI speaks
+   *  keeps its speaker echo below the VAD without closing the mic. */
+  private uplinkCtx: AudioContext | null = null;
+  private uplinkGain: GainNode | null = null;
+  private duckReleaseTimer: ReturnType<typeof setTimeout> | null = null;
 
   private phase: Phase = "idle";
   private stopped = false;
@@ -149,6 +164,21 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       throw new Error("mic denied");
     }
 
+    // 1b) Uplink ducking chain (speakerphone echo defense). AEC runs at
+    //     the getUserMedia source, so the processed track keeps it.
+    //     Created inside the Start-click gesture → context runs.
+    this.uplinkCtx = new AudioContext();
+    if (this.uplinkCtx.state === "suspended") {
+      void this.uplinkCtx.resume().catch(() => {});
+    }
+    const uplinkSrc = this.uplinkCtx.createMediaStreamSource(this.micStream);
+    this.uplinkGain = this.uplinkCtx.createGain();
+    this.uplinkGain.gain.value = 1;
+    const uplinkDest = this.uplinkCtx.createMediaStreamDestination();
+    uplinkSrc.connect(this.uplinkGain);
+    this.uplinkGain.connect(uplinkDest);
+    const uplinkStream = uplinkDest.stream;
+
     // 2) OpenAI realtime session (observer callbacks).
     let resolveRemote: (s: MediaStream | null) => void = () => {};
     const remotePromise = new Promise<MediaStream | null>((r) => {
@@ -161,16 +191,26 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
         window.dispatchEvent(new CustomEvent("ic:retake-speech"));
       },
       onSpeechStopped: () => {
-        // Brief gap while the model composes its reply.
-        if (!this.stopped && this.phase !== "ended") this.setPhase("thinking");
+        // Brief gap while the model composes its reply. Only from
+        // "listening" — a stray VAD blip during AI speech (echo)
+        // must not thrash the phase display.
+        if (!this.stopped && this.phase === "listening") {
+          this.setPhase("thinking");
+        }
       },
       onCandidateTranscript: (text) => this.onCandidateAnswer(text),
       onAiTranscript: (text) => this.onAiTurn(text),
       onResponseCreated: () => {
-        if (!this.stopped && this.phase !== "ended") this.setPhase("asking");
+        if (this.stopped || this.phase === "ended") return;
+        this.setPhase("asking");
+        // Duck the uplink for the whole AI turn — speaker echo stays
+        // below the VAD threshold; a real interruption still passes.
+        this.setDuck(true);
       },
       onResponseDone: () => {
-        if (!this.stopped && this.phase !== "ended") this.setPhase("listening");
+        if (this.stopped || this.phase === "ended") return;
+        this.setPhase("listening");
+        this.setDuck(false); // releases after DUCK_RELEASE_MS tail
       },
       onFunctionCall: (name) => {
         if (name === "end_interview") this.runEnd();
@@ -186,7 +226,8 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     });
 
     await this.session.connect({
-      micStream: this.micStream,
+      // The DUCKED stream — OpenAI hears the gain-controlled mic.
+      micStream: uplinkStream,
       instructions: this.buildInstructions(),
       voice: this.plan.language === "zh" ? "cedar" : "marin",
       language: this.plan.language,
@@ -237,6 +278,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     }
     this.session?.close();
     this.session = null;
+    this.teardownUplink();
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.micStream = null;
     // AudioSession.stop() flushes the recording to window.__ic_* via the
@@ -246,6 +288,18 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     } finally {
       this.audio = null;
     }
+  }
+
+  private teardownUplink(): void {
+    if (this.duckReleaseTimer) {
+      clearTimeout(this.duckReleaseTimer);
+      this.duckReleaseTimer = null;
+    }
+    if (this.uplinkCtx && this.uplinkCtx.state !== "closed") {
+      void this.uplinkCtx.close().catch(() => {});
+    }
+    this.uplinkCtx = null;
+    this.uplinkGain = null;
   }
 
   getCameraStream(): MediaStream | null {
@@ -272,6 +326,34 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     if (this.phase === "ended") return;
     this.phase = p;
     useStore.getState().setRetakePhase(p);
+  }
+
+  /** Duck (or release) the OpenAI uplink. Release is delayed by
+   *  DUCK_RELEASE_MS because the AI's audio keeps playing out — and
+   *  echoing — for a beat after response.done. */
+  private setDuck(on: boolean): void {
+    if (!this.uplinkCtx || !this.uplinkGain) return;
+    if (this.uplinkCtx.state === "suspended") {
+      void this.uplinkCtx.resume().catch(() => {});
+    }
+    if (this.duckReleaseTimer) {
+      clearTimeout(this.duckReleaseTimer);
+      this.duckReleaseTimer = null;
+    }
+    const gain = this.uplinkGain.gain;
+    if (on) {
+      gain.setTargetAtTime(DUCK_GAIN, this.uplinkCtx.currentTime, 0.03);
+    } else {
+      this.duckReleaseTimer = setTimeout(() => {
+        this.duckReleaseTimer = null;
+        if (this.stopped || !this.uplinkCtx || !this.uplinkGain) return;
+        this.uplinkGain.gain.setTargetAtTime(
+          1,
+          this.uplinkCtx.currentTime,
+          0.05
+        );
+      }, DUCK_RELEASE_MS);
+    }
   }
 
   private elapsed(): number {
@@ -495,6 +577,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     }
     this.session?.close();
     this.session = null;
+    this.teardownUplink();
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.micStream = null;
     try {

@@ -92,13 +92,25 @@ export async function POST(req: Request) {
                 // realtime path uses these transcripts (not Deepgram)
                 // to fill Question.answerText and drive coaching.
                 transcription: { model: "gpt-4o-mini-transcribe" },
+                // Speakerphone support: far-field noise reduction is
+                // tuned for mic-picks-up-the-room setups (vs near_field
+                // for headsets) — one layer of the no-headphones echo
+                // defense (with client-side uplink ducking + AEC).
+                noise_reduction: { type: "far_field" },
                 // Model-driven conversation (ChatGPT-voice style):
                 // create_response:true → the model runs the whole
                 // interview autonomously (turn-taking, follow-ups,
                 // acknowledgments) guided by the plan in `instructions`.
                 // interrupt_response:true → the candidate can barge in.
+                // threshold raised from the 0.5 default so residual
+                // speaker echo (post-AEC, post-ducking) doesn't trip the
+                // VAD and make the AI interrupt itself; a real voice at
+                // normal volume still clears 0.75 easily.
                 turn_detection: {
                   type: "server_vad",
+                  threshold: 0.75,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: 600,
                   create_response: true,
                   interrupt_response: true,
                 },

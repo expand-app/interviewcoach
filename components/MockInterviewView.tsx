@@ -53,12 +53,17 @@ export function MockInterviewView({ onEndRequest }: Props) {
     if (phase === "listening") setListenStartedAt(Date.now());
   }, [phase]);
   const hearingYou = now - lastHeardAt < 2000;
+  // Dead-mic warning: only when we've NEVER heard the candidate the
+  // whole call. Once any speech signal has arrived, the mic works —
+  // re-warning on every 8s pause (thinking time, speaker-echo VAD
+  // quirks) just nags a healthy setup, which was the field report
+  // ("the red warning keeps appearing").
   const micLooksDead =
     phase === "listening" &&
     !micMuted &&
     listenStartedAt > 0 &&
     now - listenStartedAt > 8000 &&
-    lastHeardAt < listenStartedAt;
+    lastHeardAt === 0;
 
   // Attach the webcam stream to the self-view tile. The camera is
   // acquired inside MockInterviewer.start() (async, after mount), so

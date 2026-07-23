@@ -178,8 +178,8 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
           )}{" "}
           <span style={{ color: "var(--color-text)", fontWeight: 500 }}>
             {t(
-              "Tip: use headphones — you can interrupt and talk over the interviewer naturally, just like a real call.",
-              "建议戴耳机——这样你可以像真实通话一样随时打断面试官、自然抢话。"
+              "Speakers work fine — echo is suppressed automatically. Headphones make interrupting the interviewer even snappier.",
+              "外放即可使用(回声会自动抑制);戴耳机的话,打断面试官会更灵敏。"
             )}
           </span>
         </p>
