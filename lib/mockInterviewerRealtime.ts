@@ -38,6 +38,13 @@ import type { Comment, Question, Utterance } from "@/types/session";
 // ===== tuning =====
 /** No candidate speech for this long during listening → suggest ending. */
 const IDLE_END_AFTER_MS = 3 * 60_000;
+/** Stall watchdog: candidate silent this long during listening → have
+ *  the AI re-engage IN THE INTERVIEW LANGUAGE (covers both "candidate
+ *  is stuck" and "model went quiet after an unexpected input, e.g. an
+ *  answer in another language" — the interview must never dead-air). */
+const STALL_NUDGE_AFTER_MS = 25_000;
+/** Minimum gap between two watchdog nudges. */
+const STALL_NUDGE_GAP_MS = 40_000;
 /** A candidate "answer" whose token overlap with a recent AI line is
  *  at/above this is the AI's own voice echoing back — drop it. */
 const ECHO_OVERLAP_THRESHOLD = 0.6;
@@ -122,7 +129,10 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   private currentQuestionId: string | null = null;
   private currentQuestionText = "";
 
+  /** Last CANDIDATE voice activity (speech events / transcripts only —
+   *  AI turns don't count). Drives the stall watchdog + idle popup. */
   private lastSpeechAt = 0;
+  private lastNudgeAt = 0;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
   private idleFired = false;
 
@@ -143,7 +153,12 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.aiTurnSinceQuestion = false;
     this.currentQuestionId = null;
     this.currentQuestionText = "";
-    this.lastSpeechAt = 0;
+    // Seed the activity clock with NOW — it previously started at 0,
+    // so the first tick after entering "listening" computed decades of
+    // "silence" and popped the end-interview dialog before the
+    // candidate ever spoke (field report #1).
+    this.lastSpeechAt = Date.now();
+    this.lastNudgeAt = 0;
     this.idleFired = false;
 
     // 1) Mic for the OpenAI uplink. Full-duplex (stays open during AI
@@ -366,8 +381,8 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     const p = this.plan!;
     const langLine =
       p.language === "zh"
-        ? "Speak ONLY in natural, conversational Mandarin Chinese."
-        : "Speak ONLY in natural, conversational English.";
+        ? "Speak ONLY in natural, conversational Mandarin Chinese. If the candidate speaks another language, DO NOT switch languages and DO NOT go silent — briefly acknowledge in Chinese, ask them to continue in Chinese, and repeat your current question in Chinese."
+        : "Speak ONLY in natural, conversational English. If the candidate speaks another language (e.g. Chinese), DO NOT switch languages and DO NOT go silent — briefly acknowledge in English, ask them to continue in English, and repeat your current question in English.";
     const profile = this.interviewerProfileSummary
       ? `You are modeled on this interviewer: ${this.interviewerProfileSummary}. `
       : "";
@@ -455,10 +470,28 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
 
   private tickIdle(): void {
     if (this.stopped || this.phase !== "listening") return;
+    const now = Date.now();
+    const silentFor = now - this.lastSpeechAt;
+
+    // Stall watchdog: the interview must never dead-air. Covers a
+    // candidate who froze up AND the model going quiet after an
+    // unexpected input (e.g. an answer in another language). The AI
+    // re-engages in the interview language, like a real interviewer
+    // ("take your time — would you like me to repeat the question?").
     if (
-      !this.idleFired &&
-      Date.now() - this.lastSpeechAt >= IDLE_END_AFTER_MS
+      silentFor >= STALL_NUDGE_AFTER_MS &&
+      now - this.lastNudgeAt >= STALL_NUDGE_GAP_MS
     ) {
+      this.lastNudgeAt = now;
+      this.session?.requestSpeak(
+        this.plan?.language === "zh"
+          ? "候选人停顿了一会儿。用中文简短地重新引导:体贴地问是否需要重复问题,或换个说法再问当前的问题。一两句话即可。"
+          : "The candidate has paused for a while (or may have spoken in another language). Re-engage briefly IN ENGLISH: kindly ask if they'd like the question repeated, or rephrase your current question. One or two sentences."
+      );
+      return;
+    }
+
+    if (!this.idleFired && silentFor >= IDLE_END_AFTER_MS) {
       this.idleFired = true;
       window.dispatchEvent(new CustomEvent("ic:retake-idle"));
     }
