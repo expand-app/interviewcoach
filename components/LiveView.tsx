@@ -62,7 +62,9 @@ const CAPTIONS_LANE_HEIGHT_PX = 60;
 // and each box keeps a FIXED height (content overflows internally,
 // never resizes the box) — so nothing shifts mid-recording and no
 // 花屏 can occur.
-const PHONE_BOX_MAX_WIDTH_PX = 440; // ≈ iPhone logical width
+const PHONE_BOX_MAX_WIDTH_PX = 760; // narrow column, sized so the enlarged phone
+// commentary (24px) + "Try this" (21px) fit the fixed pane with NO clipping across
+// all real comments (validated 0/635), while staying ~3/4 the wide layout's 1032px.
 // FIXED height for the commentary pane in phone mode. Holds a full-budget
 // comment (≈80 字 / 40 words, measured ~160 字) + the 15-30 word "Try
 // this" at the enlarged phone font. Content past this clips internally
@@ -202,7 +204,7 @@ function CommentaryBody({
     <div
       className={
         "mt-3 rounded-sm leading-relaxed text-text-muted " +
-        (phoneMode ? "text-[19px]" : "text-[14.5px]")
+        (phoneMode ? "text-[21px]" : "text-[14.5px]")
       }
       style={{
         padding: "var(--space-3)",
@@ -247,7 +249,7 @@ function CommentaryBody({
         <div
           className={
             "flex-1 min-w-0 px-4 py-4 leading-normal text-text prose-live " +
-            (phoneMode ? "text-[23px]" : "text-[17px]")
+            (phoneMode ? "text-[24px]" : "text-[17px]")
           }
         >
           <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
@@ -275,7 +277,7 @@ function CommentaryBody({
     <div
       className={
         "w-full px-4 py-4 leading-normal text-text prose-live animate-appear " +
-        (phoneMode ? "text-[23px]" : "text-[17px]")
+        (phoneMode ? "text-[24px]" : "text-[17px]")
       }
     >
       <div dangerouslySetInnerHTML={{ __html: mainHtml }} />
@@ -1494,6 +1496,9 @@ function BarShell({
         // shove the captions section out of the fixed-height card.
         maxHeight: phoneMode ? PHONE_QUESTION_MAX_HEIGHT_PX : undefined,
         maxWidth: phoneMode ? PHONE_BOX_MAX_WIDTH_PX : WIDE_BOX_MAX_WIDTH_PX,
+        // Phone mode: solid BLACK box border (vs the default light-gray) so the
+        // narrow card reads as a crisp bordered panel on the phone crop.
+        borderColor: phoneMode ? "var(--color-text)" : undefined,
         transition: LAYOUT_TRANSITION,
       }}
     >
@@ -1762,6 +1767,8 @@ function CommentarySection({
           ? COMMENTARY_PHONE_HEIGHT_PX
           : COMMENTARY_TOTAL_HEIGHT_PX,
         maxWidth: phoneMode ? PHONE_BOX_MAX_WIDTH_PX : WIDE_BOX_MAX_WIDTH_PX,
+        // Phone mode: solid BLACK box border (vs the default light-gray).
+        borderColor: phoneMode ? "var(--color-text)" : undefined,
         transition: LAYOUT_TRANSITION,
       }}
     >
