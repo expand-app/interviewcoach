@@ -934,9 +934,27 @@ export default function Page() {
       });
       // Timer + refresh guard key off "recording", same as live.
       setLiveStatus("recording");
-    } catch {
-      // AudioSession already surfaced the reason (toast +
-      // ic:session-aborted where applicable). Reset to idle.
+    } catch (e) {
+      // Surface WHY the call view is closing — a silent close here
+      // reads as a UI bug (field report: "the interview box closed
+      // immediately", which was actually OpenAI returning 429
+      // insufficient-quota on the WebRTC call). AudioSession failures
+      // toast themselves; realtime connect failures (token route, SDP
+      // exchange, quota) only surface here.
+      const msg = e instanceof Error ? e.message : String(e);
+      window.dispatchEvent(
+        new CustomEvent("ic:error", {
+          detail: /quota|429/i.test(msg)
+            ? t(
+                "OpenAI account is out of credits — add billing credits at platform.openai.com, then try again.",
+                "OpenAI 账户额度不足——请到 platform.openai.com 充值后重试。"
+              )
+            : t(
+                `Couldn't start the interview: ${msg}`,
+                `无法开始面试:${msg}`
+              ),
+        })
+      );
       resetLive();
     }
   };
