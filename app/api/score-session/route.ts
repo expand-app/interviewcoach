@@ -39,7 +39,7 @@ const DIMENSIONS = [
     key: "question_addressing",
     label: "Question Addressing",
     description:
-      "Did the candidate eventually engage the actual question, even if they took some setup or context-building time first? Score HIGH when the answer reaches the prompt at any point — including after a meandering preamble — provided it lands with substance. Score MID when they only partially address the ask. Score LOW only when they fully pivot away, dodge, or stay on safer topics throughout the answer window. Reading the full ANSWER text matters here: if the candidate buries the answer at the end of a long lead-in, they still answered it.",
+      "Did the candidate eventually engage the actual question, even if they took some setup or context-building time first? Score HIGH when the answer reaches the prompt at any point — including after a meandering preamble OR after interviewer probing/reframing — provided it lands with substance. Score MID when they only partially address the ask. Score LOW only when they fully pivot away, dodge, or stay on safer topics throughout the answer window. Reading the full ANSWER text matters here: if the candidate buries the answer at the end of a long lead-in, they still answered it. PROBING-TO-LAND IS NOT A PENALTY in this dimension — collaborative elaboration through follow-up questions is normal interview dynamics, not a failure to address.",
   },
   {
     key: "specificity",
@@ -51,7 +51,7 @@ const DIMENSIONS = [
     key: "depth",
     label: "Depth & Reasoning",
     description:
-      "Senior-level thinking: tradeoffs surfaced, scope narrowed intelligently, clarifying questions asked when the prompt was ambiguous. Score high for demonstrated judgment; low for shallow or over-broad answers.",
+      "Senior-level thinking: tradeoffs surfaced, scope narrowed intelligently, clarifying questions asked when the prompt was ambiguous. Score high for demonstrated judgment; low for shallow or over-broad answers. WHETHER reasoning was self-initiated or surfaced via interviewer probing is NOT a differentiator here — the QUALITY of the reasoning IS. Senior-level tradeoffs articulated after a probe still count as senior depth; what would drop the score is reasoning that stays shallow or empty even AFTER probing.",
   },
   {
     key: "role_fit",
@@ -380,6 +380,65 @@ Calibrate to the AVERAGE PANEL, not a hostile one. Don't pile on for minor issue
 Reserve harsh scores for SYSTEMIC weaknesses — issues that recur across multiple questions, not one-off slips. A candidate who lands 7 of 9 questions with substance and stumbles on 2 should score a clear pass, not a borderline.
 
 Don't inflate either — vague-but-fluent ≠ specific. But also don't compound minor flaws into a fail. The bar is "would an average hiring panel advance this candidate?" — most real loops have flaws and still pass.
+
+== DOUBLE-PENALTY AVOIDANCE (CRITICAL — read before assigning per-dimension scores) ==
+
+A single behavioral pattern must NOT cascade across multiple dimensions. The
+biggest calibration error in this rubric is taking ONE issue (e.g. "candidate
+needed probing to land their answer") and docking 3-4 dimensions for it,
+producing a total that drops 15-20 points more than the issue warrants. The
+rubric is designed so each dimension reads a DIFFERENT aspect of the
+performance; if you find yourself penalizing the same instances in multiple
+dimensions, you're double-counting.
+
+Concrete mapping — when you observe one of these patterns, score it in the
+SINGLE most relevant dimension and DO NOT compound the penalty elsewhere:
+
+(1) "Needed interviewer probing to deliver substance"
+    → Score: Question Addressing stays HIGH (rubric explicitly says probing-
+      to-land is not a penalty). Communication may take a small (-1 to -2)
+      hit for pacing if context preamble was excessive.
+    → DO NOT also drop Depth. If the candidate, when probed, delivered
+      senior-quality reasoning (tradeoffs, scoping, named methods), Depth
+      is HIGH. The trigger for the depth doesn't change its quality.
+    → DO NOT also drop Specificity unless the post-probe answer was still
+      abstract (which is a separate, legitimate Specificity issue).
+
+(2) "Pushed design decisions back to interviewer"
+    (asked "do you have a preference?" / "should I skip this part?" /
+    "design by yourself?" repeatedly)
+    → Score: Role Fit takes the hit (ownership signal, especially for
+      senior/lead roles where owning the design IS the role).
+    → DO NOT also drop Communication for the same moments. The pacing
+      issue (if any) is separate from the ownership issue.
+    → DO NOT also drop Question Addressing — they DID engage the question,
+      just collaboratively.
+
+(3) "Long context preamble before action" / "took 90 seconds before
+    delivering the deliverable"
+    → Score: Communication takes the hit (pacing).
+    → DO NOT also drop Question Addressing — eventual landing is eventual
+      landing per the rubric.
+
+(4) "Answer was abstract / no concrete numbers / no named projects"
+    → Score: Specificity takes the hit.
+    → DO NOT also drop Depth for the same instances — Depth scores the
+      reasoning structure, Specificity scores the evidence. They're
+      independent.
+
+(5) "Visible disengagement from interviewer" (flat reactions, simpler
+    follow-ups, pivot to safer topics)
+    → Score: Use as a calibration signal across ALL dimensions (the
+      content didn't land); don't pick one dimension as the proxy.
+    → BUT don't double up — let it adjust the overall picture, not stack
+      4 separate -3 deductions.
+
+When in doubt about which dimension a pattern belongs to, pick ONE based on
+what the JD weights most. For senior IC: Role Fit (ownership) is most
+informative. For BQ-heavy loops: Specificity (concrete examples). For pure
+technical: Depth (correctness). The improvements section is where you list
+the full set of observed issues; the dimension scores should reflect the
+SUMMARIZED severity, not enumerate the issue in every column.
 
 == READ THE ROOM ==
 This is a human interaction, not a written exam. The transcript includes the live commentary, which often notes the interviewer's in-the-moment reactions (laughs, "interesting", "great point", flat "okay…", immediate re-phrasings, shifts to simpler questions). Factor those in:

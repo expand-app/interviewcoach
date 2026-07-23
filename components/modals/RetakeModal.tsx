@@ -175,7 +175,13 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
           {t(
             `The mock interview mirrors ${leadCount} question${leadCount === 1 ? "" : "s"} from the original. On start, the browser will ask for microphone and camera access.`,
             `模拟面试将参照原面试的 ${leadCount} 道主问题。开始后浏览器会请求麦克风与摄像头权限。`
-          )}
+          )}{" "}
+          <span style={{ color: "var(--color-text)", fontWeight: 500 }}>
+            {t(
+              "Tip: use headphones — you can interrupt and talk over the interviewer naturally, just like a real call.",
+              "建议戴耳机——这样你可以像真实通话一样随时打断面试官、自然抢话。"
+            )}
+          </span>
         </p>
 
         {error && (

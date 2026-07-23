@@ -44,11 +44,6 @@ const IDLE_END_AFTER_MS = 3 * 60_000;
 const SPK_INTERVIEWER = 0;
 const SPK_CANDIDATE = 1;
 
-/** Wait this long after the AI's response.done before re-opening the
- *  uplink mic — the AI audio track keeps PLAYING OUT for a beat after
- *  generation finishes, and that tail would otherwise be transcribed
- *  as candidate speech. */
-const UPLINK_REOPEN_DELAY_MS = 600;
 /** A candidate "answer" whose token overlap with a recent AI line is
  *  at/above this is the AI's own voice echoing back — drop it. */
 const ECHO_OVERLAP_THRESHOLD = 0.6;
@@ -120,7 +115,6 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   /** Recent AI spoken lines — the echo guard matches candidate
    *  transcripts against these. */
   private recentAiLines: string[] = [];
-  private reopenTimer: ReturnType<typeof setTimeout> | null = null;
 
   private lastSpeechAt = 0;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -231,10 +225,6 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
     }
-    if (this.reopenTimer) {
-      clearTimeout(this.reopenTimer);
-      this.reopenTimer = null;
-    }
     try {
       this.session?.cancelResponse();
     } catch {
@@ -260,43 +250,32 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   setUserMuted(muted: boolean): void {
     this.userMuted = muted;
     useStore.getState().setRetakeMicMuted(muted);
-    // Recording mic follows the button immediately. The OpenAI uplink
-    // is only opened when we're actually listening (and not muted) —
-    // never while the AI is speaking (echo).
+    // Full-duplex: the uplink stays open whenever the user isn't muted,
+    // INCLUDING while the AI is speaking — that's what lets the
+    // candidate barge in and interrupt (OpenAI's server VAD +
+    // interrupt_response:true cut the AI off). Echo is handled
+    // acoustically (echoCancellation) + by the text echo-guard below.
     this.audio?.setMicGain(muted ? 0 : 1);
-    this.session?.setMicEnabled(!muted && this.phase === "listening");
+    this.session?.setMicEnabled(!muted);
   }
 
-  // ===== echo control =====
+  // ===== barge-in + echo control =====
   //
-  // The OpenAI uplink mic is CLOSED whenever the AI is speaking, and
-  // only re-opened a beat after the AI's audio finishes — otherwise the
-  // AI's own voice (through the speakers) is transcribed as the
-  // candidate's answer. This mirrors the Aura engine's mic-gain guard.
+  // The uplink mic stays OPEN during AI speech so the candidate can
+  // interrupt naturally. The AI's own voice bleeding back is handled by
+  // (1) browser echoCancellation on the mic and (2) the text echo-guard
+  // in onCandidateAnswer, which drops any "answer" that matches a line
+  // the AI just said. Headphones eliminate the acoustic echo entirely.
 
-  /** Speak an AI turn: close the uplink first so the AI's voice can't
-   *  be captured as candidate input, then request the turn. */
+  /** Speak an AI turn. Mic stays open (barge-in). */
   private aiSay(instructions: string): void {
-    if (this.reopenTimer) {
-      clearTimeout(this.reopenTimer);
-      this.reopenTimer = null;
-    }
-    this.session?.setMicEnabled(false);
     this.session?.requestSpeak(instructions);
   }
 
-  /** Enter listening: re-open the uplink after a short tail so the AI's
-   *  audio playout can drain first. */
   private enterListening(): void {
     if (this.stopped) return;
     this.setPhase("listening");
     this.lastSpeechAt = Date.now();
-    if (this.reopenTimer) clearTimeout(this.reopenTimer);
-    this.reopenTimer = setTimeout(() => {
-      this.reopenTimer = null;
-      if (this.stopped || this.phase !== "listening") return;
-      this.session?.setMicEnabled(!this.userMuted);
-    }, UPLINK_REOPEN_DELAY_MS);
   }
 
   skipQuestion(): void {
@@ -648,10 +627,6 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     if (this.idleTimer) {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
-    }
-    if (this.reopenTimer) {
-      clearTimeout(this.reopenTimer);
-      this.reopenTimer = null;
     }
     this.session?.close();
     this.session = null;

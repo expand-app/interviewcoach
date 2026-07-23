@@ -3,8 +3,11 @@
   "configurations": [
     {
       "name": "next-dev",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": [
+        "-c",
+        "export PATH=\"$HOME/.local/node-v24.17.0-darwin-arm64/bin:$PATH\"; npm run dev"
+      ],
       "port": 3000,
       "autoPort": true
     }
