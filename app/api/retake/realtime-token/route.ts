@@ -68,6 +68,12 @@ export async function POST(req: Request) {
   // Restrict voice to a known set so the field can't be repurposed.
   const voice =
     body.voice && /^[a-z]+$/.test(body.voice) ? body.voice : DEFAULT_VOICE;
+  // Pin the input-transcription language to the interview language.
+  // Auto-detect on short/noisy utterances routinely hallucinates other
+  // languages (field report: a breath transcribed as Japanese
+  // 「はい、失礼します」 in an English interview), which then poisons
+  // the answer text and the coaching.
+  const sttLanguage = body.language === "zh" ? "zh" : "en";
 
   try {
     const upstream = await fetch(
@@ -91,7 +97,10 @@ export async function POST(req: Request) {
                 // Whisper transcription of the CANDIDATE's speech — the
                 // realtime path uses these transcripts (not Deepgram)
                 // to fill Question.answerText and drive coaching.
-                transcription: { model: "gpt-4o-mini-transcribe" },
+                transcription: {
+                  model: "gpt-4o-mini-transcribe",
+                  language: sttLanguage,
+                },
                 // Speakerphone support: far-field noise reduction is
                 // tuned for mic-picks-up-the-room setups (vs near_field
                 // for headsets) — one layer of the no-headphones echo

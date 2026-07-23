@@ -112,9 +112,26 @@ export class OpenAiRealtimeSession {
     const micTrack = opts.micStream.getAudioTracks()[0];
     if (micTrack) pc.addTrack(micTrack, opts.micStream);
 
-    // 3) Data channel for JSON events.
+    // 3) Data channel for JSON events. NOTE: the channel opens
+    //    asynchronously AFTER the SDP exchange (DTLS/SCTP handshake),
+    //    so anything sent right after connect() resolves would be
+    //    dropped — that silently ate the "begin the interview" kickoff
+    //    and the AI sat mute until the candidate spoke first. send()
+    //    queues until open; flush here.
     const dc = pc.createDataChannel("oai-events");
     this.dc = dc;
+    dc.onopen = () => {
+      this.cb.onLog?.("rt:dc-open", { queued: this.pendingSends.length });
+      const queued = this.pendingSends;
+      this.pendingSends = [];
+      for (const raw of queued) {
+        try {
+          dc.send(raw);
+        } catch {
+          this.cb.onLog?.("rt:send-failed-on-flush", {});
+        }
+      }
+    };
     dc.onmessage = (ev) => this.handleEvent(ev.data);
     dc.onerror = () => this.cb.onLog?.("rt:dc-error", {});
 
@@ -177,6 +194,7 @@ export class OpenAiRealtimeSession {
 
   close(): void {
     this.closed = true;
+    this.pendingSends = [];
     try {
       this.dc?.close();
     } catch {
@@ -202,11 +220,17 @@ export class OpenAiRealtimeSession {
     this.remoteStream = null;
   }
 
+  /** Events sent before the data channel finished opening — flushed
+   *  by dc.onopen in order. */
+  private pendingSends: string[] = [];
+
   private send(obj: unknown): void {
+    const raw = JSON.stringify(obj);
     if (this.dc && this.dc.readyState === "open") {
-      this.dc.send(JSON.stringify(obj));
+      this.dc.send(raw);
     } else {
-      this.cb.onLog?.("rt:send-dropped", { state: this.dc?.readyState });
+      this.pendingSends.push(raw);
+      this.cb.onLog?.("rt:send-queued", { state: this.dc?.readyState });
     }
   }
 

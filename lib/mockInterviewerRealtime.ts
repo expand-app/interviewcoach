@@ -244,7 +244,11 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       // The DUCKED stream — OpenAI hears the gain-controlled mic.
       micStream: uplinkStream,
       instructions: this.buildInstructions(),
-      voice: this.plan.language === "zh" ? "cedar" : "marin",
+      // "marin" for BOTH languages (it's multilingual): a single,
+      // consistently FEMALE voice — the plan generates a female
+      // interviewer name to match (field report: female voice
+      // introducing itself as "Kevin" broke the illusion).
+      voice: "marin",
       language: this.plan.language,
     });
 
