@@ -386,8 +386,11 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     const profile = this.interviewerProfileSummary
       ? `You are modeled on this interviewer: ${this.interviewerProfileSummary}. `
       : "";
+    const nameLine = p.interviewerName
+      ? `Your name is ${p.interviewerName} — introduce yourself by this name in your greeting. `
+      : "";
     return [
-      `You are a professional job interviewer running a realistic mock interview by voice. ${profile}${langLine}`,
+      `You are a professional job interviewer running a realistic mock interview by voice. ${nameLine}${profile}${langLine}`,
       `Conduct it as a natural, flowing conversation — like a real interviewer on a call. Greet the candidate briefly, then work through the interview. Keep every turn short and conversational (1-3 sentences). Acknowledge answers naturally before moving on. Never lecture, never coach, never reveal the "right" answer — just interview. Let the candidate interrupt you at any time.`,
       `You MUST cover ALL of the questions below, in roughly this order. Ask them in your own natural words (do not read them verbatim). When an answer is thin or interesting, ask ONE — at most two — natural follow-up questions before moving on. Do NOT invent unrelated topics or add questions beyond these.`,
       `Questions to cover:\n${p.slots

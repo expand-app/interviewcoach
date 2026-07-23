@@ -143,7 +143,7 @@ export function MockInterviewView({ onEndRequest }: Props) {
                 color: "rgba(255,255,255,0.85)",
               }}
             >
-              {t("I", "面")}
+              {(retake?.plan.interviewerName ?? t("I", "面"))[0]}
             </div>
           </div>
           <div className="flex flex-col items-center gap-1">
@@ -151,7 +151,7 @@ export function MockInterviewView({ onEndRequest }: Props) {
               className="text-[14px] font-medium"
               style={{ color: "rgba(255,255,255,0.9)" }}
             >
-              {t("Interviewer", "面试官")}
+              {retake?.plan.interviewerName ?? t("Interviewer", "面试官")}
             </span>
             <span
               className="text-[12px]"

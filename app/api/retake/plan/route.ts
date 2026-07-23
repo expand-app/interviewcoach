@@ -41,6 +41,10 @@ export interface RetakePlanSlot {
 
 export interface RetakePlan {
   language: "en" | "zh";
+  /** The AI interviewer's display + spoken name (e.g. "Sarah Chen" /
+   *  "王磊"). Taken from the original interviewer's profile when the
+   *  name is known there, otherwise invented to fit the language. */
+  interviewerName?: string;
   greeting: string;
   closing: string;
   slots: RetakePlanSlot[];
@@ -116,7 +120,8 @@ ${JSON.stringify(followupFlags)}
 Produce a JSON object with this exact shape:
 {
   "language": "en" | "zh",          // the language the ORIGINAL questions are written in
-  "greeting": string,               // 2-3 spoken sentences: greet the candidate, introduce yourself as the interviewer for this role, say you'll ask a series of questions. Natural, warm, professional. Will be read aloud by TTS.
+  "interviewerName": string,        // the interviewer's name. If the original interviewer's real name appears in the profile above, use it; otherwise invent a natural, professional full name fitting the language (e.g. "Sarah Chen" for en, "王磊" for zh). Never "Interviewer".
+  "greeting": string,               // 2-3 spoken sentences: greet the candidate, introduce yourself BY NAME (the interviewerName above) as the interviewer for this role, say you'll ask a series of questions. Natural, warm, professional. Will be read aloud by TTS.
   "closing": string,                // 1-2 spoken sentences wrapping up the interview and thanking them. No "any questions for me". Will be read aloud by TTS.
   "slots": [                        // EXACTLY one slot per original question above, same order
     {
@@ -174,6 +179,16 @@ Return ONLY the JSON object, no markdown fences.`;
       );
     }
     plan.slots = plan.slots.slice(0, MAX_SLOTS);
+
+    // Interviewer name is display-critical (the call UI shows it) but
+    // not worth failing the whole plan over — fall back per language.
+    if (
+      typeof plan.interviewerName !== "string" ||
+      !plan.interviewerName.trim()
+    ) {
+      plan.interviewerName = plan.language === "zh" ? "李静" : "Alex Carter";
+    }
+    plan.interviewerName = plan.interviewerName.trim().slice(0, 40);
 
     return NextResponse.json({ plan });
   } catch (e) {
