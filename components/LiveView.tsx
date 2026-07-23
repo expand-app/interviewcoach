@@ -744,12 +744,14 @@ export function LiveView({
             id="ic-capture-region"
             className="sticky top-0 z-10 relative border border-border rounded-lg overflow-hidden bg-bg flex flex-col mb-6"
             style={
-              isFullscreen
-                ? // Fullscreen: height driven by content; a fullscreen
-                  // toggle is a deliberate one-off layout change with its
-                  // own crop refresh.
-                  undefined
-                : phoneMode
+              // Height is FIXED in ALL modes — INCLUDING fullscreen. The card
+              // is the Region Capture crop target, so any mid-recording height
+              // change moves its bbox → garbled frame (花屏). Fullscreen used to
+              // be content-driven (undefined) and grew on each new question /
+              // commentary while recording — a real 花屏 risk. Locking it makes
+              // fullscreen as bbox-stable as the non-fullscreen modes; content
+              // overflows internally (clip / scroll) instead of resizing.
+              phoneMode
                 ? // Phone mode: FIXED height (not auto) so the card's
                   // Region Capture bbox never changes mid-recording when
                   // the question bar grows on a new question → no 花屏.
