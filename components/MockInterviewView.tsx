@@ -321,11 +321,13 @@ export function MockInterviewView({ onEndRequest }: Props) {
           active={!captionsOn}
           onClick={() => setCaptionsOn((v) => !v)}
         />
-        <CallButton
-          label={t("Skip question", "跳过这题")}
-          disabled={phase !== "listening"}
-          onClick={() => interviewer.skipQuestion()}
-        />
+        {process.env.NEXT_PUBLIC_RETAKE_ENGINE !== "openai" && (
+          <CallButton
+            label={t("Skip question", "跳过这题")}
+            disabled={phase !== "listening"}
+            onClick={() => interviewer.skipQuestion()}
+          />
+        )}
         <button
           onClick={onEndRequest}
           className="rounded-md px-4 py-2 text-[13px] font-semibold transition-colors"

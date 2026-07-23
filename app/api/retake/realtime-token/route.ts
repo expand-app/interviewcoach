@@ -92,18 +92,31 @@ export async function POST(req: Request) {
                 // realtime path uses these transcripts (not Deepgram)
                 // to fill Question.answerText and drive coaching.
                 transcription: { model: "gpt-4o-mini-transcribe" },
-                // Server-side VAD does the turn-taking + barge-in that
-                // the old hand-rolled tick()/silence machinery did.
-                // create_response:false → the controller decides each
-                // AI turn explicitly (keeps the plan's slot control).
+                // Model-driven conversation (ChatGPT-voice style):
+                // create_response:true → the model runs the whole
+                // interview autonomously (turn-taking, follow-ups,
+                // acknowledgments) guided by the plan in `instructions`.
+                // interrupt_response:true → the candidate can barge in.
                 turn_detection: {
                   type: "server_vad",
-                  create_response: false,
+                  create_response: true,
                   interrupt_response: true,
                 },
               },
               output: { voice },
             },
+            // The model calls this when it has covered the whole plan
+            // and finished its closing — the client then ends the call.
+            tools: [
+              {
+                type: "function",
+                name: "end_interview",
+                description:
+                  "Call this ONCE, only after you have asked all the planned questions and delivered your closing remarks, to end the interview.",
+                parameters: { type: "object", properties: {}, required: [] },
+              },
+            ],
+            tool_choice: "auto",
           },
         }),
       }

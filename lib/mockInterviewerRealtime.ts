@@ -1,26 +1,31 @@
 /**
  * RealtimeMockInterviewer — the OpenAI Realtime (WebRTC) engine for the
- * Retake flow. Drop-in for MockInterviewer (same IMockInterviewer
- * surface), selected by the RETAKE engine flag in getMockInterviewer().
+ * Retake flow, MODEL-DRIVEN (ChatGPT-voice style). Drop-in for
+ * MockInterviewer (same IMockInterviewer surface), selected by the
+ * RETAKE engine flag in getMockInterviewer().
  *
- * What OpenAI handles that the Aura engine hand-rolled:
- *   - the AI voice (gpt-realtime-2.1, natural low-latency)
- *   - turn-taking + barge-in (server VAD) — no tick()/silence/echo code
- *   - both-side transcription
+ * v2 architecture — the model runs the whole conversation:
+ *   - turn_detection.create_response:true → after each candidate turn
+ *     the model responds on its own; it greets, asks the planned
+ *     questions in order, adds natural follow-ups, acknowledges, and
+ *     wraps up — no controller-driven turn injection or state machine.
+ *   - The plan lives in the session `instructions` as SOFT GUARDRAILS
+ *     (cover all questions, ≤1-2 follow-ups, don't invent topics).
+ *   - The model calls the `end_interview` tool when it's done → we end.
  *
- * What THIS controller still owns (so the rest of the app is unchanged):
- *   - slot progression + follow-up depth (the plan's structure)
- *   - registering Question / Utterance / Comment rows in the store, in
- *     the SAME shape PastView + scoring already consume
- *   - the session recording, via AudioSession with disableStt:true and
- *     auxAudioStream = the AI's remote audio track (mic + AI voice → S3)
- *   - the store phases + ic:retake-* events the call UI reads
+ * This controller is now an OBSERVER, not a driver. It:
+ *   - records both sides' transcripts as Utterances (synthetic speaker
+ *     ids so PastView role resolution works),
+ *   - maps each AI turn that precedes an answer to a Question row and
+ *     the candidate's reply to that question's answer_text (for
+ *     scoring), fires silent Claude coaching per answered turn,
+ *   - records the session via AudioSession (aux = AI voice, disableStt),
+ *   - drives the call-UI phase from the response lifecycle,
+ *   - keeps a text echo-guard so the AI's own voice (bleeding back
+ *     through the mic) is never taken for a candidate answer.
  *
- * Turn model: turn_detection.create_response is false, so the AI speaks
- * ONLY when we call requestSpeak(). We decide follow-up-vs-advance
- * locally (plan control) and let the model generate the contextual
- * wording (natural). Everything OpenAI-uncertain is isolated in
- * openaiRealtimeSession.ts.
+ * Barge-in: the uplink mic stays open; OpenAI's server VAD +
+ * interrupt_response cut the AI off when the candidate speaks.
  */
 
 import { AudioSession } from "./audioSession";
@@ -31,30 +36,23 @@ import type { RetakePlan } from "@/app/api/retake/plan/route";
 import type { Comment, Question, Utterance } from "@/types/session";
 
 // ===== tuning =====
-/** Max follow-ups per slot (matches the Aura engine's depth cap). */
-const MAX_FOLLOWUP_DEPTH = 1;
-/** An answer shorter than this (words) is treated as "thin" → eligible
- *  for a follow-up when the slot allows it. Longer answers move on. */
-const THIN_ANSWER_WORDS = 45;
 /** No candidate speech for this long during listening → suggest ending. */
 const IDLE_END_AFTER_MS = 3 * 60_000;
+/** A candidate "answer" whose token overlap with a recent AI line is
+ *  at/above this is the AI's own voice echoing back — drop it. */
+const ECHO_OVERLAP_THRESHOLD = 0.6;
 
 // Synthetic diarization ids so PastView's speaker-role resolution works
 // exactly as with Deepgram (we KNOW the roles here — no diarization).
 const SPK_INTERVIEWER = 0;
 const SPK_CANDIDATE = 1;
 
-/** A candidate "answer" whose token overlap with a recent AI line is
- *  at/above this is the AI's own voice echoing back — drop it. */
-const ECHO_OVERLAP_THRESHOLD = 0.6;
-
 function rid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /** Token-overlap similarity in [0,1] against the smaller set. CJK falls
- *  back to per-character tokens. (Same idea as the Aura engine's echo
- *  guard.) */
+ *  back to per-character tokens. */
 function tokenOverlap(a: string, b: string): number {
   const norm = (s: string): string[] => {
     const cleaned = s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "");
@@ -93,28 +91,21 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
 
   private phase: Phase = "idle";
   private stopped = false;
-  private slotIndex = 0;
-  private followupDepth = 0;
   private startedAtMs = 0;
-
-  /** The Question row the current answer attaches to. */
-  private currentQuestionId: string | null = null;
-  private currentQuestionText = "";
-  /** Lead question id of the current slot (followups parent to it). */
-  private currentLeadId: string | null = null;
-  /** True while we expect the AI's next transcript to BE a question
-   *  (so we register it as a Question row rather than a stray line). */
-  private expectingQuestion = false;
-  /** True while the AI is asking a FOLLOW-UP (parents to the lead). */
-  private pendingIsFollowup = false;
-  /** Guard so one candidate answer drives exactly one decision. */
-  private answerHandledForTurn = false;
-  /** User pressed the mute button (distinct from the automatic
-   *  during-AI-speech uplink muting). */
   private userMuted = false;
+  private endedFired = false;
+
   /** Recent AI spoken lines — the echo guard matches candidate
    *  transcripts against these. */
   private recentAiLines: string[] = [];
+  /** The most recent AI turn's text + whether a NEW AI turn has
+   *  happened since we last opened a Question (so the next answer maps
+   *  to the right question). */
+  private lastAiTurnText = "";
+  private aiTurnSinceQuestion = false;
+  /** The Question row the current answer attaches to. */
+  private currentQuestionId: string | null = null;
+  private currentQuestionText = "";
 
   private lastSpeechAt = 0;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -129,19 +120,19 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.interviewerProfileSummary = args.interviewerProfileSummary ?? "";
     this.stopped = false;
     this.phase = "idle";
-    this.slotIndex = 0;
-    this.followupDepth = 0;
-    this.currentQuestionId = null;
-    this.currentLeadId = null;
-    this.expectingQuestion = false;
-    this.pendingIsFollowup = false;
-    this.answerHandledForTurn = false;
-    this.idleFired = false;
     this.startedAtMs = Date.now();
+    this.userMuted = false;
+    this.endedFired = false;
+    this.recentAiLines = [];
+    this.lastAiTurnText = "";
+    this.aiTurnSinceQuestion = false;
+    this.currentQuestionId = null;
+    this.currentQuestionText = "";
+    this.lastSpeechAt = 0;
+    this.idleFired = false;
 
-    // 1) Mic for the OpenAI uplink. Separate from AudioSession's own
-    //    recording mic (muting handles both). EC/NS on — the AI plays
-    //    through the speakers.
+    // 1) Mic for the OpenAI uplink. Full-duplex (stays open during AI
+    //    speech) so the candidate can barge in. EC/NS on for echo.
     try {
       this.micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -158,8 +149,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       throw new Error("mic denied");
     }
 
-    // 2) OpenAI realtime session. The remote AI audio track (ontrack)
-    //    resolves remotePromise so we can hand it to AudioSession's aux.
+    // 2) OpenAI realtime session (observer callbacks).
     let resolveRemote: (s: MediaStream | null) => void = () => {};
     const remotePromise = new Promise<MediaStream | null>((r) => {
       resolveRemote = r;
@@ -169,11 +159,22 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       onSpeechStarted: () => {
         this.lastSpeechAt = Date.now();
         window.dispatchEvent(new CustomEvent("ic:retake-speech"));
-        if (this.phase === "asking") this.setPhase("listening");
+      },
+      onSpeechStopped: () => {
+        // Brief gap while the model composes its reply.
+        if (!this.stopped && this.phase !== "ended") this.setPhase("thinking");
       },
       onCandidateTranscript: (text) => this.onCandidateAnswer(text),
-      onAiTranscript: (text) => this.onAiTranscript(text),
-      onResponseDone: () => this.onAiResponseDone(),
+      onAiTranscript: (text) => this.onAiTurn(text),
+      onResponseCreated: () => {
+        if (!this.stopped && this.phase !== "ended") this.setPhase("asking");
+      },
+      onResponseDone: () => {
+        if (!this.stopped && this.phase !== "ended") this.setPhase("listening");
+      },
+      onFunctionCall: (name) => {
+        if (name === "end_interview") this.runEnd();
+      },
       onError: (msg) =>
         window.dispatchEvent(new CustomEvent("ic:error", { detail: msg })),
       onLog: (event, data) =>
@@ -191,14 +192,13 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       language: this.plan.language,
     });
 
-    // Wait briefly for the AI audio track so the recording captures it.
     const remote = await Promise.race([
       remotePromise,
       new Promise<MediaStream | null>((r) => setTimeout(() => r(null), 4000)),
     ]);
 
-    // 3) Recording via AudioSession — NO Deepgram (transcripts come from
-    //    OpenAI); aux = AI voice so the recording has both sides.
+    // 3) Recording via AudioSession — NO Deepgram; aux = AI voice so the
+    //    recording has both sides.
     this.audio = new AudioSession(this.makeAudioCallbacks(), {
       captureTabAudio: "off",
       useMic: true,
@@ -213,9 +213,14 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
       throw new Error("audio session failed to start");
     }
 
-    // 4) Idle watchdog + greeting.
+    // 4) Kick off the interview: the first response is the only one we
+    //    request — after that create_response:true makes the model
+    //    respond to each candidate turn on its own.
+    this.setPhase("greeting");
     this.idleTimer = setInterval(() => this.tickIdle(), 1000);
-    this.runGreeting();
+    this.session.requestSpeak(
+      "Begin the interview now. Greet the candidate briefly and immediately ask your first question."
+    );
   }
 
   async stop(): Promise<void> {
@@ -250,48 +255,21 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   setUserMuted(muted: boolean): void {
     this.userMuted = muted;
     useStore.getState().setRetakeMicMuted(muted);
-    // Full-duplex: the uplink stays open whenever the user isn't muted,
-    // INCLUDING while the AI is speaking — that's what lets the
-    // candidate barge in and interrupt (OpenAI's server VAD +
-    // interrupt_response:true cut the AI off). Echo is handled
-    // acoustically (echoCancellation) + by the text echo-guard below.
     this.audio?.setMicGain(muted ? 0 : 1);
     this.session?.setMicEnabled(!muted);
   }
 
-  // ===== barge-in + echo control =====
-  //
-  // The uplink mic stays OPEN during AI speech so the candidate can
-  // interrupt naturally. The AI's own voice bleeding back is handled by
-  // (1) browser echoCancellation on the mic and (2) the text echo-guard
-  // in onCandidateAnswer, which drops any "answer" that matches a line
-  // the AI just said. Headphones eliminate the acoustic echo entirely.
-
-  /** Speak an AI turn. Mic stays open (barge-in). */
-  private aiSay(instructions: string): void {
-    this.session?.requestSpeak(instructions);
-  }
-
-  private enterListening(): void {
-    if (this.stopped) return;
-    this.setPhase("listening");
-    this.lastSpeechAt = Date.now();
-  }
-
+  /** No-op in the model-driven engine — the model decides when to move
+   *  on; there is no manual "skip" that makes sense mid-conversation.
+   *  (The button is hidden in this engine; kept for interface parity.) */
   skipQuestion(): void {
-    if (this.phase !== "listening" && this.phase !== "asking") return;
-    // Cut off any AI speech and jump to the next slot with no answer.
-    try {
-      this.session?.cancelResponse();
-    } catch {
-      /* noop */
-    }
-    this.advanceSlot();
+    /* intentionally no-op */
   }
 
   // ===== internals =====
 
   private setPhase(p: Exclude<Phase, "idle">) {
+    if (this.phase === "ended") return;
     this.phase = p;
     useStore.getState().setRetakePhase(p);
   }
@@ -300,10 +278,8 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     return this.startedAtMs ? (Date.now() - this.startedAtMs) / 1000 : 0;
   }
 
-  /** Persona + language + full plan, given to the realtime session as
-   *  its standing instructions. The plan questions are the source of
-   *  truth; the controller injects them one at a time via requestSpeak,
-   *  but embedding them here keeps the model on-topic and consistent. */
+  /** Persona + language + the whole plan as SOFT GUARDRAILS. The model
+   *  runs the interview from this — the controller never injects turns. */
   private buildInstructions(): string {
     const p = this.plan!;
     const langLine =
@@ -311,59 +287,42 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
         ? "Speak ONLY in natural, conversational Mandarin Chinese."
         : "Speak ONLY in natural, conversational English.";
     const profile = this.interviewerProfileSummary
-      ? `\nYou are modeled on this interviewer: ${this.interviewerProfileSummary}\n`
+      ? `You are modeled on this interviewer: ${this.interviewerProfileSummary}. `
       : "";
     return [
-      `You are a professional job interviewer conducting a mock interview.`,
-      langLine,
-      profile,
-      `Keep every turn short and conversational — 1 to 3 sentences, like a real interviewer. Never lecture, never coach, never give feedback or the "right answer". Just interview.`,
-      `When asked to pose a question, ask it naturally in your own words. When asked to follow up, dig into a specific detail the candidate just mentioned. When asked to move on, briefly acknowledge their answer in a few words, then ask the next question.`,
-      `You will be told exactly what to do for each turn. Do not skip ahead or invent new topics on your own.`,
-      `\nThe interview covers these questions in order:\n${p.slots
+      `You are a professional job interviewer running a realistic mock interview by voice. ${profile}${langLine}`,
+      `Conduct it as a natural, flowing conversation — like a real interviewer on a call. Greet the candidate briefly, then work through the interview. Keep every turn short and conversational (1-3 sentences). Acknowledge answers naturally before moving on. Never lecture, never coach, never reveal the "right" answer — just interview. Let the candidate interrupt you at any time.`,
+      `You MUST cover ALL of the questions below, in roughly this order. Ask them in your own natural words (do not read them verbatim). When an answer is thin or interesting, ask ONE — at most two — natural follow-up questions before moving on. Do NOT invent unrelated topics or add questions beyond these.`,
+      `Questions to cover:\n${p.slots
         .map((s, i) => `${i + 1}. ${s.question}`)
         .join("\n")}`,
+      `When you have covered every question and the candidate has answered, give a brief, warm closing (thank them, tell them that's the end) and then CALL THE end_interview FUNCTION. Do not call it before you have covered all the questions.`,
+      p.greeting ? `Suggested greeting tone: "${p.greeting}"` : "",
+      p.closing ? `Suggested closing tone: "${p.closing}"` : "",
     ]
       .filter(Boolean)
-      .join("\n");
+      .join("\n\n");
   }
 
-  private runGreeting(): void {
-    if (!this.plan || this.stopped) return;
-    this.setPhase("greeting");
-    useStore.getState().setRetakeCaption(this.plan.greeting);
-    this.expectingQuestion = false;
-    this.aiSay(
-      `Greet the candidate warmly and say, in your own natural words: "${this.plan.greeting}". Do not ask a question yet.`
-    );
-    // On response.done we advance to the first slot question.
+  /** An AI spoken turn's transcript is final. */
+  private onAiTurn(text: string): void {
+    if (this.stopped || !text.trim()) return;
+    // Feed the echo guard.
+    this.recentAiLines.push(text);
+    if (this.recentAiLines.length > 5) this.recentAiLines.shift();
+    // Record + caption.
+    this.addUtterance(text, SPK_INTERVIEWER);
+    useStore.getState().setRetakeCaption(text);
+    // Remember this turn so the NEXT candidate answer maps to it.
+    this.lastAiTurnText = text;
+    this.aiTurnSinceQuestion = true;
   }
 
-  /** Ask the lead question of the current slot. */
-  private askCurrentSlot(): void {
-    if (!this.plan || this.stopped) return;
-    const slot = this.plan.slots[this.slotIndex];
-    if (!slot) {
-      this.runWrapup();
-      return;
-    }
-    this.followupDepth = 0;
-    this.pendingIsFollowup = false;
-    this.expectingQuestion = true;
-    this.answerHandledForTurn = false;
-    this.setPhase("asking");
-    this.aiSay(
-      `Ask the candidate this question, in your own natural words (one or two sentences): "${slot.question}"`
-    );
-  }
-
-  /** Candidate finished an answer (OpenAI final transcript). */
+  /** A candidate turn's transcript is final. */
   private onCandidateAnswer(text: string): void {
     if (this.stopped || !text.trim()) return;
 
-    // Echo guard: if this "answer" closely matches a line the AI just
-    // spoke, it's the AI's own voice bleeding into the mic — drop it
-    // (do NOT append, do NOT advance). The real answer will follow.
+    // Echo guard: the AI's own voice bleeding back through the mic.
     const isEcho = this.recentAiLines.some(
       (line) => tokenOverlap(text, line) >= ECHO_OVERLAP_THRESHOLD
     );
@@ -371,138 +330,45 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
 
     this.lastSpeechAt = Date.now();
     this.idleFired = false;
+    window.dispatchEvent(new CustomEvent("ic:retake-speech"));
 
-    // Persist the utterance (candidate lane) + answer text for scoring.
+    // Map to a Question row. A fresh AI turn since the last question
+    // means THIS answer belongs to a new question (that AI turn).
+    if (this.aiTurnSinceQuestion && this.lastAiTurnText) {
+      const store = useStore.getState();
+      const q: Question = {
+        id: rid("q"),
+        text: this.lastAiTurnText,
+        askedAtSeconds: this.elapsed(),
+        comments: [],
+        kind: "interviewer",
+      };
+      store.addQuestion(q);
+      this.currentQuestionId = q.id;
+      this.currentQuestionText = this.lastAiTurnText;
+      this.aiTurnSinceQuestion = false;
+    }
+
+    // Record the candidate utterance + answer text for scoring.
     this.addUtterance(text, SPK_CANDIDATE);
     if (this.currentQuestionId) {
       useStore
         .getState()
         .appendCandidateAnswerText(this.currentQuestionId, text);
-    }
-
-    // One decision per turn — the model may emit multiple transcript
-    // fragments; only the first drives progression.
-    if (this.answerHandledForTurn) return;
-    this.answerHandledForTurn = true;
-
-    // Silent coaching for this answered turn (fire-and-forget).
-    const qId = this.currentQuestionId;
-    const qText = this.currentQuestionText;
-    if (qId && qText) {
-      void this.generateSilentComment(qId, qText, text);
-    }
-
-    this.setPhase("thinking");
-    this.decideNextTurn(text);
-  }
-
-  /** Local decision: follow up once on a thin answer where the slot
-   *  allows it, otherwise advance. The model generates the wording. */
-  private decideNextTurn(answer: string): void {
-    if (!this.plan || this.stopped) return;
-    const slot = this.plan.slots[this.slotIndex];
-    const words = answer.trim().split(/\s+/).filter(Boolean).length;
-    const canFollowup =
-      !!slot?.allowFollowups &&
-      this.followupDepth < MAX_FOLLOWUP_DEPTH &&
-      words < THIN_ANSWER_WORDS;
-
-    if (canFollowup) {
-      this.followupDepth += 1;
-      this.pendingIsFollowup = true;
-      this.expectingQuestion = true;
-      this.answerHandledForTurn = false;
-      this.setPhase("asking");
-      this.aiSay(
-        `The candidate just said: "${answer.slice(0, 600)}". Ask ONE short, natural follow-up question that digs into a specific part of what they said. One sentence.`
+      // Silent coaching for this answered turn (fire-and-forget).
+      void this.generateSilentComment(
+        this.currentQuestionId,
+        this.currentQuestionText,
+        text
       );
-      return;
-    }
-    this.advanceSlot();
-  }
-
-  private advanceSlot(): void {
-    if (!this.plan || this.stopped) return;
-    this.slotIndex += 1;
-    if (this.slotIndex >= this.plan.slots.length) {
-      this.runWrapup();
-      return;
-    }
-    const slot = this.plan.slots[this.slotIndex];
-    this.followupDepth = 0;
-    this.pendingIsFollowup = false;
-    this.expectingQuestion = true;
-    this.answerHandledForTurn = false;
-    this.setPhase("asking");
-    // Ack + next question in ONE natural turn (no dead air).
-    this.aiSay(
-      `Briefly acknowledge the candidate's answer in a few words, then ask the next question in your own natural words: "${slot.question}"`
-    );
-  }
-
-  private runWrapup(): void {
-    if (!this.plan || this.stopped) return;
-    this.setPhase("wrapup");
-    this.expectingQuestion = false;
-    useStore.getState().setRetakeCaption(this.plan.closing);
-    this.aiSay(
-      `Wrap up the interview: briefly thank the candidate and say, naturally: "${this.plan.closing}". Do not ask anything else.`
-    );
-    // ic:retake-complete fires on the wrapup response.done.
-  }
-
-  /** An AI spoken turn's transcript is final. */
-  private onAiTranscript(text: string): void {
-    if (this.stopped || !text.trim()) return;
-    // Feed the echo guard: candidate transcripts matching a recent AI
-    // line are the AI's own voice bleeding back through the mic.
-    this.recentAiLines.push(text);
-    if (this.recentAiLines.length > 4) this.recentAiLines.shift();
-    // Persist as an interviewer utterance for the transcript.
-    this.addUtterance(text, SPK_INTERVIEWER);
-    useStore.getState().setRetakeCaption(text);
-
-    // If we were expecting a question, THIS transcript is it → register
-    // the Question row the upcoming answer attaches to.
-    if (this.expectingQuestion) {
-      this.expectingQuestion = false;
-      const store = useStore.getState();
-      const q: Question = {
-        id: rid("q"),
-        text,
-        askedAtSeconds: this.elapsed(),
-        comments: [],
-        kind: "interviewer",
-        ...(this.pendingIsFollowup && this.currentLeadId
-          ? { parentQuestionId: this.currentLeadId }
-          : {}),
-      };
-      store.addQuestion(q);
-      this.currentQuestionId = q.id;
-      this.currentQuestionText = text;
-      if (!this.pendingIsFollowup) this.currentLeadId = q.id;
     }
   }
 
-  /** One AI response fully finished. Drives the state machine forward
-   *  for turns that don't depend on a candidate answer (greeting → first
-   *  question; wrapup → end). */
-  private onAiResponseDone(): void {
-    if (this.stopped) return;
-    if (this.phase === "greeting") {
-      this.askCurrentSlot();
-      return;
-    }
-    if (this.phase === "wrapup") {
-      this.setPhase("ended");
-      window.dispatchEvent(new CustomEvent("ic:retake-complete"));
-      return;
-    }
-    // asking → listening: the AI finished posing the question. Re-open
-    // the uplink mic after a short tail (enterListening).
-    if (this.phase === "asking") {
-      this.enterListening();
-    }
+  private runEnd(): void {
+    if (this.endedFired || this.stopped) return;
+    this.endedFired = true;
+    this.setPhase("ended");
+    window.dispatchEvent(new CustomEvent("ic:retake-complete"));
   }
 
   private tickIdle(): void {
@@ -589,8 +455,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
 
   private makeAudioCallbacks() {
     return {
-      // No Deepgram in this engine — transcripts come from OpenAI, so
-      // the transcript callbacks are inert.
+      // No Deepgram in this engine — transcripts come from OpenAI.
       onInterimTranscript: () => {},
       onFinalTranscript: () => {},
       onAudioReady: (audioUrl: string) => {

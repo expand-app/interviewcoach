@@ -30,8 +30,13 @@ export interface RealtimeSessionCallbacks {
   onCandidateTranscript?: (text: string) => void;
   /** Final transcript of an AI spoken turn (question / follow-up). */
   onAiTranscript?: (text: string) => void;
+  /** The model began a new spoken response (drives the "AI speaking"
+   *  phase in the call UI). */
+  onResponseCreated?: () => void;
   /** One AI response fully finished (audio + transcript). */
   onResponseDone?: () => void;
+  /** The model called a function tool by name (e.g. "end_interview"). */
+  onFunctionCall?: (name: string) => void;
   /** The remote AI audio stream is available (for recording capture). */
   onRemoteStream?: (stream: MediaStream) => void;
   onError?: (msg: string) => void;
@@ -207,7 +212,15 @@ export class OpenAiRealtimeSession {
 
   private handleEvent(raw: unknown): void {
     if (typeof raw !== "string") return;
-    let evt: { type?: string; transcript?: string; error?: unknown };
+    let evt: {
+      type?: string;
+      transcript?: string;
+      name?: string;
+      error?: unknown;
+      response?: {
+        output?: Array<{ type?: string; name?: string }>;
+      };
+    };
     try {
       evt = JSON.parse(raw);
     } catch {
@@ -249,7 +262,32 @@ export class OpenAiRealtimeSession {
       return;
     }
 
+    // The model began a new spoken response → "AI speaking" phase.
+    if (type === "response.created") {
+      this.cb.onResponseCreated?.();
+      return;
+    }
+
+    // A function tool the model called mid-stream (fires before
+    // response.done). Surface the name.
+    if (
+      type.includes("function_call") &&
+      (type.endsWith(".done") || type.endsWith(".arguments.done"))
+    ) {
+      if (typeof evt.name === "string" && evt.name) {
+        this.cb.onFunctionCall?.(evt.name);
+      }
+      return;
+    }
+
     if (type === "response.done") {
+      // Belt-and-suspenders: also scan the finished response's output
+      // for function_call items (the streamed event above may not carry
+      // the name in every API revision).
+      const calls = (evt.response?.output ?? []).filter(
+        (o) => o.type === "function_call" && o.name
+      );
+      for (const call of calls) this.cb.onFunctionCall?.(call.name as string);
       this.cb.onResponseDone?.();
       return;
     }
