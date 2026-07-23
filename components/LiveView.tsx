@@ -77,7 +77,7 @@ const COMMENTARY_PHONE_HEIGHT_PX = 620;
 // which the user needs) off the bottom of the fixed card. Beyond this the
 // question scrolls internally; captions always stays put. ~6-7 lines at
 // the enlarged phone font.
-const PHONE_QUESTION_MAX_HEIGHT_PX = 260;
+const PHONE_QUESTION_MAX_HEIGHT_PX = 220;
 // Phone-mode card is a FIXED height (not auto) for the same reason wide
 // mode is: the card IS the Region Capture crop target, and ANY size
 // change during recording (e.g. the question bar growing when a new
@@ -809,7 +809,18 @@ export function LiveView({
               const controlsLocked =
                 live.status === "recording" || live.status === "paused";
               return (
-              <div className="absolute top-2 right-2 z-10 flex items-center gap-1.5 print:hidden">
+              <div className={
+                phoneMode
+                  // Phone/Live-demo: a real top header ROW (not an absolute
+                  // overlay) so the controls reserve their own height and the
+                  // narrow question box below can't slide under them. Fixes the
+                  // overlap where the black-bordered box's top-right corner sat
+                  // beneath the Wide/Exit buttons. shrink-0 keeps it a fixed
+                  // strip inside the fixed-height card.
+                  ? "flex items-center justify-end gap-1.5 px-3 pt-2 pb-1 shrink-0 print:hidden"
+                  // Wide: unchanged — absolute top-right ghost cluster.
+                  : "absolute top-2 right-2 z-10 flex items-center gap-1.5 print:hidden"
+              }>
                 {/* "Live 演示" — narrow-tall (iPhone-ish) vs default
                     wide-flat (iPad-ish) box layout. */}
                 {onTogglePhoneMode && (
