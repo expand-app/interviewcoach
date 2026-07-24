@@ -54,19 +54,26 @@ export function ConfirmModal({
       <div className="p-7 px-8">
         <h2 className="text-[18px] font-semibold mb-1.5 text-text">{title}</h2>
         <div className="text-sm text-text-muted mb-5 leading-relaxed">{description}</div>
-        <div className="flex gap-2 justify-end mt-4">
+        <div className="mt-4 flex flex-col gap-3">
+          <div className="flex gap-2 justify-end">
+            <Button onClick={onCancel}>{cancelLabel}</Button>
+            <Button variant="primary" onClick={onConfirm} style={dangerStyle}>
+              {confirmLabel}
+            </Button>
+          </div>
+          {/* Destructive-secondary action on its own row so three
+              buttons never overflow the 420px modal (the one-row
+              layout clipped "Exit without saving" off the left edge). */}
           {altLabel && onAlt && (
-            <Button
+            <button
+              type="button"
               onClick={onAlt}
-              style={{ color: "var(--color-error)", marginRight: "auto" }}
+              className="self-start text-[13px] font-medium hover:underline"
+              style={{ color: "var(--color-error)" }}
             >
               {altLabel}
-            </Button>
+            </button>
           )}
-          <Button onClick={onCancel}>{cancelLabel}</Button>
-          <Button variant="primary" onClick={onConfirm} style={dangerStyle}>
-            {confirmLabel}
-          </Button>
         </div>
       </div>
     </ModalShell>
