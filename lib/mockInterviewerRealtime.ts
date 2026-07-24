@@ -49,10 +49,13 @@ const STALL_NUDGE_GAP_MS = 40_000;
  *  at/above this is the AI's own voice echoing back — drop it. */
 const ECHO_OVERLAP_THRESHOLD = 0.6;
 /** Speakerphone echo defense: while the AI is speaking, the OpenAI
- *  uplink is DUCKED to this gain (not muted — a real, close-to-mic
- *  voice still clears the raised VAD threshold, so barge-in works),
- *  which drops residual speaker echo below detection. */
-const DUCK_GAIN = 0.22;
+ *  uplink is DUCKED to this gain (not muted — a real voice still
+ *  clears the VAD, so barge-in works), which drops residual speaker
+ *  echo below detection. 0.35 (was 0.22): with the VAD threshold back
+ *  at 0.55 and near-field NR, 0.22 made interrupting too hard —
+ *  deep-duck + high-threshold + far-field stacking was the "AI can't
+ *  hear me" regression. */
+const DUCK_GAIN = 0.35;
 /** Keep the duck for a beat after response.done — the audio track
  *  keeps playing out (and echoing) briefly after generation ends. */
 const DUCK_RELEASE_MS = 500;
@@ -110,6 +113,8 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
   private uplinkCtx: AudioContext | null = null;
   private uplinkGain: GainNode | null = null;
   private duckReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Gesture backstop that re-resumes a suspended uplink context. */
+  private gestureResume: (() => void) | null = null;
 
   private phase: Phase = "idle";
   private stopped = false;
@@ -186,6 +191,25 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     if (this.uplinkCtx.state === "suspended") {
       void this.uplinkCtx.resume().catch(() => {});
     }
+    // Autoplay-policy backstop: a suspended uplink context = silent
+    // uplink = the AI hears nothing. Any click/keypress re-resumes it
+    // until confirmed running. Removed in teardownUplink().
+    this.gestureResume = () => {
+      if (this.uplinkCtx && this.uplinkCtx.state === "suspended") {
+        void this.uplinkCtx.resume().catch(() => {});
+      }
+    };
+    window.addEventListener("pointerdown", this.gestureResume, true);
+    window.addEventListener("keydown", this.gestureResume, true);
+    window.dispatchEvent(
+      new CustomEvent("ic:debug", {
+        detail: {
+          source: "retake-realtime",
+          event: "uplink:ctx-state",
+          data: { state: this.uplinkCtx.state },
+        },
+      })
+    );
     const uplinkSrc = this.uplinkCtx.createMediaStreamSource(this.micStream);
     this.uplinkGain = this.uplinkCtx.createGain();
     this.uplinkGain.gain.value = 1;
@@ -279,7 +303,7 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     this.setPhase("greeting");
     this.idleTimer = setInterval(() => this.tickIdle(), 1000);
     this.session.requestSpeak(
-      "Begin the interview now. Greet the candidate briefly and immediately ask your first question."
+      "Begin the interview now, following your OPENING instructions: greet the candidate, introduce yourself and briefly present the role and team, then ask a light warm-up question. Do NOT ask any planned interview question yet."
     );
   }
 
@@ -313,6 +337,11 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     if (this.duckReleaseTimer) {
       clearTimeout(this.duckReleaseTimer);
       this.duckReleaseTimer = null;
+    }
+    if (this.gestureResume) {
+      window.removeEventListener("pointerdown", this.gestureResume, true);
+      window.removeEventListener("keydown", this.gestureResume, true);
+      this.gestureResume = null;
     }
     if (this.uplinkCtx && this.uplinkCtx.state !== "closed") {
       void this.uplinkCtx.close().catch(() => {});
@@ -393,15 +422,19 @@ export class RealtimeMockInterviewer implements IMockInterviewer {
     const nameLine = p.interviewerName
       ? `Your name is ${p.interviewerName} — introduce yourself by this name in your greeting. `
       : "";
+    const jdExcerpt = this.jd ? this.jd.slice(0, 1500) : "";
     return [
       `You are a professional job interviewer running a realistic mock interview by voice. ${nameLine}${profile}${langLine}`,
-      `Conduct it as a natural, flowing conversation — like a real interviewer on a call. Greet the candidate briefly, then work through the interview. Keep every turn short and conversational (1-3 sentences). Acknowledge answers naturally before moving on. Never lecture, never coach, never reveal the "right" answer — just interview. Let the candidate interrupt you at any time.`,
+      jdExcerpt
+        ? `The role you are hiring for (job description excerpt — use it to speak naturally about the position and team):\n${jdExcerpt}`
+        : "",
+      `OPENING — do NOT jump straight into interview questions. Like a real interview: greet the candidate, introduce yourself by name, spend one or two sentences introducing the role and the team (drawing on the job description above), then ask a light warm-up — how they're doing, or a one-line "tell me a bit about yourself". Only AFTER that first exchange, transition naturally into the planned questions ("Great — let's dive in, then.").`,
+      `STYLE — a conversation, not an interrogation. Keep every turn short (1-3 sentences). React to the SPECIFIC content of each answer before moving on: echo a detail in your own words, show genuine interest, occasionally connect what they said to the role or the team. Vary your phrasing — never open two turns the same way. Never lecture, never coach, never reveal a "right" answer. The candidate may interrupt you at any time.`,
       `You MUST cover ALL of the questions below, in roughly this order. Ask them in your own natural words (do not read them verbatim). When an answer is thin or interesting, ask ONE — at most two — natural follow-up questions before moving on. Do NOT invent unrelated topics or add questions beyond these.`,
       `Questions to cover:\n${p.slots
         .map((s, i) => `${i + 1}. ${s.question}`)
         .join("\n")}`,
       `When you have covered every question and the candidate has answered, give a brief, warm closing (thank them, tell them that's the end) and then CALL THE end_interview FUNCTION. Do not call it before you have covered all the questions.`,
-      p.greeting ? `Suggested greeting tone: "${p.greeting}"` : "",
       p.closing ? `Suggested closing tone: "${p.closing}"` : "",
     ]
       .filter(Boolean)

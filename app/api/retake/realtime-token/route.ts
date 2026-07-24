@@ -101,23 +101,25 @@ export async function POST(req: Request) {
                   model: "gpt-4o-mini-transcribe",
                   language: sttLanguage,
                 },
-                // Speakerphone support: far-field noise reduction is
-                // tuned for mic-picks-up-the-room setups (vs near_field
-                // for headsets) — one layer of the no-headphones echo
-                // defense (with client-side uplink ducking + AEC).
-                noise_reduction: { type: "far_field" },
+                // near_field: laptop/headset close-mic profile. We
+                // briefly shipped far_field (a conference-room distant
+                // -mic profile) as echo defense, but stacked with the
+                // 0.75 VAD threshold and uplink ducking it suppressed
+                // NORMAL candidate speech below detection — "the AI
+                // can't hear me". Echo is handled by AEC + ducking +
+                // the text echo-guard instead.
+                noise_reduction: { type: "near_field" },
                 // Model-driven conversation (ChatGPT-voice style):
                 // create_response:true → the model runs the whole
                 // interview autonomously (turn-taking, follow-ups,
                 // acknowledgments) guided by the plan in `instructions`.
                 // interrupt_response:true → the candidate can barge in.
-                // threshold raised from the 0.5 default so residual
-                // speaker echo (post-AEC, post-ducking) doesn't trip the
-                // VAD and make the AI interrupt itself; a real voice at
-                // normal volume still clears 0.75 easily.
+                // threshold 0.55: slightly above the 0.5 default (echo
+                // margin) but low enough that normal speech through a
+                // ducked uplink still registers — 0.75 proved deaf.
                 turn_detection: {
                   type: "server_vad",
-                  threshold: 0.75,
+                  threshold: 0.55,
                   prefix_padding_ms: 300,
                   silence_duration_ms: 600,
                   create_response: true,
