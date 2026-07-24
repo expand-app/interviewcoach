@@ -2,6 +2,18 @@ import type { Metadata } from "next";
 import { Inter, Lora, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
+// Force per-request rendering for EVERY page. Without this, Next
+// prerenders pages like /app as static and serves them with
+// `Cache-Control: s-maxage=31536000` — and the CloudFront distribution
+// in front of EB then caches the HTML (which pins the old JS bundle
+// hashes) for up to a YEAR per edge. Users kept seeing weeks-old UI
+// after deploys, unfixable by hard refresh because the EDGE was stale.
+// Dynamic rendering emits no-store headers, so HTML is always fetched
+// from origin; hashed /_next/static assets stay immutable-cached.
+// (Deploys also invalidate CloudFront via .deploy/redeploy.sh now —
+// belt and suspenders.)
+export const dynamic = "force-dynamic";
+
 // Self-hosted via next/font: Next.js downloads these at build time and
 // serves them from the same origin as the app. No runtime request to
 // fonts.googleapis.com — required so users in mainland China (where
