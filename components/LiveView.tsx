@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useStore } from "@/lib/store";
+import { isAdminUser } from "@/lib/auth-client";
 import { useTranslations } from "@/lib/i18n";
 import { ModalShell } from "@/components/modals/ModalShell";
 import { Eyebrow, Button, BrandMark } from "@/components/ui";
@@ -331,6 +333,15 @@ export function LiveView({
   const isUploadMode = false;
   const forceSetSpeakerRole = useStore((s) => s.forceSetSpeakerRole);
   const [retagModalOpen, setRetagModalOpen] = useState(false);
+
+  // Gate the portaled control cluster (see below) so createPortal only runs
+  // client-side after mount (document.body is undefined during SSR).
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  // When the admin debug panel occupies the right 360px column (admin +
+  // not fullscreen), inset the portaled controls to its left so they don't
+  // cover it; otherwise sit in the viewport's top-right corner.
+  const adminDebugRail = isAdminUser(useStore((s) => s.user)) && !isFullscreen;
 
   const [interim, setInterim] = useState("");
   useEffect(() => {
@@ -807,22 +818,22 @@ export function LiveView({
                 the duration. Toggling either mid-recording would move /
                 resize the Region Capture crop target → 花屏 in the saved
                 video, so we gate them off. */}
-            {(onTogglePhoneMode || onToggleFullscreen) && (() => {
+            {(onTogglePhoneMode || onToggleFullscreen) && mounted && (() => {
               const controlsLocked =
                 live.status === "recording" || live.status === "paused";
-              return (
-              <div className={
-                phoneMode
-                  // Phone/Live-demo: a real top header ROW (not an absolute
-                  // overlay) so the controls reserve their own height and the
-                  // narrow question box below can't slide under them. Fixes the
-                  // overlap where the black-bordered box's top-right corner sat
-                  // beneath the Wide/Exit buttons. shrink-0 keeps it a fixed
-                  // strip inside the fixed-height card.
-                  ? "flex items-center justify-end gap-1.5 px-3 pt-2 pb-1 shrink-0 print:hidden"
-                  // Wide: unchanged — absolute top-right ghost cluster.
-                  : "absolute top-2 right-2 z-10 flex items-center gap-1.5 print:hidden"
-              }>
+              // Portal the control cluster to <body> so it escapes the card's
+              // `sticky z-10` stacking context. Otherwise the ready-bar popup
+              // ("Set your view size" — fixed z-40) always paints OVER these
+              // buttons no matter their z-index, because the whole card is
+              // trapped at z-10 in the root context. Fixed top-right + z-50
+              // keeps Live demo / Fullscreen visible & clickable above the
+              // popup at ANY screen size, and outside the recording crop
+              // region (card bbox unchanged → no 花屏).
+              return createPortal(
+              <div
+                className="fixed top-2 z-50 flex items-center gap-1.5 print:hidden"
+                style={{ right: adminDebugRail ? 368 : 8 }}
+              >
                 {/* "Live 演示" — narrow-tall (iPhone-ish) vs default
                     wide-flat (iPad-ish) box layout. */}
                 {onTogglePhoneMode && (
@@ -929,7 +940,8 @@ export function LiveView({
                     </span>
                   </button>
                 )}
-              </div>
+              </div>,
+              document.body
               );
             })()}
             {/* (1) Current Question — fixed-height top bar.
