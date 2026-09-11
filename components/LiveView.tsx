@@ -818,7 +818,16 @@ export function LiveView({
                 the duration. Toggling either mid-recording would move /
                 resize the Region Capture crop target → 花屏 in the saved
                 video, so we gate them off. */}
-            {(onTogglePhoneMode || onToggleFullscreen) && mounted && (() => {
+            {(onTogglePhoneMode || onToggleFullscreen) &&
+              mounted &&
+              // Only render the portaled control cluster BEFORE recording
+              // (idle / ready-bar). During recording/paused the toggles are
+              // locked anyway, and the portal (fixed z-50 top-right) would
+              // otherwise overlap and swallow clicks on the Topbar's
+              // End / Pause buttons — the operator couldn't End & Save.
+              live.status !== "recording" &&
+              live.status !== "paused" &&
+              (() => {
               const controlsLocked =
                 live.status === "recording" || live.status === "paused";
               // Portal the control cluster to <body> so it escapes the card's
