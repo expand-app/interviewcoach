@@ -55,8 +55,16 @@ export function Topbar({
   // Capture crop target → 花屏 in the saved video. The user picks the
   // layout BEFORE clicking Begin, then it's committed for the duration.
   const controlsLocked = status === "recording" || status === "paused";
+  // Only render the layout cluster BEFORE recording (idle / ready-bar).
+  // During recording/paused both toggles are disabled anyway, and their
+  // extra width is un-shrinkable (shrink-0), so keeping them in the row
+  // would push the Dock's End past the container's right edge on a
+  // narrow main column or at high page zoom — overflow:hidden then CLIPS
+  // End and the operator can't End & Save. Dropping them here keeps the
+  // recording-state row as compact as it is on main.
   const showLayoutControls =
-    Boolean(onTogglePhoneMode) || Boolean(onToggleFullscreen);
+    !controlsLocked &&
+    (Boolean(onTogglePhoneMode) || Boolean(onToggleFullscreen));
 
   return (
     <div className="h-11 border-b border-border flex items-center px-3 sm:px-5 gap-2.5 shrink-0">
