@@ -349,9 +349,19 @@ export default function Page() {
   }, []);
   const handleResumeShare = async () => {
     setShareResuming(true);
+    // Hide the banner IMMEDIATELY — before getDisplayMedia and the new
+    // MediaRecorder start — not after resumeScreenShare resolves. In
+    // fullscreen the banner overlaps #ic-capture-region, so if it were
+    // still mounted when the fresh recorder starts, the first frames after
+    // Resume would capture "Screen recording paused…" into the video.
+    // Hiding it up front removes it from any capture window in every mode.
+    // If the user cancels the share picker (resume returns false), bring
+    // it back so they can retry. The engine keeps its OWN shareEnded flag,
+    // so this React-side reset doesn't affect resumeScreenShare's guard.
+    setShareEnded(false);
     try {
       const ok = await getOrchestrator().resumeScreenShare();
-      if (ok) setShareEnded(false);
+      if (!ok) setShareEnded(true);
     } finally {
       setShareResuming(false);
     }
@@ -561,6 +571,11 @@ export default function Page() {
     interviewerProfile?: string;
   }) => {
     setShowStart(false);
+    // Clear any leftover "share paused" banner from a PRIOR session — it
+    // only auto-resets on a successful Resume, so after an End & Save while
+    // the share was down it can still be mounted. Left up, it would sit on
+    // top of this new session's ready-bar popup (both are top-14 centered).
+    setShareEnded(false);
     startLive(args.jd, args.resume, args.interviewerProfile);
     // Kick off title extraction in parallel with session start — the
     // heading defaults to "Live Interview Session" until it returns.
@@ -755,6 +770,9 @@ export default function Page() {
     if (endingRef.current) return;
     endingRef.current = true;
     setShowEnd(false);
+    // Drop the "share paused" banner if it's up — the session is ending,
+    // so there's nothing left to resume.
+    setShareEnded(false);
     // Suppress any prompts that might fire during the stop window —
     // closing-detection's hysteresis-auto-confirm timer can pop a
     // "Looks like the interview just wrapped up" prompt mid-stop and
@@ -801,6 +819,9 @@ export default function Page() {
     // questions=[]".
     if (endingRef.current) return;
     endingRef.current = true;
+    // Drop the "share paused" banner if it's up — the session is ending,
+    // so there's nothing left to resume.
+    setShareEnded(false);
 
     // Last-ditch title generation. If the user clicked Save while
     // /api/session-title was still in-flight (or had failed both
