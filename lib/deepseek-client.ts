@@ -55,10 +55,34 @@ function getProxyAgent(): HttpAgent | null {
 }
 
 /**
- * Proxy-aware fetch shim. The SDK calls this like a standard web
- * fetch. We widen the types at the boundary because the SDK's types
- * use the lib.dom fetch types while node-fetch has its own — the
- * runtime shape is compatible for the subset the SDK actually uses.
+ * deepseek-flash ships with thinking mode ENABLED by default, at
+ * `reasoning_effort: high`. In that mode the model emits a chain of
+ * thought into `reasoning_content` BEFORE it writes a single token of
+ * `content` — and both draw from the same `max_tokens` budget.
+ *
+ * Every max_tokens value in this app (40 for session-title, 200 for
+ * the classifiers, 600 for live commentary, …) was sized for a
+ * non-reasoning model. Left on, the reasoning pass silently eats the
+ * whole budget on any prompt it finds non-trivial and the route gets
+ * back an empty string — no exception, no error status, full billing,
+ * and `finish_reason: "stop"`. It is prompt-dependent, so it presents
+ * as routes randomly returning nothing.
+ *
+ * Disabling it restores the behavior contract the call sites were
+ * written against, and keeps first-token latency low for the streamed
+ * commentary path. This is injected here, in the transport, rather
+ * than at the ~15 call sites on purpose: a call site that forgets the
+ * flag reintroduces a silent, intermittent, billable bug.
+ */
+const THINKING_DISABLED = { type: "disabled" } as const;
+
+/**
+ * Proxy-aware fetch shim, which also stamps `thinking: disabled` onto
+ * every outgoing chat-completion request body (see above).
+ *
+ * We widen the types at the boundary because the SDK's types use the
+ * lib.dom fetch types while node-fetch has its own — the runtime
+ * shape is compatible for the subset the SDK actually uses.
  */
 async function proxyAwareFetch(
   input: string | URL,
@@ -66,8 +90,24 @@ async function proxyAwareFetch(
 ): Promise<Response> {
   const agent = getProxyAgent();
   const url = typeof input === "string" ? input : input.toString();
+
+  let body = init?.body;
+  if (typeof body === "string" && url.includes("/chat/completions")) {
+    try {
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      // Respect an explicit per-call override; only default it.
+      if (parsed.thinking === undefined) {
+        parsed.thinking = THINKING_DISABLED;
+        body = JSON.stringify(parsed);
+      }
+    } catch {
+      /* non-JSON body — pass through untouched */
+    }
+  }
+
   const nfInit: NodeFetchInit = {
     ...(init as unknown as NodeFetchInit),
+    body: body as NodeFetchInit["body"],
     agent: agent ?? undefined,
   };
   const res = await nodeFetch(url, nfInit);
