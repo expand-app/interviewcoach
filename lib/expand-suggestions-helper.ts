@@ -17,7 +17,7 @@
  * so the same session doesn't double-fire if multiple opens hit fast.
  */
 
-import { getAnthropicClient } from "./anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "./deepseek-client";
 import { query, withTx } from "./db";
 import { logSessionEvent, logSessionEvents } from "./session-event-log";
 
@@ -183,18 +183,16 @@ ${itemsBlock}
 
 Write the JSON.`;
 
-    const client = getAnthropicClient();
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
+    const client = getDeepseekClient();
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 8000,
-      system,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
-    const text = resp.content
-      .filter((c) => c.type === "text")
-      .map((c) => (c as { text: string }).text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: { expansions?: Array<{ commentId: string; text: string }> };
     try {

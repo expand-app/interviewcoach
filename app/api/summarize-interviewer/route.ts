@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -26,10 +25,10 @@ interface Body {
  * summary isn't ready, so failure here is non-fatal.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set", fallback: true },
+      { error: "DEEPSEEK_API_KEY not set", fallback: true },
       { status: 200 }
     );
   }
@@ -70,13 +69,15 @@ Write the JSON.`;
 
   // Retry shape mirrors the other Haiku-backed routes.
   async function callWithRetry() {
-    const client = getAnthropicClient();
+    const client = getDeepseekClient();
     const doCall = () =>
-      client.messages.create({
-        model: "claude-haiku-4-5-20251001",
+      client.chat.completions.create({
+        model: DEEPSEEK_MODEL,
         max_tokens: 400,
-        system,
-        messages: [{ role: "user", content: user }],
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
       });
     const MAX_ATTEMPTS = 2;
     let lastErr: unknown = null;
@@ -105,11 +106,7 @@ Write the JSON.`;
 
   try {
     const resp = await callWithRetry();
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: { summary?: string } = {};
     try {

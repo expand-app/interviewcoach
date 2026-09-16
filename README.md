@@ -48,9 +48,9 @@ Browser mic
 npm install
 ```
 
-### 2. Get an Anthropic API key
+### 2. Get a DeepSeek API key
 
-https://console.anthropic.com/ → API Keys → Create Key
+https://platform.deepseek.com/api_keys → Create new API key
 
 ### 3. Configure env
 

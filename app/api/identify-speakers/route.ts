@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -21,10 +20,10 @@ interface IdentifyBody {
  * later when more text accumulates.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set" },
+      { error: "DEEPSEEK_API_KEY not set" },
       { status: 500 }
     );
   }
@@ -37,7 +36,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ roles: {} });
   }
 
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
 
   const system = `You identify the role of each speaker in a recorded interview.
 
@@ -75,18 +74,16 @@ ${formatted}
 Classify each speaker number you have enough evidence for.`;
 
   try {
-    const resp = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 200,
-      system,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
 
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: Record<string, string> = {};
     try {

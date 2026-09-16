@@ -1,4 +1,4 @@
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -63,9 +63,9 @@ interface CommentaryBody {
  * every ~80 words of new answer text).
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
-    return new Response("ANTHROPIC_API_KEY not set", { status: 500 });
+    return new Response("DEEPSEEK_API_KEY not set", { status: 500 });
   }
 
   const body = (await req.json()) as CommentaryBody;
@@ -117,7 +117,7 @@ ${trimmedProfile}
     return new Response("Missing candidateQuestion", { status: 400 });
   }
 
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
 
   // ==== SUGGESTED-ANSWER BLOCK (shared across all 4 modes / 6 prompts) ====
   // The user wants every commentary / hint to end with a tiny English
@@ -519,25 +519,22 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
 
       try {
-        // Sonnet 4.5 — chosen over Opus for live commentary: much lower
-        // first-token latency (the comment lands while the candidate is
-        // still on the topic), ~1/5 the cost, and near-Opus quality on
-        // this read-the-answer-and-coach task. Streamed token-by-token,
-        // so the candidate sees text almost immediately.
-        const messageStream = client.messages.stream({
-          model: "claude-sonnet-4-5",
+        // Streamed token-by-token so the comment starts landing while
+        // the candidate is still on the topic — first-token latency
+        // matters far more here than total completion time.
+        const messageStream = await client.chat.completions.create({
+          model: DEEPSEEK_MODEL,
           max_tokens: 600,
-          system: systemForMode,
-          messages: [{ role: "user", content: userMsg }],
+          stream: true,
+          messages: [
+            { role: "system", content: systemForMode },
+            { role: "user", content: userMsg },
+          ],
         });
 
-        for await (const event of messageStream) {
-          if (
-            event.type === "content_block_delta" &&
-            event.delta.type === "text_delta"
-          ) {
-            send({ type: "delta", text: event.delta.text });
-          }
+        for await (const chunk of messageStream) {
+          const delta = chunk.choices[0]?.delta?.content;
+          if (delta) send({ type: "delta", text: delta });
         }
         send({ type: "done" });
       } catch (e) {

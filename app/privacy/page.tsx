@@ -124,7 +124,7 @@ export default function PrivacyPage() {
       </p>
       <h3>AI providers</h3>
       <p>
-        We send text snippets to AI providers (such as Anthropic) to
+        We send text snippets to AI providers (such as DeepSeek) to
         generate coaching. These providers process the data to return a
         response and do not retain it for training under our enterprise
         agreements.

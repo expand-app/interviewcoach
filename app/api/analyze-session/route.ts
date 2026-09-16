@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 // Analysis is a single Opus call with a large context (full log +
@@ -57,7 +56,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "missing log" }, { status: 400 });
   }
 
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
 
   const system = `You are an expert QA engineer for "puebulo", a live
 coaching app that listens to interviews and overlays real-time AI
@@ -191,20 +190,15 @@ ${userCommentsBlock}
 Produce JSON with your findings.`;
 
   try {
-    // Sonnet 4.5 — this is an internal batch diagnostic (not user-
-    // facing, low call volume); Sonnet handles the structured
-    // transcript+log analysis well at a fraction of Opus's cost.
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 8000,
-      system,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: { summary?: string; findings?: Finding[] } = {};
     try {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -141,14 +141,14 @@ Rules:
 Return ONLY the JSON object, no markdown fences.`;
 
   try {
-    const client = getAnthropicClient();
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
+    const client = getDeepseekClient();
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 3000,
       messages: [{ role: "user", content: prompt }],
     });
     const text =
-      resp.content[0]?.type === "text" ? resp.content[0].text : "";
+      resp.choices[0]?.message?.content ?? "";
     // Tolerate accidental markdown fences.
     const jsonText = text
       .replace(/^\s*```(?:json)?\s*/i, "")

@@ -86,7 +86,7 @@ const REASONING: Record<
   },
   "classify:error": {
     what: "classify-moment request failed.",
-    why: "Usually an Anthropic API hiccup. Swallowed; next trigger retries.",
+    why: "Usually a DeepSeek API hiccup. Swallowed; next trigger retries.",
   },
   "moment:transit": {
     what: "Moment state machine changed phase (e.g. interviewer_speaking → question_finalized).",
@@ -116,11 +116,11 @@ const REASONING: Record<
   },
   "commentary:error": {
     what: "Commentary API failed.",
-    why: "Check the Anthropic key + proxy config (lib/anthropic-client.ts " +
+    why: "Check the DeepSeek key + proxy config (lib/deepseek-client.ts " +
       "handles the HTTPS_PROXY edge case).",
   },
   "commentary:api-err": {
-    what: "Upstream Anthropic API returned an error mid-stream.",
+    what: "Upstream DeepSeek API returned an error mid-stream.",
     why: "Stream continues for other deltas but final commentary is partial.",
   },
   "listen-hint:request": {
@@ -139,7 +139,7 @@ const REASONING: Record<
     why: "Same root-cause pool as commentary errors.",
   },
   "listen-hint:api-err": {
-    what: "Upstream Anthropic API errored during listening-hint stream.",
+    what: "Upstream DeepSeek API errored during listening-hint stream.",
     why: "Partial hint text may have been written before error.",
   },
   "filter:L1-pass": {
@@ -220,7 +220,7 @@ const REASONING: Record<
   },
   "warmup-cmt:error": {
     what: "Warm-up commentary API call failed.",
-    why: "Anthropic API or network hiccup. Swallowed; next candidate utterance may re-trigger.",
+    why: "DeepSeek API or network hiccup. Swallowed; next candidate utterance may re-trigger.",
   },
 };
 

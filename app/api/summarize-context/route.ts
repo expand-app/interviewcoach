@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -37,10 +36,10 @@ interface Body {
  * retry or just leave the Context block hidden.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set", fallback: true },
+      { error: "DEEPSEEK_API_KEY not set", fallback: true },
       { status: 200 }
     );
   }
@@ -87,16 +86,18 @@ ${hasResume ? `Candidate resume:\n"""\n${resume.slice(0, 4000)}\n"""\n` : "(No c
 ${hasInterviewer ? `Interviewer profile (raw paste — extract the essentials):\n"""\n${interviewerProfile.slice(0, 4000)}\n"""\n` : "(No interviewer profile provided.)\n"}
 Write the JSON.`;
 
-  // Same retry shape as the other Anthropic-backed routes — one
+  // Same retry shape as the other model-backed routes — one
   // ECONNRESET shouldn't lose the summary. 2 attempts, 2s backoff.
   async function callWithRetry() {
-    const client = getAnthropicClient();
+    const client = getDeepseekClient();
     const doCall = () =>
-      client.messages.create({
-        model: "claude-haiku-4-5-20251001",
+      client.chat.completions.create({
+        model: DEEPSEEK_MODEL,
         max_tokens: 600,
-        system,
-        messages: [{ role: "user", content: user }],
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
       });
     const MAX_ATTEMPTS = 2;
     let lastErr: unknown = null;
@@ -125,11 +126,7 @@ Write the JSON.`;
 
   try {
     const resp = await callWithRetry();
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: {
       jdSummary?: string;

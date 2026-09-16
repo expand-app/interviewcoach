@@ -566,7 +566,7 @@ export default function Page() {
     // heading defaults to "Live Interview Session" until it returns.
     //
     // The route returns `{ title, fallback?: true }`. `fallback: true`
-    // means Anthropic was unreachable / rate-limited / returned empty —
+    // means the model provider was unreachable / rate-limited / returned empty —
     // we got the generic placeholder back, not a real generated title.
     // In that case we retry once after 2.5s; one transient blip
     // shouldn't permanently leave the user staring at "Live Interview

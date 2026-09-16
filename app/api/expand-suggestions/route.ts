@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 import { logSessionEvent, logSessionEvents } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
@@ -149,18 +148,20 @@ async function expandSingle(
   jd: string,
   resume: string
 ): Promise<string | null> {
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
   const user = buildUserPrompt(item, jd, resume);
 
   const doCall = () =>
-    client.messages.create({
+    client.chat.completions.create({
       // Smaller per-item prompt + simpler output shape lets us cap
       // tokens MUCH lower than the batch call's 8000. 800 covers the
       // 220-word target with margin.
-      model: "claude-sonnet-4-5",
+      model: DEEPSEEK_MODEL,
       max_tokens: 800,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: user },
+      ],
     });
 
   const MAX_ATTEMPTS = 2;
@@ -168,11 +169,7 @@ async function expandSingle(
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       const resp = await doCall();
-      const text = resp.content
-        .filter((c): c is Anthropic.TextBlock => c.type === "text")
-        .map((c) => c.text)
-        .join("")
-        .trim();
+      const text = (resp.choices[0]?.message?.content ?? "").trim();
 
       let parsed: { text?: string } = {};
       try {
@@ -255,10 +252,10 @@ async function mapWithConcurrency<T, R>(
 }
 
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set", fallback: true },
+      { error: "DEEPSEEK_API_KEY not set", fallback: true },
       { status: 200 }
     );
   }
@@ -298,7 +295,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ expansions: [] });
   }
 
-  // Concurrency tuned to comfortably stay under Anthropic's per-org
+  // Concurrency tuned to comfortably stay under DeepSeek's per-org
   // RPM limit (50 RPM at Tier 1). 8 parallel × ~10s/call → ~12s
   // wall-clock for 8 items, ~25s for 30 items. Higher concurrency
   // saves only marginal time and risks 429 floods that we'd then

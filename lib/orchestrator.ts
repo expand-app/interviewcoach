@@ -1288,7 +1288,7 @@ export class LiveOrchestrator {
    * attempts failed. `onDelta` is called with the running accumulated
    * string as each chunk arrives; the caller uses it to update the
    * store. `onApiError` is called if the stream itself carries an
-   * `{type:"error"}` event (upstream Anthropic error) — embedded
+   * `{type:"error"}` event (upstream model-provider error) — embedded
    * errors do NOT trigger retry (the API explicitly declined).
    */
   private async streamCommentarySSE(
@@ -2596,7 +2596,7 @@ export class LiveOrchestrator {
     // the SAME imaginary Q over and over ("Tell me about yourself"
     // proposed 6 times in 40s even though it was never asked). Remember
     // texts we've already rejected and skip them without re-running
-    // Layer 1/2/3. Saves significant Anthropic budget + noise.
+    // Layer 1/2/3. Saves significant model budget + noise.
     const normalized = this.normalizeQText(text);
     if (this.rejectedQTexts.has(normalized)) {
       log("filter", "L0-cached-reject", {
