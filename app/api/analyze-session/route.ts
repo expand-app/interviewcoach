@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
-// Analysis is a single Opus call with a large context (full log +
+// Analysis is a single model call with a large context (full log +
 // transcript). 3 minutes is plenty; requests have timed out at 60s
 // on Vercel free, so we bump the ceiling.
 export const maxDuration = 300;
@@ -38,7 +38,7 @@ interface Finding {
  * Auto-diagnose a puebulo session.
  *
  * Given the debug log (events + timestamps) and the transcript (what
- * was actually said), an Opus-4.7 pass identifies behavioral bugs and
+ * was actually said), a DeepSeek pass identifies behavioral bugs and
  * coaching-quality issues in the orchestrator. Returns a structured
  * list the user can review and selectively export to Claude Code for
  * implementation.
@@ -73,13 +73,13 @@ Speech pipeline:
   assigned the opposite role.
 
 State machine (per-utterance):
-- classify-moment (Haiku) decides: chitchat / interviewer_speaking /
+- classify-moment (DeepSeek) decides: chitchat / interviewer_speaking /
   question_finalized, with a questionRelation (new_topic / follow_up / null).
 - When question_finalized fires, a 4-layer filter gates the commit:
   L0: reject-cache for repeat hallucinations
   L1: text grounding — Q tokens must appear in recent interviewer
       transcript (≥50% overlap)
-  L2: parallel Haiku "is this really a question or still setup?" verdict
+  L2: parallel "is this really a question or still setup?" verdict
   L3: 3-second continuation gate — interviewer must go silent for 3s
 - Restatement gate: within 10s of a Lead commit, similar Qs are dropped
   to avoid double-locking (Jaccard ≥ 0.5).

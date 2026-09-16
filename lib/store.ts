@@ -195,7 +195,7 @@ interface StoreState {
   setLiveTitle: (title: string) => void;
   /** Rolling window of finalized utterances (newest last). */
   liveUtterances: Utterance[];
-  /** Map of Deepgram speaker number → resolved role. Set as Haiku identifies
+  /** Map of Deepgram speaker number → resolved role. Set as the model identifies
    *  speakers; once set, sticks for the rest of the session. */
   liveSpeakerRoles: Record<number, "interviewer" | "candidate">;
   /** Current "moment" — drives the top bar's three-state display. */

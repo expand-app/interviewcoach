@@ -116,11 +116,25 @@ Replace `lib/audioSession.ts` with a WebSocket-based Deepgram streaming version.
 
 ---
 
-## Cost estimate (Anthropic only, Web Speech API is free)
+## Cost estimate (DeepSeek only, Web Speech API is free)
 
-- **Claude Haiku** for question detection: ~$0.001 per utterance × ~50 utterances per interview ≈ **$0.05 per interview**
-- **Claude Sonnet** for commentary: ~$0.01 per comment × ~15 comments per interview ≈ **$0.15 per interview**
+Published `deepseek-flash` rates (off-peak; peak hours are 2x):
 
-**Total: ~$0.20 per 30-minute interview.**
+| | per 1M tokens |
+|---|---|
+| input, cache miss | $0.15 |
+| input, cache hit | $0.003 |
+| output | $0.60 |
 
-If this adds up, you can swap Sonnet → Haiku in `app/api/commentary/route.ts` for 1/10th the cost (lower quality commentary, but often still useful).
+Repeated system prompts — the commentary coach prompt, the scoring
+rubric — are cached automatically, so a busy session pays the cache-hit
+rate on most of its input.
+
+A 30-minute interview runs on the order of **$0.02-0.04**. Treat that as
+an order of magnitude, not a quote: the rates above are published, but
+the call volume behind the estimate (roughly 50 question-detection
+calls, 15 commentary streams, one scorecard, plus titles and summaries)
+is an assumption that has not been measured against production traffic.
+
+Every route shares one model, so there is no cheap-tier/expensive-tier
+tradeoff to tune — cost scales with call volume and prompt size only.

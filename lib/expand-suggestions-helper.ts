@@ -3,14 +3,14 @@
  *
  * Mirrors the lib/transcode.ts pattern: when GET /api/sessions/:id sees
  * a session whose comments still have brief Try blocks but no
- * `expanded_suggestion` rows, kick off a background Sonnet call that
+ * `expanded_suggestion` rows, kick off a background model call that
  * generates full deliverable answers and writes them back to the
  * comments table. The next time the user opens the session, the
  * expansions are there.
  *
  * Why not rely on the existing /api/expand-suggestions route fired
  * from the client at endLive: that path was unreliable in practice —
- * a slow upsert (Aurora cold start), a transient Sonnet hiccup, or
+ * a slow upsert (Aurora cold start), a transient model hiccup, or
  * the user navigating away mid-flight all left the session with no
  * expansions and no obvious recovery path. Server-side lazy backfill
  * runs whenever someone opens the past view, with in-memory dedupe
@@ -210,7 +210,7 @@ Write the JSON.`;
         e.text.trim().length > 0
     );
     if (expansions.length === 0) {
-      console.warn("[expand-backfill] sonnet returned 0 expansions for", sessionId);
+      console.warn("[expand-backfill] model returned 0 expansions for", sessionId);
       logSessionEvent(sessionId, {
         source: "expand-backfill",
         event: "no-expansions-returned",
@@ -238,7 +238,7 @@ Write the JSON.`;
       elapsedMs,
     });
 
-    // Per-item failures vs successes. The Sonnet single-batch call may
+    // Per-item failures vs successes. The single-batch model call may
     // omit some items entirely (it's instructed to skip when there's
     // nothing useful to expand) — capture which commentIds DIDN'T
     // come back so a future debug session can tell silent-skip from

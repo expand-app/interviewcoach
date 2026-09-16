@@ -12,7 +12,7 @@ interface TitleBody {
  * Extracts a concise session title from the JD (and optionally the
  * resume, for context) — used as the heading on the live view and as
  * the default name when saving the session. Kept deliberately short:
- * one line, role + company if present, nothing fancy. Haiku is plenty
+ * one line, role + company if present, nothing fancy. the model is plenty
  * for this and keeps latency low.
  *
  * Examples of good output:

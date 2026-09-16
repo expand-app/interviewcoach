@@ -70,14 +70,14 @@ const REASONING: Record<
       "tag disambiguates the pair, the other side auto-fills.'",
   },
   "classify:request": {
-    what: "classify-moment fired (Opus 4.7) to decide state transitions.",
+    what: "classify-moment fired (DeepSeek) to decide state transitions.",
     why: "Debounced 2s after the last utterance OR when silence timer " +
       "elapses. Gated on rolesConfirmed so we don't classify 'Speaker 1/2' " +
       "garbage.",
   },
   "classify:response": {
     what: "Classifier returned a state + optional new question text.",
-    why: "Opus 4.7 interprets the recent dialogue vs. current state. " +
+    why: "DeepSeek interprets the recent dialogue vs. current state. " +
       "questionRelation (new_topic | follow_up | same) decides lead vs. probe.",
   },
   "classify:empty": {
@@ -447,7 +447,7 @@ export function LiveDebugPanel() {
 
   /**
    * Auto-diagnosis flow. Sends the current log + extracted transcript
-   * + user comments to /api/analyze-session, which runs an Opus-4.7
+   * + user comments to /api/analyze-session, which runs a DeepSeek
    * pass over everything to identify bugs and improvement opportunities
    * in the orchestrator's behavior. Returns a structured list of
    * findings (severity, category, timestamp, fix proposal) that gets
@@ -654,7 +654,7 @@ export function LiveDebugPanel() {
             onClick={analyzeSession}
             disabled={analyzing || entries.length === 0}
             className="flex-1 btn btn-primary"
-            title="Run auto-diagnosis: an Opus pass over the session's log + transcript, returns a list of bugs / improvements. Copied as markdown for pasting into Claude."
+            title="Run auto-diagnosis: a DeepSeek pass over the session's log + transcript, returns a list of bugs / improvements. Copied as markdown for pasting into Claude."
           >
             {analyzing ? "Analyzing…" : "Analyze & copy"}
           </button>

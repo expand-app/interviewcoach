@@ -75,7 +75,7 @@ interface ClassifyBody {
  *   - Candidate substantive-answer threshold lowered to 20 chars
  *   - Filler / transition words ("so...", "uh let me think", "and also...")
  *     do NOT count as the interviewer being done
- *   - Haiku must verify the accumulated interviewer text has a complete
+ *   - the model must verify the accumulated interviewer text has a complete
  *     question structure before allowing question_finalized
  */
 export async function POST(req: Request) {
@@ -586,7 +586,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
   // catch the typical rate-limit / socket-blip / brief upstream outage
   // cases. 4xx (except 429) are NOT retried — they're parameter
   // problems that won't succeed a second time.
-  async function callHaikuWithRetry() {
+  async function callModelWithRetry() {
     const doCall = () =>
       client.chat.completions.create({
         model: DEEPSEEK_MODEL,
@@ -633,7 +633,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
   }
 
   try {
-    const resp = await callHaikuWithRetry();
+    const resp = await callModelWithRetry();
 
     const text = (resp.choices[0]?.message?.content ?? "").trim();
 
@@ -675,7 +675,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
         : "";
     // Server-side guard against the model echoing interviewer hand-off
     // lines into candidateQuestion. Even with the explicit
-    // CANDQ-ATTRIBUTION rule in the prompt, Haiku occasionally fills
+    // CANDQ-ATTRIBUTION rule in the prompt, the model occasionally fills
     // candQ with the interviewer's "what questions do you have" text
     // when the candidate hasn't asked yet. Compare candQ against the
     // recent interviewer utterances; if there's clear text overlap,

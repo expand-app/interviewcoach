@@ -27,7 +27,7 @@ interface Body {
  * input was blank or the model returned empty text — the caller
  * treats either as "skip that row".
  *
- * One Haiku call per (jd | resume | interviewer) — all three summaries
+ * One model call per (jd | resume | interviewer) — all three summaries
  * fit comfortably in a single 500-token response so we make ONE call
  * with structured sections in the prompt.
  *

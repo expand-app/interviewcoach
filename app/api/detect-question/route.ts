@@ -13,9 +13,8 @@ interface DetectBody {
 /**
  * Returns { isQuestion: boolean, question?: string }.
  *
- * Claude Haiku is used here because it's fast and cheap — we call this on
- * every finalized utterance, and we don't want to pay Sonnet rates for a
- * boolean classification.
+ * Kept on a tight max_tokens budget: this fires on every finalized
+ * utterance, and the answer is a boolean plus a short string.
  *
  * "question" in the response is the normalized question text (trimmed,
  * cleaned up), useful because Deepgram sometimes returns fragments like

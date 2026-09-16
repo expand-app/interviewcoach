@@ -12,7 +12,7 @@ export const runtime = "nodejs";
  * depth where the original interviewer probed — but with freshly
  * worded questions so the user can't just replay a memorized answer.
  *
- * One Sonnet call at retake start (the modal shows a loading state).
+ * One model call at retake start (the modal shows a loading state).
  * The client keeps the plan in memory for the whole call; it is not
  * persisted (refresh mid-retake loses the run — same contract as a
  * live session).

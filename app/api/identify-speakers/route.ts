@@ -15,7 +15,7 @@ interface IdentifyBody {
  *
  * Returns: { roles: { "0": "Interviewer", "1": "Candidate", ... } }
  *
- * If a speaker hasn't said enough to tell, Haiku is instructed to omit them
+ * If a speaker hasn't said enough to tell, the model is instructed to omit them
  * — caller should keep showing the placeholder ("Speaker N") and try again
  * later when more text accumulates.
  */

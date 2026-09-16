@@ -362,7 +362,7 @@ export async function POST(req: Request) {
   // session with two throwaway answers. For retakes, answerText is
   // ground truth (realtime transcripts), so the bar is mechanical:
   // ≥3 answered questions (≥60 chars each) totaling ≥1000 chars, or
-  // no scorecard. Deterministic, reproducible, and saves a Sonnet call.
+  // no scorecard. Deterministic, reproducible, and saves a model call.
   if (isRetake && (questionsWithAnswers < 3 || totalAnswerChars < 1000)) {
     const summary = `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithAnswers} with substantive candidate answers (${totalAnswerChars} chars total) over ${Math.round(durationSeconds / 60)} min. Full scoring needs ≥ 3 answered questions totaling ≥ 1000 chars of candidate speech.`;
     const score: SessionScore = {
@@ -736,14 +736,14 @@ INSUFFICIENT gate: requires questionsWithEvidence < 3 AND totalEvidenceChars < 1
 
 Score the interview. Return JSON only.`;
 
-  // Diagnostic: log the rough prompt size before firing. Sonnet 4.5
+  // Diagnostic: log the rough prompt size before firing. deepseek-flash
   // handles ~200K input tokens but the bigger risk is route latency at
   // ~5K-tokens-per-1K-chars rates → 30s+ generation on huge prompts.
   // Helps explain a hang as "too big" rather than "API down".
   const systemChars = system.length;
   const userChars = user.length;
   const estTokens = Math.ceil((systemChars + userChars) / 3.5);
-  console.log("[score-session] calling Sonnet:", {
+  console.log("[score-session] calling the model:", {
     systemChars,
     userChars,
     estTokens,
@@ -756,7 +756,7 @@ Score the interview. Return JSON only.`;
   // once after 2.5s on transient errors (network drops, upstream
   // overload, rate limits). 4xx errors that aren't 429 are NOT
   // retried — they're parameter problems that won't succeed twice.
-  // 2 total attempts (not 3) because each Sonnet call is 30-40s
+  // 2 total attempts (not 3) because each model call is 30-40s
   // wall-clock — a third attempt would push past most users'
   // patience and the 90s client-side timeout.
   async function callModelWithRetry() {
@@ -889,11 +889,11 @@ Score the interview. Return JSON only.`;
     // declined" we both catch here:
     //   (1) Explicit: parsed.insufficient === true. Cleanest signal.
     //   (2) Implicit: model emitted dimensions but every dimension's
-    //       score is null. With temperature: 0 we've seen Sonnet
+    //       score is null. With temperature: 0 we've seen the model
     //       prefer this shape over the explicit insufficient flag —
     //       same effect (no useful score), different JSON.
     //
-    // Sonnet sometimes wobbles into one of these on perfectly
+    // the model sometimes wobbles into one of these on perfectly
     // gradable sessions; we caught the pattern on a 35-minute /
     // 12-question / 15K-char interview that re-scored "insufficient"
     // SIX times and produced a real `pass` only on the seventh.
@@ -902,7 +902,7 @@ Score the interview. Return JSON only.`;
     // the model thinks the answers are too "abstract" — wrong
     // judgment per server-side stats.
     //
-    // Override path: re-prompt Sonnet with a stricter system
+    // Override path: re-prompt the model with a stricter system
     // addendum that REMOVES the decline option entirely. If the
     // retry still declines, we accept it and surface the override
     // attempt in the summary.
@@ -928,8 +928,9 @@ Score the interview. Return JSON only.`;
     //       would short-circuit anyway.
     //   (e) Combination — weight=0 + score=null on every dim. The
     //       single most common "decline" shape from temperature: 0
-    //       Sonnet on the Uber session that triggered this whole
-    //       investigation.
+    //       on the Uber session that triggered this whole
+    //       investigation (observed on Claude Sonnet, the model in
+    //       use at the time).
     const dims = Array.isArray(parsed.dimensions) ? parsed.dimensions : null;
     const dimsMissingOrEmpty = !dims || dims.length === 0;
     const allScoresNullish =
@@ -1141,7 +1142,7 @@ Score the interview. Return JSON only.`;
     //   1) Model emits `weight` for each dimension (preferred, new path).
     //   2) Model omits weight entirely → fall back to canonical defaults
     //      (20/25/25/15/15) so we DON'T misclassify the session as
-    //      insufficient just because Sonnet reverted to its older
+    //      insufficient just because the model reverted to an older
     //      score-only output shape.
     //   3) Model emits weight on SOME dims but not others → fill the
     //      gaps from defaults proportionally.
@@ -1210,7 +1211,7 @@ Score the interview. Return JSON only.`;
 
     // Enforce sum-of-weights = 100. Renormalize on the fly when the
     // model's weights drift (we ask for sum=100 in the prompt, but
-    // Sonnet occasionally returns 95 or 105). Scale every weight + the
+    // the model occasionally returns 95 or 105). Scale every weight + the
     // active scores by the same factor so percentages stay consistent
     // with what the model intended. After this pass dimensionsOut.max
     // sums to exactly 100 and dimensionsOut.score (when not null) is

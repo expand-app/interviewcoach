@@ -4,7 +4,7 @@ import { logSessionEvent, logSessionEvents } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
 // Bump the per-request server timeout. The end-of-session expand kicks
-// off N parallel Sonnet calls; even with concurrency=8 a 30-question
+// off N parallel model calls; even with concurrency=8 a 30-question
 // session may need ~25-40s if the slowest item lags. Default Next.js
 // route timeout in production is 30s on EB — without this directive
 // the gateway 504's before the route can respond.
@@ -58,10 +58,10 @@ interface Body {
  * without a Try block (e.g. listening hints) are simply not in the
  * output. Failed expansions are also omitted (silent partial success).
  *
- * Architecture: N Sonnet calls FAN OUT in parallel (concurrency 8),
+ * Architecture: N model calls FAN OUT in parallel (concurrency 8),
  * one per Try item. Each call is small (one item's worth of context)
  * so wall-clock is bounded by the slowest single call (~5-15s) plus
- * concurrency-bucket waits. Replaces the old "single Sonnet call for
+ * concurrency-bucket waits. Replaces the old "single model call for
  * all items" path which sequentialized inside the model — total
  * generation time scaled linearly with item count and could top 50s
  * on long sessions. Per-item parallel keeps wall-clock roughly
@@ -141,7 +141,7 @@ Brief Try: ${item.brief}
 Write the JSON.`;
 }
 
-/** Single-item Sonnet call with 1 retry on transient errors. Returns
+/** Single-item model call with 1 retry on transient errors. Returns
  *  the expanded text or null on failure / empty output. */
 async function expandSingle(
   item: Item,
@@ -295,11 +295,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ expansions: [] });
   }
 
-  // Concurrency tuned to comfortably stay under DeepSeek's per-org
-  // RPM limit (50 RPM at Tier 1). 8 parallel × ~10s/call → ~12s
-  // wall-clock for 8 items, ~25s for 30 items. Higher concurrency
-  // saves only marginal time and risks 429 floods that we'd then
-  // have to retry.
+  // 8 parallel × ~10s/call → ~12s wall-clock for 8 items, ~25s for
+  // 30 items. Higher concurrency saves only marginal time and risks
+  // 429 floods that we'd then have to retry.
+  //
+  // NOTE: this number was tuned against Anthropic's rate limits and
+  // has NOT been re-measured against DeepSeek's, which throttle
+  // differently. If end-of-session expansion starts throwing 429s,
+  // this is the knob.
   const CONCURRENCY = 8;
 
   if (sessionId) {
