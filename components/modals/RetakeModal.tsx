@@ -23,7 +23,7 @@ interface Props {
  * The JD and interviewer context carry over from the original session
  * unchanged (read-only here). The resume is editable — re-practicing
  * with an updated resume is a core use case. "Generate & start" runs
- * /api/retake/plan (one Sonnet call, ~5-10s) and only hands off to
+ * /api/retake/plan (one model call, ~5-10s) and only hands off to
  * the call view once a structurally valid plan exists.
  */
 export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
@@ -32,7 +32,7 @@ export function RetakeModal({ open, parent, onCancel, onStart }: Props) {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
   const [jdExpanded, setJdExpanded] = useState(false);
-  // Two-step flow: Generate (slow, 5-10s Sonnet call) → separate
+  // Two-step flow: Generate (slow, 5-10s model call) → separate
   // "Start interview" click. The second click is NOT just UX — the
   // browser's autoplay policy requires a FRESH user gesture right
   // before the AudioContexts + mic/camera acquisition happen, or the

@@ -67,7 +67,7 @@ export interface MomentState {
 
 /** A finalized chunk of transcript. The role (interviewer/candidate) is
  *  NOT stored — it's derived at render time from the session's speaker-role
- *  map, so identity changes (after Haiku identification) automatically
+ *  map, so identity changes (after model identification) automatically
  *  re-label all historical utterances. */
 export interface Utterance {
   id: string;

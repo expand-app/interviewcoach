@@ -10,6 +10,15 @@
       ],
       "port": 3000,
       "autoPort": true
+    },
+    {
+      "name": "pr2-probe",
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": [
+        "-c",
+        "export PATH=\"$HOME/.local/node-v24.17.0-darwin-arm64/bin:$PATH\"; cd /tmp/claude-501/-Users-dq-Desktop-puebulo/1f6cca84-0036-49e1-bb1b-1abce0208b51/scratchpad/wt-pr2; npm run dev -- -p 3022"
+      ],
+      "port": 3022
     }
   ]
 }

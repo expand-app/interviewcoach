@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -13,18 +13,17 @@ interface DetectBody {
 /**
  * Returns { isQuestion: boolean, question?: string }.
  *
- * Claude Haiku is used here because it's fast and cheap — we call this on
- * every finalized utterance, and we don't want to pay Sonnet rates for a
- * boolean classification.
+ * Kept on a tight max_tokens budget: this fires on every finalized
+ * utterance, and the answer is a boolean plus a short string.
  *
  * "question" in the response is the normalized question text (trimmed,
  * cleaned up), useful because Deepgram sometimes returns fragments like
  * "so uh tell me about yourself".
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "ANTHROPIC_API_KEY not set" }, { status: 500 });
+    return NextResponse.json({ error: "DEEPSEEK_API_KEY not set" }, { status: 500 });
   }
 
   const body = (await req.json()) as DetectBody;
@@ -33,7 +32,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ isQuestion: false });
   }
 
-  const client = new Anthropic({ apiKey });
+  const client = getDeepseekClient();
 
   const system = `You are a classifier inside a live interview assistant. You decide if the latest utterance from the transcript stream is the interviewer asking a NEW question.
 
@@ -57,18 +56,16 @@ ${utterance}
 """`;
 
   try {
-    const resp = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 200,
-      system,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
 
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     // Try to parse as strict JSON, falling back to extracting the first {...}.
     let parsed: { isQuestion?: boolean; question?: string } = {};

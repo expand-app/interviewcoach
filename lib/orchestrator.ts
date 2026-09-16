@@ -104,7 +104,7 @@ const IDENTIFY_CONTEXT_CAP           = 24;
 const IDENTIFY_REFRESH_UTTERANCES_PRE_CONFIRM  = 3;
 /** Post-confirmation cadence: once both roles are committed, re-evaluate
  *  periodically as a REVIEW mechanism. Not aggressive — just often
- *  enough that if the early commit was wrong, Haiku has multiple
+ *  enough that if the early commit was wrong, the model has multiple
  *  chances to flip it once it has richer context. */
 const IDENTIFY_REFRESH_UTTERANCES_POST_CONFIRM = 10;
 /** Consecutive identify runs that must propose the SAME role before we
@@ -424,7 +424,7 @@ export class LiveOrchestrator {
   private identifyLastUtteranceCount = 0;
   /** Last identify-speakers result. Used to require two consecutive
    *  agreeing runs before we overwrite an existing role assignment —
-   *  prevents lane content from flipping when Haiku is borderline and
+   *  prevents lane content from flipping when the model is borderline and
    *  its answer oscillates between runs. */
   private lastIdentifyResult: Record<number, "interviewer" | "candidate"> = {};
   /** Per-speaker count of consecutive identify runs that agreed with the
@@ -433,7 +433,7 @@ export class LiveOrchestrator {
    *  streak reaches IDENTIFY_CONFIDENCE_THRESHOLD and the pending role
    *  differs from the committed one, we commit (or flip) the role. Live
    *  sessions never hard-lock — identify keeps running periodically so
-   *  a wrong early commit can flip back once Haiku sees more context. */
+   *  a wrong early commit can flip back once the model sees more context. */
   private roleAgreementStreak: Record<number, number> = {};
   /** Per-speaker role PROPOSED by the most recent identify run —
    *  provisional, not yet committed to the store. Committing waits
@@ -1002,7 +1002,7 @@ export class LiveOrchestrator {
     //       (stored as `liveSpeakerPrompt`; rendered by the UI as a
     //       floating card). Commentary / questions remain gated until
     //       the user resolves the prompt.
-    // No periodic review / no Haiku-based second-guessing — user input
+    // No periodic review / no model-based second-guessing — user input
     // is treated as source of truth. Upload mode keeps its own
     // preIdentify path (unchanged by this block).
     if (dgSpeaker !== undefined && !this.preIdentified) {
@@ -1288,7 +1288,7 @@ export class LiveOrchestrator {
    * attempts failed. `onDelta` is called with the running accumulated
    * string as each chunk arrives; the caller uses it to update the
    * store. `onApiError` is called if the stream itself carries an
-   * `{type:"error"}` event (upstream Anthropic error) — embedded
+   * `{type:"error"}` event (upstream model-provider error) — embedded
    * errors do NOT trigger retry (the API explicitly declined).
    */
   private async streamCommentarySSE(
@@ -1649,7 +1649,7 @@ export class LiveOrchestrator {
         ? Date.now() - this.lastTranscriptAt
         : 0;
 
-      // Compute current main + follow-up texts to send to Haiku.
+      // Compute current main + follow-up texts to send to the model.
       const currentSubQ = store.liveQuestions.find(
         (q) => q.id === store.live.currentQuestionId
       );
@@ -2596,7 +2596,7 @@ export class LiveOrchestrator {
     // the SAME imaginary Q over and over ("Tell me about yourself"
     // proposed 6 times in 40s even though it was never asked). Remember
     // texts we've already rejected and skip them without re-running
-    // Layer 1/2/3. Saves significant Anthropic budget + noise.
+    // Layer 1/2/3. Saves significant model budget + noise.
     const normalized = this.normalizeQText(text);
     if (this.rejectedQTexts.has(normalized)) {
       log("filter", "L0-cached-reject", {
@@ -2967,7 +2967,7 @@ export class LiveOrchestrator {
       //     IDENTIFY_CONFIDENCE_THRESHOLD AND the committed role differs
       //     from what we'd commit. ~90% confidence: three independent
       //     runs reading the same body of conversation.
-      //   - A committed role can still FLIP if Haiku proposes a new one
+      //   - A committed role can still FLIP if the model proposes a new one
       //     for THRESHOLD runs in a row (the pending + streak logic
       //     handles this naturally — streak resets on dissent, grows on
       //     agreement, commits when it hits threshold).

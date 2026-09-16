@@ -2151,7 +2151,7 @@ function LiveCaptions({
           // header right side so the user knows where to click if they
           // realize they mis-assigned interviewer/candidate at the
           // start. Discoverable but not noisy. Only renders in live
-          // mode (upload mode pre-identifies via Haiku).
+          // mode (upload mode pre-identifies via DeepSeek).
           <button
             onClick={onRetagClick}
             className="ml-auto inline-flex items-center gap-1 text-[12.5px] text-text-subtle hover:text-text transition-colors"

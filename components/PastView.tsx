@@ -223,7 +223,7 @@ function ImprovementBody({ text }: { text: string }) {
 
   // The model emits multi-section content (lead-in paragraph + bullets
   // + closing paragraph) and is instructed to separate them with real
-  // newlines. In practice Sonnet uses a MIX of `\n\n` paragraph breaks
+  // newlines. In practice the model uses a MIX of `\n\n` paragraph breaks
   // and bare `\n` line breaks even within the same response, and
   // sometimes runs the lead-in / bullets / closing all together with
   // single `\n` between them.
@@ -242,7 +242,7 @@ function ImprovementBody({ text }: { text: string }) {
   if (allLines.length === 0) return null;
 
   // Group consecutive lines by "is this a bullet?". A bullet line
-  // starts with "- " or "* " (some Sonnet variants emit "* "); the
+  // starts with "- " or "* " (some model variants emit "* "); the
   // dash/asterisk is followed by whitespace.
   type Group = { kind: "ul" | "p"; lines: string[] };
   const groups: Group[] = [];

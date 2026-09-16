@@ -1,9 +1,8 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
-// Analysis is a single Opus call with a large context (full log +
+// Analysis is a single model call with a large context (full log +
 // transcript). 3 minutes is plenty; requests have timed out at 60s
 // on Vercel free, so we bump the ceiling.
 export const maxDuration = 300;
@@ -39,7 +38,7 @@ interface Finding {
  * Auto-diagnose a puebulo session.
  *
  * Given the debug log (events + timestamps) and the transcript (what
- * was actually said), an Opus-4.7 pass identifies behavioral bugs and
+ * was actually said), a DeepSeek pass identifies behavioral bugs and
  * coaching-quality issues in the orchestrator. Returns a structured
  * list the user can review and selectively export to Claude Code for
  * implementation.
@@ -57,7 +56,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "missing log" }, { status: 400 });
   }
 
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
 
   const system = `You are an expert QA engineer for "puebulo", a live
 coaching app that listens to interviews and overlays real-time AI
@@ -74,13 +73,13 @@ Speech pipeline:
   assigned the opposite role.
 
 State machine (per-utterance):
-- classify-moment (Haiku) decides: chitchat / interviewer_speaking /
+- classify-moment (DeepSeek) decides: chitchat / interviewer_speaking /
   question_finalized, with a questionRelation (new_topic / follow_up / null).
 - When question_finalized fires, a 4-layer filter gates the commit:
   L0: reject-cache for repeat hallucinations
   L1: text grounding — Q tokens must appear in recent interviewer
       transcript (≥50% overlap)
-  L2: parallel Haiku "is this really a question or still setup?" verdict
+  L2: parallel "is this really a question or still setup?" verdict
   L3: 3-second continuation gate — interviewer must go silent for 3s
 - Restatement gate: within 10s of a Lead commit, similar Qs are dropped
   to avoid double-locking (Jaccard ≥ 0.5).
@@ -191,20 +190,15 @@ ${userCommentsBlock}
 Produce JSON with your findings.`;
 
   try {
-    // Sonnet 4.5 — this is an internal batch diagnostic (not user-
-    // facing, low call volume); Sonnet handles the structured
-    // transcript+log analysis well at a fraction of Opus's cost.
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 8000,
-      system,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: { summary?: string; findings?: Finding[] } = {};
     try {

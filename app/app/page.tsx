@@ -581,7 +581,7 @@ export default function Page() {
     // heading defaults to "Live Interview Session" until it returns.
     //
     // The route returns `{ title, fallback?: true }`. `fallback: true`
-    // means Anthropic was unreachable / rate-limited / returned empty —
+    // means the model provider was unreachable / rate-limited / returned empty —
     // we got the generic placeholder back, not a real generated title.
     // In that case we retry once after 2.5s; one transient blip
     // shouldn't permanently leave the user staring at "Live Interview
@@ -828,7 +828,7 @@ export default function Page() {
     // earlier attempts), `title` will be the fallback "Untitled
     // session" / "未命名面试". Try ONE more synchronous call here
     // — the JD is already on the live store, the call is fast
-    // (~1-2s with Haiku), and the user is already waiting for the
+    // (~1-2s with DeepSeek), and the user is already waiting for the
     // post-session save anyway. Better than the user being left
     // with "Untitled session" in their sidebar forever.
     const isFallbackTitle =
@@ -1079,7 +1079,7 @@ export default function Page() {
   );
 
   // POST-SESSION HELPER #1 — JD/resume summary for the Context block.
-  // Lightweight Haiku call (~2s). Ignores fallback flag, just stores
+  // Lightweight model call (~2s). Ignores fallback flag, just stores
   // whatever real summary came back. No retry beyond what the route
   // already does internally.
   const summarizeContextAsync = async (saved: ReturnType<typeof endLive>) => {
@@ -1087,7 +1087,7 @@ export default function Page() {
       // If the session-start /api/summarize-interviewer call already
       // produced a summary, skip re-summarizing the interviewer here —
       // pass empty interviewerProfile so the route returns early on
-      // that field. Saves a duplicate Haiku call on the same input.
+      // that field. Saves a duplicate model call on the same input.
       const interviewerForCall = saved.interviewerProfileSummary
         ? ""
         : saved.interviewerProfile;
@@ -1123,7 +1123,7 @@ export default function Page() {
   };
 
   // POST-SESSION HELPER #2 — Expand brief "Try:" blocks into full
-  // deliverable answers. Single Sonnet call for the whole session
+  // deliverable answers. Single model call for the whole session
   // (~30-50s). Stored per-comment via setPastSessionExpandedSuggestions.
   // Failure leaves the existing brief Try block as-is in PastView.
   const expandSuggestionsAsync = async (saved: ReturnType<typeof endLive>) => {
@@ -1196,7 +1196,7 @@ export default function Page() {
     });
     try {
       // 90-second hard timeout via AbortController. The route itself can
-      // take 30+ seconds when Sonnet is generating a full scorecard for
+      // take 30+ seconds when the model is generating a full scorecard for
       // a 32-min interview, but anything past 90s is almost certainly
       // hung — better to surface a retryable error than leave the user
       // staring at a forever-spinner.

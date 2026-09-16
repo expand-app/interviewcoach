@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 import { logSessionEvent, logSessionEvents } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
 // Bump the per-request server timeout. The end-of-session expand kicks
-// off N parallel Sonnet calls; even with concurrency=8 a 30-question
+// off N parallel model calls; even with concurrency=8 a 30-question
 // session may need ~25-40s if the slowest item lags. Default Next.js
 // route timeout in production is 30s on EB — without this directive
 // the gateway 504's before the route can respond.
@@ -59,10 +58,10 @@ interface Body {
  * without a Try block (e.g. listening hints) are simply not in the
  * output. Failed expansions are also omitted (silent partial success).
  *
- * Architecture: N Sonnet calls FAN OUT in parallel (concurrency 8),
+ * Architecture: N model calls FAN OUT in parallel (concurrency 8),
  * one per Try item. Each call is small (one item's worth of context)
  * so wall-clock is bounded by the slowest single call (~5-15s) plus
- * concurrency-bucket waits. Replaces the old "single Sonnet call for
+ * concurrency-bucket waits. Replaces the old "single model call for
  * all items" path which sequentialized inside the model — total
  * generation time scaled linearly with item count and could top 50s
  * on long sessions. Per-item parallel keeps wall-clock roughly
@@ -142,25 +141,27 @@ Brief Try: ${item.brief}
 Write the JSON.`;
 }
 
-/** Single-item Sonnet call with 1 retry on transient errors. Returns
+/** Single-item model call with 1 retry on transient errors. Returns
  *  the expanded text or null on failure / empty output. */
 async function expandSingle(
   item: Item,
   jd: string,
   resume: string
 ): Promise<string | null> {
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
   const user = buildUserPrompt(item, jd, resume);
 
   const doCall = () =>
-    client.messages.create({
+    client.chat.completions.create({
       // Smaller per-item prompt + simpler output shape lets us cap
       // tokens MUCH lower than the batch call's 8000. 800 covers the
       // 220-word target with margin.
-      model: "claude-sonnet-4-5",
+      model: DEEPSEEK_MODEL,
       max_tokens: 800,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: user },
+      ],
     });
 
   const MAX_ATTEMPTS = 2;
@@ -168,11 +169,7 @@ async function expandSingle(
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       const resp = await doCall();
-      const text = resp.content
-        .filter((c): c is Anthropic.TextBlock => c.type === "text")
-        .map((c) => c.text)
-        .join("")
-        .trim();
+      const text = (resp.choices[0]?.message?.content ?? "").trim();
 
       let parsed: { text?: string } = {};
       try {
@@ -255,10 +252,10 @@ async function mapWithConcurrency<T, R>(
 }
 
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set", fallback: true },
+      { error: "DEEPSEEK_API_KEY not set", fallback: true },
       { status: 200 }
     );
   }
@@ -298,11 +295,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ expansions: [] });
   }
 
-  // Concurrency tuned to comfortably stay under Anthropic's per-org
-  // RPM limit (50 RPM at Tier 1). 8 parallel × ~10s/call → ~12s
-  // wall-clock for 8 items, ~25s for 30 items. Higher concurrency
-  // saves only marginal time and risks 429 floods that we'd then
-  // have to retry.
+  // 8 parallel × ~10s/call → ~12s wall-clock for 8 items, ~25s for
+  // 30 items. Higher concurrency saves only marginal time and risks
+  // 429 floods that we'd then have to retry.
+  //
+  // NOTE: this number was tuned against Anthropic's rate limits and
+  // has NOT been re-measured against DeepSeek's, which throttle
+  // differently. If end-of-session expansion starts throwing 429s,
+  // this is the knob.
   const CONCURRENCY = 8;
 
   if (sessionId) {

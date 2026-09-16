@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -13,7 +12,7 @@ interface TitleBody {
  * Extracts a concise session title from the JD (and optionally the
  * resume, for context) — used as the heading on the live view and as
  * the default name when saving the session. Kept deliberately short:
- * one line, role + company if present, nothing fancy. Haiku is plenty
+ * one line, role + company if present, nothing fancy. the model is plenty
  * for this and keeps latency low.
  *
  * Examples of good output:
@@ -25,10 +24,10 @@ interface TitleBody {
  * any failure so the UI always has something to render.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { title: "Live Interview Session", error: "ANTHROPIC_API_KEY not set" },
+      { title: "Live Interview Session", error: "DEEPSEEK_API_KEY not set" },
       { status: 200 }
     );
   }
@@ -60,17 +59,16 @@ ${jd.slice(0, 4000)}
 Write the title.`;
 
   try {
-    const client = getAnthropicClient();
-    const resp = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
+    const client = getDeepseekClient();
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 40,
-      system,
-      messages: [{ role: "user", content: user }],
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
+    const text = (resp.choices[0]?.message?.content ?? "")
       .trim()
       .replace(/^["'`]+|["'`]+$/g, "") // strip stray quotes if the model slipped
       .split("\n")[0]

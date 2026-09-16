@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 import type { SessionScore, Question } from "@/types/session";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 import { logSessionEvent } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
@@ -97,10 +96,10 @@ function verdictForPercent(percent: number): SessionScore["verdict"] {
  * Session so past-session views don't re-call the model.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set" },
+      { error: "DEEPSEEK_API_KEY not set" },
       { status: 500 }
     );
   }
@@ -363,7 +362,7 @@ export async function POST(req: Request) {
   // session with two throwaway answers. For retakes, answerText is
   // ground truth (realtime transcripts), so the bar is mechanical:
   // ≥3 answered questions (≥60 chars each) totaling ≥1000 chars, or
-  // no scorecard. Deterministic, reproducible, and saves a Sonnet call.
+  // no scorecard. Deterministic, reproducible, and saves a model call.
   if (isRetake && (questionsWithAnswers < 3 || totalAnswerChars < 1000)) {
     const summary = `Captured ${mains.length} main question${mains.length === 1 ? "" : "s"} and ${questionsWithAnswers} with substantive candidate answers (${totalAnswerChars} chars total) over ${Math.round(durationSeconds / 60)} min. Full scoring needs ≥ 3 answered questions totaling ≥ 1000 chars of candidate speech.`;
     const score: SessionScore = {
@@ -737,14 +736,14 @@ INSUFFICIENT gate: requires questionsWithEvidence < 3 AND totalEvidenceChars < 1
 
 Score the interview. Return JSON only.`;
 
-  // Diagnostic: log the rough prompt size before firing. Sonnet 4.5
+  // Diagnostic: log the rough prompt size before firing. deepseek-flash
   // handles ~200K input tokens but the bigger risk is route latency at
   // ~5K-tokens-per-1K-chars rates → 30s+ generation on huge prompts.
   // Helps explain a hang as "too big" rather than "API down".
   const systemChars = system.length;
   const userChars = user.length;
   const estTokens = Math.ceil((systemChars + userChars) / 3.5);
-  console.log("[score-session] calling Sonnet:", {
+  console.log("[score-session] calling the model:", {
     systemChars,
     userChars,
     estTokens,
@@ -757,33 +756,35 @@ Score the interview. Return JSON only.`;
   // once after 2.5s on transient errors (network drops, upstream
   // overload, rate limits). 4xx errors that aren't 429 are NOT
   // retried — they're parameter problems that won't succeed twice.
-  // 2 total attempts (not 3) because each Sonnet call is 30-40s
+  // 2 total attempts (not 3) because each model call is 30-40s
   // wall-clock — a third attempt would push past most users'
   // patience and the 90s client-side timeout.
-  async function callSonnetWithRetry() {
-    const client = getAnthropicClient();
+  async function callModelWithRetry() {
+    const client = getDeepseekClient();
     const doCall = () =>
-      client.messages.create({
-        model: "claude-sonnet-4-5",
+      client.chat.completions.create({
+        model: DEEPSEEK_MODEL,
         // max_tokens 4000 (was 1500) — Chinese-output sessions (one
         // tenant ran a 12-question / 15K-char Uber interview that
-        // kept landing on empty `dimensions: []` because Sonnet's
+        // kept landing on empty `dimensions: []` because the model's
         // full Chinese-language justification spilled past 1500
         // tokens and JSON extraction caught a truncated array). The
-        // Anthropic limit is well above this; over-budgeting wastes
+        // provider limit is well above this; over-budgeting wastes
         // nothing because billing is on actually-emitted tokens.
         max_tokens: 4000,
         // temperature: 0 makes scoring deterministic — same input
-        // always produces the same verdict. Default 1.0 lets Sonnet
+        // always produces the same verdict. The default lets the model
         // wobble between "insufficient_data" and a real grade on
         // identical inputs, which is what caused users to see a
         // session re-score 6 times with "INSUFFICIENT" verdicts and
-        // then spontaneously succeed on the 7th try (Sonnet rolled
+        // then spontaneously succeed on the 7th try (the model rolled
         // the dice each call). Scoring should be reproducible: same
         // session re-scored should always land on the same number.
         temperature: 0,
-        system,
-        messages: [{ role: "user", content: user }],
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
       });
     const MAX_ATTEMPTS = 2;
     const BACKOFF_MS = 2500;
@@ -823,14 +824,10 @@ Score the interview. Return JSON only.`;
 
   try {
     const t0 = Date.now();
-    const resp = await callSonnetWithRetry();
-    console.log("[score-session] Sonnet returned in", Date.now() - t0, "ms");
+    const resp = await callModelWithRetry();
+    console.log("[score-session] model returned in", Date.now() - t0, "ms");
 
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     if (!text) {
       // Empty model output — would otherwise silently fall through to
@@ -892,11 +889,11 @@ Score the interview. Return JSON only.`;
     // declined" we both catch here:
     //   (1) Explicit: parsed.insufficient === true. Cleanest signal.
     //   (2) Implicit: model emitted dimensions but every dimension's
-    //       score is null. With temperature: 0 we've seen Sonnet
+    //       score is null. With temperature: 0 we've seen the model
     //       prefer this shape over the explicit insufficient flag —
     //       same effect (no useful score), different JSON.
     //
-    // Sonnet sometimes wobbles into one of these on perfectly
+    // the model sometimes wobbles into one of these on perfectly
     // gradable sessions; we caught the pattern on a 35-minute /
     // 12-question / 15K-char interview that re-scored "insufficient"
     // SIX times and produced a real `pass` only on the seventh.
@@ -905,7 +902,7 @@ Score the interview. Return JSON only.`;
     // the model thinks the answers are too "abstract" — wrong
     // judgment per server-side stats.
     //
-    // Override path: re-prompt Sonnet with a stricter system
+    // Override path: re-prompt the model with a stricter system
     // addendum that REMOVES the decline option entirely. If the
     // retry still declines, we accept it and surface the override
     // attempt in the summary.
@@ -931,8 +928,9 @@ Score the interview. Return JSON only.`;
     //       would short-circuit anyway.
     //   (e) Combination — weight=0 + score=null on every dim. The
     //       single most common "decline" shape from temperature: 0
-    //       Sonnet on the Uber session that triggered this whole
-    //       investigation.
+    //       on the Uber session that triggered this whole
+    //       investigation (observed on Claude Sonnet, the model in
+    //       use at the time).
     const dims = Array.isArray(parsed.dimensions) ? parsed.dimensions : null;
     const dimsMissingOrEmpty = !dims || dims.length === 0;
     const allScoresNullish =
@@ -1007,7 +1005,7 @@ Score the interview. Return JSON only.`;
         });
       }
       try {
-        const client = getAnthropicClient();
+        const client = getDeepseekClient();
         const strictAddendum =
           "\n\n--- OVERRIDE INSTRUCTION (MANDATORY) ---\n" +
           "Your previous response declined to grade this session (returned " +
@@ -1034,8 +1032,8 @@ Score the interview. Return JSON only.`;
           "questions and 12 substantive answers totaling 15K+ chars — there " +
           "IS enough to grade. Pick weights and scores that reflect what " +
           "you observed, even if rough.";
-        const strictResp = await client.messages.create({
-          model: "claude-sonnet-4-5",
+        const strictResp = await client.chat.completions.create({
+          model: DEEPSEEK_MODEL,
           // Match the primary call's bumped budget so the retry
           // can also produce full Chinese justifications without
           // hitting the same truncation that triggered this
@@ -1051,14 +1049,12 @@ Score the interview. Return JSON only.`;
           // result reasonable; not 1.0 because we don't want
           // wildly different grades each retry either.
           temperature: 0.3,
-          system: system + strictAddendum,
-          messages: [{ role: "user", content: user }],
+          messages: [
+            { role: "system", content: system + strictAddendum },
+            { role: "user", content: user },
+          ],
         });
-        const strictText = strictResp.content
-          .filter((c): c is Anthropic.TextBlock => c.type === "text")
-          .map((c) => c.text)
-          .join("")
-          .trim();
+        const strictText = (strictResp.choices[0]?.message?.content ?? "").trim();
         let strictParsed: typeof parsed = {};
         try {
           strictParsed = JSON.parse(strictText);
@@ -1146,7 +1142,7 @@ Score the interview. Return JSON only.`;
     //   1) Model emits `weight` for each dimension (preferred, new path).
     //   2) Model omits weight entirely → fall back to canonical defaults
     //      (20/25/25/15/15) so we DON'T misclassify the session as
-    //      insufficient just because Sonnet reverted to its older
+    //      insufficient just because the model reverted to an older
     //      score-only output shape.
     //   3) Model emits weight on SOME dims but not others → fill the
     //      gaps from defaults proportionally.
@@ -1215,7 +1211,7 @@ Score the interview. Return JSON only.`;
 
     // Enforce sum-of-weights = 100. Renormalize on the fly when the
     // model's weights drift (we ask for sum=100 in the prompt, but
-    // Sonnet occasionally returns 95 or 105). Scale every weight + the
+    // the model occasionally returns 95 or 105). Scale every weight + the
     // active scores by the same factor so percentages stay consistent
     // with what the model intended. After this pass dimensionsOut.max
     // sums to exactly 100 and dimensionsOut.score (when not null) is

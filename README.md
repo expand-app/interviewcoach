@@ -1,7 +1,7 @@
 # Interview Coach
 
 Real-time AI commentary on interview answers. Listens to your mic, detects
-the interviewer's questions, streams per-question commentary from Claude,
+the interviewer's questions, streams per-question commentary from DeepSeek,
 and lets you replay the whole session afterwards with timestamped notes.
 
 **Current version uses the browser's built-in Web Speech API for transcription
@@ -27,10 +27,10 @@ Browser mic
                      │       Orchestrator           │
                      │                              │
                      │  every final utterance →     │
-                     │  POST /api/detect-question   │──► Claude Haiku (is this a Q?)
+                     │  POST /api/detect-question   │──► deepseek-flash (is this a Q?)
                      │                              │
                      │  every ~220 chars of answer →│
-                     │  POST /api/commentary (SSE)  │──► Claude Sonnet (streamed comment)
+                     │  POST /api/commentary (SSE)  │──► deepseek-flash (streamed comment)
                      └─────────────────────────────┘
                                    │
                                    ▼
@@ -48,9 +48,9 @@ Browser mic
 npm install
 ```
 
-### 2. Get an Anthropic API key
+### 2. Get a DeepSeek API key
 
-https://console.anthropic.com/ → API Keys → Create Key
+https://platform.deepseek.com/api_keys → Create new API key
 
 ### 3. Configure env
 
@@ -76,7 +76,7 @@ the browser will ask for microphone permission.
 1. **Start** → Shows the JD + Resume modal.
 2. **Confirm** → Opens the browser mic, starts Web Speech API + MediaRecorder.
 3. **Every finalized transcript utterance** is sent to `/api/detect-question`.
-   Claude Haiku decides if it's a new question. If yes → a new Question
+   DeepSeek decides if it's a new question. If yes → a new Question
    block appears at the top. If no → the utterance is added to the current
    Question's running answer buffer.
 4. **Every ~220 chars of new answer text** triggers `/api/commentary`. This

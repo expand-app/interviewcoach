@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -12,7 +12,7 @@ export const runtime = "nodejs";
  * depth where the original interviewer probed — but with freshly
  * worded questions so the user can't just replay a memorized answer.
  *
- * One Sonnet call at retake start (the modal shows a loading state).
+ * One model call at retake start (the modal shows a loading state).
  * The client keeps the plan in memory for the whole call; it is not
  * persisted (refresh mid-retake loses the run — same contract as a
  * live session).
@@ -141,14 +141,14 @@ Rules:
 Return ONLY the JSON object, no markdown fences.`;
 
   try {
-    const client = getAnthropicClient();
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
+    const client = getDeepseekClient();
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 3000,
       messages: [{ role: "user", content: prompt }],
     });
     const text =
-      resp.content[0]?.type === "text" ? resp.content[0].text : "";
+      resp.choices[0]?.message?.content ?? "";
     // Tolerate accidental markdown fences.
     const jsonText = text
       .replace(/^\s*```(?:json)?\s*/i, "")

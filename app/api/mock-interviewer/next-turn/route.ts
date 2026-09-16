@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -136,14 +136,14 @@ Return ONLY JSON: {"action": "followup" | "next" | "wrapup", "utterance": string
 - action "wrapup": utterance = "", nextSlotIndex = ${currentSlotIndex}`;
 
   try {
-    const client = getAnthropicClient();
-    const resp = await client.messages.create({
-      model: "claude-sonnet-4-5",
+    const client = getDeepseekClient();
+    const resp = await client.chat.completions.create({
+      model: DEEPSEEK_MODEL,
       max_tokens: 400,
       messages: [{ role: "user", content: prompt }],
     });
     const text =
-      resp.content[0]?.type === "text" ? resp.content[0].text : "";
+      resp.choices[0]?.message?.content ?? "";
     const jsonText = text
       .replace(/^\s*```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/, "")

@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
-import { getAnthropicClient } from "@/lib/anthropic-client";
+import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
 
 export const runtime = "nodejs";
 
@@ -76,14 +75,14 @@ interface ClassifyBody {
  *   - Candidate substantive-answer threshold lowered to 20 chars
  *   - Filler / transition words ("so...", "uh let me think", "and also...")
  *     do NOT count as the interviewer being done
- *   - Haiku must verify the accumulated interviewer text has a complete
+ *   - the model must verify the accumulated interviewer text has a complete
  *     question structure before allowing question_finalized
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY not set" },
+      { error: "DEEPSEEK_API_KEY not set" },
       { status: 500 }
     );
   }
@@ -129,7 +128,7 @@ export async function POST(req: Request) {
   const sessionIsMature =
     sessionElapsedSec >= 5 * 60 && priorLeadCount >= 1;
 
-  const client = getAnthropicClient();
+  const client = getDeepseekClient();
 
   // === Layer 2 branch: confirmation-focused prompt ===
   // Runs in parallel with the main classifier. Asks ONE specific binary
@@ -243,17 +242,15 @@ Milliseconds since last transcript: ${msSinceLastTranscript}${reverseQaBias}${ma
 Verdict?`;
 
     try {
-      const resp = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
+      const resp = await client.chat.completions.create({
+        model: DEEPSEEK_MODEL,
         max_tokens: 200,
-        system: confirmSystem,
-        messages: [{ role: "user", content: confirmUser }],
+        messages: [
+          { role: "system", content: confirmSystem },
+          { role: "user", content: confirmUser },
+        ],
       });
-      const text = resp.content
-        .filter((c): c is Anthropic.TextBlock => c.type === "text")
-        .map((c) => c.text)
-        .join("")
-        .trim();
+      const text = (resp.choices[0]?.message?.content ?? "").trim();
       let parsed: { verdict?: string; reason?: string } = {};
       try {
         parsed = JSON.parse(text);
@@ -589,13 +586,15 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
   // catch the typical rate-limit / socket-blip / brief upstream outage
   // cases. 4xx (except 429) are NOT retried — they're parameter
   // problems that won't succeed a second time.
-  async function callHaikuWithRetry() {
+  async function callModelWithRetry() {
     const doCall = () =>
-      client.messages.create({
-        model: "claude-haiku-4-5-20251001",
+      client.chat.completions.create({
+        model: DEEPSEEK_MODEL,
         max_tokens: 400,
-        system,
-        messages: [{ role: "user", content: user }],
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
       });
     const BACKOFFS_MS = [500, 1500]; // delay before retry #1 and retry #2
     const MAX_ATTEMPTS = BACKOFFS_MS.length + 1; // 3
@@ -634,13 +633,9 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
   }
 
   try {
-    const resp = await callHaikuWithRetry();
+    const resp = await callModelWithRetry();
 
-    const text = resp.content
-      .filter((c): c is Anthropic.TextBlock => c.type === "text")
-      .map((c) => c.text)
-      .join("")
-      .trim();
+    const text = (resp.choices[0]?.message?.content ?? "").trim();
 
     let parsed: {
       state?: string;
@@ -680,7 +675,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
         : "";
     // Server-side guard against the model echoing interviewer hand-off
     // lines into candidateQuestion. Even with the explicit
-    // CANDQ-ATTRIBUTION rule in the prompt, Haiku occasionally fills
+    // CANDQ-ATTRIBUTION rule in the prompt, the model occasionally fills
     // candQ with the interviewer's "what questions do you have" text
     // when the candidate hasn't asked yet. Compare candQ against the
     // recent interviewer utterances; if there's clear text overlap,
@@ -749,7 +744,7 @@ Decide the moment. Be strict about finalization (3s silence or substantive 20-ch
     // Log the full error body (not just status) so we can diagnose why
     // classify-moment fails. Previously the client log showed only
     // {"status":500}, which hid rate-limit reasons / prompt-length
-    // errors / Anthropic outages behind a generic code.
+    // errors / DeepSeek outages behind a generic code.
     const status = (e as { status?: number })?.status;
     const errBody = (e as { error?: unknown })?.error;
     const msg = e instanceof Error ? e.message : "Unknown error";

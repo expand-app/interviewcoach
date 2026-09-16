@@ -24,8 +24,8 @@ npm install
 
 # 3. Set up your API key
 cp .env.local.example .env.local
-# Open .env.local in any text editor and paste your Anthropic API key
-# Get one at https://console.anthropic.com/
+# Open .env.local in any text editor and paste your DeepSeek API key
+# Get one at https://platform.deepseek.com/api_keys
 
 # 4. Run the dev server
 npm run dev
@@ -69,7 +69,7 @@ git push -u origin main
    - Build Command: `npm run build` (default)
    - Output Directory: `.next` (default)
 4. Click **Environment Variables** and add:
-   - `ANTHROPIC_API_KEY` = `sk-ant-...` (your real key)
+   - `DEEPSEEK_API_KEY` = `sk-...` (your real key)
 5. Click **Deploy**
 
 First deploy takes ~2 minutes. After it finishes you get a URL like `https://interview-coach-abc123.vercel.app`.
@@ -102,11 +102,11 @@ You're on Safari or Firefox. Use Chrome or Edge.
 
 ### The page loads but nothing happens when I click Start
 Open the browser's DevTools console (F12 → Console tab). Look for red errors. Most likely either:
-- `ANTHROPIC_API_KEY` isn't set — check your `.env.local`
+- `DEEPSEEK_API_KEY` isn't set — check your `.env.local`
 - You're on a non-HTTPS URL and the browser is blocking microphone access
 
 ### AI commentary appears then disappears
-That's the streaming — text appears token-by-token as Claude generates it. It shouldn't disappear. If it does, something's wrong with SSE — open DevTools Network tab and check the `/api/commentary` request.
+That's the streaming — text appears token-by-token as the model generates it. It shouldn't disappear. If it does, something's wrong with SSE — open DevTools Network tab and check the `/api/commentary` request.
 
 ### Web Speech API drops words mid-session
 Known Chrome limitation — the recognition engine disconnects every ~60 seconds. The code auto-reconnects, but you may lose 1-2 words at the seam. This is why the production plan is to switch to Deepgram.
@@ -116,11 +116,25 @@ Replace `lib/audioSession.ts` with a WebSocket-based Deepgram streaming version.
 
 ---
 
-## Cost estimate (Anthropic only, Web Speech API is free)
+## Cost estimate (DeepSeek only, Web Speech API is free)
 
-- **Claude Haiku** for question detection: ~$0.001 per utterance × ~50 utterances per interview ≈ **$0.05 per interview**
-- **Claude Sonnet** for commentary: ~$0.01 per comment × ~15 comments per interview ≈ **$0.15 per interview**
+Published `deepseek-flash` rates (off-peak; peak hours are 2x):
 
-**Total: ~$0.20 per 30-minute interview.**
+| | per 1M tokens |
+|---|---|
+| input, cache miss | $0.15 |
+| input, cache hit | $0.003 |
+| output | $0.60 |
 
-If this adds up, you can swap Sonnet → Haiku in `app/api/commentary/route.ts` for 1/10th the cost (lower quality commentary, but often still useful).
+Repeated system prompts — the commentary coach prompt, the scoring
+rubric — are cached automatically, so a busy session pays the cache-hit
+rate on most of its input.
+
+A 30-minute interview runs on the order of **$0.02-0.04**. Treat that as
+an order of magnitude, not a quote: the rates above are published, but
+the call volume behind the estimate (roughly 50 question-detection
+calls, 15 commentary streams, one scorecard, plus titles and summaries)
+is an assumption that has not been measured against production traffic.
+
+Every route shares one model, so there is no cheap-tier/expensive-tier
+tradeoff to tune — cost scales with call volume and prompt size only.
