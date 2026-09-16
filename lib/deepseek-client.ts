@@ -77,8 +77,70 @@ function getProxyAgent(): HttpAgent | null {
 const THINKING_DISABLED = { type: "disabled" } as const;
 
 /**
+ * The `thinking` flag is stamped onto a JSON body by hand, outside the
+ * SDK's type system — DeepSeek's API accepts it, the OpenAI SDK knows
+ * nothing about it. That makes the whole defense above a silent
+ * single point of failure: if DeepSeek renames the parameter, or
+ * starts ignoring unknown fields instead of rejecting them, the
+ * injection degrades into a no-op and the empty-response bug returns
+ * with no error, no status code, and no signal of any kind.
+ *
+ * So verify the flag by its effects rather than trusting it:
+ *
+ *  - `reasoning_content` present, or reasoning_tokens > 0, means the
+ *    flag did NOT take. That is the failure this module exists to
+ *    prevent, so it is an error.
+ *  - `finish_reason: "length"` with empty content is the shape the
+ *    bug actually presents as. It can also mean a genuinely
+ *    over-long completion, so it is a warning, not an error.
+ *
+ * Both go to the server log, which is where someone debugging
+ * "scores come back blank sometimes" will actually be looking.
+ */
+function auditCompletion(payload: string): void {
+  let body: {
+    choices?: Array<{
+      finish_reason?: string;
+      message?: { content?: string | null; reasoning_content?: string | null };
+    }>;
+    usage?: { completion_tokens_details?: { reasoning_tokens?: number } };
+  };
+  try {
+    body = JSON.parse(payload);
+  } catch {
+    return;
+  }
+
+  const choice = body.choices?.[0];
+  if (!choice) return;
+
+  const reasoningTokens =
+    body.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+  if (choice.message?.reasoning_content || reasoningTokens > 0) {
+    console.error(
+      "[deepseek-client] thinking mode is ACTIVE despite " +
+        `thinking:${JSON.stringify(THINKING_DISABLED)} — the injection in ` +
+        "proxyAwareFetch is no longer working. Responses will " +
+        "intermittently come back empty as reasoning consumes max_tokens. " +
+        `(reasoning_tokens=${reasoningTokens}) See lib/deepseek-client.ts.`
+    );
+    return;
+  }
+
+  if (choice.finish_reason === "length" && !choice.message?.content?.trim()) {
+    console.warn(
+      "[deepseek-client] empty content with finish_reason=length — the " +
+        "call's max_tokens budget was exhausted before any output. Raise " +
+        "max_tokens at the call site, or check whether thinking mode was " +
+        "re-enabled."
+    );
+  }
+}
+
+/**
  * Proxy-aware fetch shim, which also stamps `thinking: disabled` onto
- * every outgoing chat-completion request body (see above).
+ * every outgoing chat-completion request body (see above) and audits
+ * the response to confirm the flag is still doing its job.
  *
  * We widen the types at the boundary because the SDK's types use the
  * lib.dom fetch types while node-fetch has its own — the runtime
@@ -92,9 +154,13 @@ async function proxyAwareFetch(
   const url = typeof input === "string" ? input : input.toString();
 
   let body = init?.body;
+  let isCompletion = false;
+  let isStreaming = false;
   if (typeof body === "string" && url.includes("/chat/completions")) {
     try {
       const parsed = JSON.parse(body) as Record<string, unknown>;
+      isCompletion = true;
+      isStreaming = parsed.stream === true;
       // Respect an explicit per-call override; only default it.
       if (parsed.thinking === undefined) {
         parsed.thinking = THINKING_DISABLED;
@@ -111,6 +177,23 @@ async function proxyAwareFetch(
     agent: agent ?? undefined,
   };
   const res = await nodeFetch(url, nfInit);
+
+  // Audit non-streamed completions only. A streamed body must not be
+  // buffered here — commentary is the streaming caller and it is the
+  // one path where first-token latency is the whole point. The audit
+  // reads a CLONE so the SDK still gets an untouched, unconsumed body,
+  // and it is deliberately not awaited: a diagnostic must never add
+  // latency to, or be able to fail, the actual request.
+  if (isCompletion && !isStreaming && res.ok) {
+    void res
+      .clone()
+      .text()
+      .then(auditCompletion)
+      .catch(() => {
+        /* diagnostics must never break the request */
+      });
+  }
+
   return res as unknown as Response;
 }
 
@@ -130,9 +213,4 @@ export function getDeepseekClient(): OpenAI {
     // our shim is runtime-compatible for the subset the SDK uses.
     fetch: proxyAwareFetch as unknown as typeof fetch,
   });
-}
-
-/** For convenience when a route already checked the key exists. */
-export function hasDeepseekKey(): boolean {
-  return !!process.env.DEEPSEEK_API_KEY;
 }
