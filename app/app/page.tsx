@@ -271,7 +271,7 @@ export default function Page() {
   // recenters horizontally. Region Capture's auto-tracking sees
   // this as a major bbox change and produces ~3s of garbled frames
   // unless we proactively pause the encoder around the transition.
-  // The onToggleFullscreen handler below calls
+  // The handleToggleFullscreen handler below calls
   // orchestrator.triggerCropTransition("fullscreen") which fires
   // the same pause-encoder → 500ms wait → refresh cropTo →
   // 2-RAF settle → resume-encoder dance the zoom keyboard/wheel
@@ -349,9 +349,19 @@ export default function Page() {
   }, []);
   const handleResumeShare = async () => {
     setShareResuming(true);
+    // Hide the banner IMMEDIATELY — before getDisplayMedia and the new
+    // MediaRecorder start — not after resumeScreenShare resolves. In
+    // fullscreen the banner overlaps #ic-capture-region, so if it were
+    // still mounted when the fresh recorder starts, the first frames after
+    // Resume would capture "Screen recording paused…" into the video.
+    // Hiding it up front removes it from any capture window in every mode.
+    // If the user cancels the share picker (resume returns false), bring
+    // it back so they can retry. The engine keeps its OWN shareEnded flag,
+    // so this React-side reset doesn't affect resumeScreenShare's guard.
+    setShareEnded(false);
     try {
       const ok = await getOrchestrator().resumeScreenShare();
-      if (ok) setShareEnded(false);
+      if (!ok) setShareEnded(true);
     } finally {
       setShareResuming(false);
     }
@@ -561,6 +571,11 @@ export default function Page() {
     interviewerProfile?: string;
   }) => {
     setShowStart(false);
+    // Clear any leftover "share paused" banner from a PRIOR session — it
+    // only auto-resets on a successful Resume, so after an End & Save while
+    // the share was down it can still be mounted. Left up, it would sit on
+    // top of this new session's ready-bar popup (both are top-14 centered).
+    setShareEnded(false);
     startLive(args.jd, args.resume, args.interviewerProfile);
     // Kick off title extraction in parallel with session start — the
     // heading defaults to "Live Interview Session" until it returns.
@@ -726,6 +741,26 @@ export default function Page() {
 
   const handleEndRequest = () => setShowEnd(true);
 
+  // Fullscreen toggle (Topbar button). Tell the recorder a layout
+  // transition is incoming BEFORE flipping React state, so any garbled
+  // frames Chrome's Region Capture emits during the cropTarget bbox
+  // change never reach the encoder. The Topbar button is disabled while
+  // recording/paused, so in practice this only fires pre-Begin — the
+  // guard stays as defense-in-depth (Esc / programmatic paths). Without
+  // it, a fullscreen toggle produced ~3s of 花屏 in the saved recording.
+  const handleToggleFullscreen = () => {
+    const liveStatus = useStore.getState().live.status;
+    if (liveStatus === "recording" || liveStatus === "paused") {
+      getOrchestrator().triggerCropTransition("fullscreen");
+    }
+    setIsFullscreen((v) => !v);
+  };
+
+  // Live-demo (phone) layout toggle (Topbar button). Layout-only and
+  // disabled while recording/paused, so it never fires mid-recording —
+  // no crop transition / recorder pause needed (unlike fullscreen).
+  const handleTogglePhoneMode = () => setPhoneMode((v) => !v);
+
   /** "Discard" branch of the End modal — user wants to stop the
    *  live session WITHOUT saving it. Releases mic / closes Deepgram /
    *  drops accumulated chunks (audio + video), wipes the live state.
@@ -735,6 +770,9 @@ export default function Page() {
     if (endingRef.current) return;
     endingRef.current = true;
     setShowEnd(false);
+    // Drop the "share paused" banner if it's up — the session is ending,
+    // so there's nothing left to resume.
+    setShareEnded(false);
     // Suppress any prompts that might fire during the stop window —
     // closing-detection's hysteresis-auto-confirm timer can pop a
     // "Looks like the interview just wrapped up" prompt mid-stop and
@@ -781,6 +819,9 @@ export default function Page() {
     // questions=[]".
     if (endingRef.current) return;
     endingRef.current = true;
+    // Drop the "share paused" banner if it's up — the session is ending,
+    // so there's nothing left to resume.
+    setShareEnded(false);
 
     // Last-ditch title generation. If the user clicked Save while
     // /api/session-title was still in-flight (or had failed both
@@ -1436,6 +1477,18 @@ export default function Page() {
                   onStart={handleStart}
                   onPause={handlePauseRequest}
                   onEnd={handleEndRequest}
+                  {...(selectedPastId === null && retake === null
+                    ? {
+                        // Live-demo / Fullscreen controls only make sense
+                        // on the live session view. Supplying the handlers
+                        // is what makes the Topbar render them (as left-side
+                        // flex items next to the breadcrumb).
+                        phoneMode,
+                        onTogglePhoneMode: handleTogglePhoneMode,
+                        isFullscreen,
+                        onToggleFullscreen: handleToggleFullscreen,
+                      }
+                    : {})}
                 />
               </div>
             </>
@@ -1448,31 +1501,7 @@ export default function Page() {
         ) : selectedPastId === null ? (
           <LiveView
             isFullscreen={isFullscreen}
-            onToggleFullscreen={() => {
-              // Tell the recorder a layout transition is incoming
-              // BEFORE flipping React state. handleCropTransition
-              // pauses the videoRecorder immediately, so any
-              // garbled frames Chrome's Region Capture emits during
-              // the cropTarget bbox change (height: 580 lock is
-              // removed in fullscreen, sidebar/PageTitle hide,
-              // card recenters) never reach the encoder. After
-              // ~500ms + 2 RAFs of layout settling the recorder
-              // resumes cleanly. Without this, fullscreen toggles
-              // produced ~3s of 花屏 in the saved recording.
-              const liveStatus = useStore.getState().live.status;
-              if (liveStatus === "recording" || liveStatus === "paused") {
-                getOrchestrator().triggerCropTransition("fullscreen");
-              }
-              setIsFullscreen((v) => !v);
-            }}
             phoneMode={phoneMode}
-            onTogglePhoneMode={() => {
-              // Layout-only, pre-recording toggle. The in-card button is
-              // disabled while recording/paused, so this never fires
-              // mid-recording — no crop transition / recorder pause is
-              // needed (unlike fullscreen).
-              setPhoneMode((v) => !v);
-            }}
             onStartRequest={handleStart}
           />
         ) : (
@@ -1769,7 +1798,14 @@ export default function Page() {
           getDisplayMedia. The button satisfies the user-gesture
           requirement that browsers impose on getDisplayMedia. */}
       {shareEnded && (
-        <div className="fixed left-1/2 top-3 -translate-x-1/2 z-[80] print:hidden">
+        // top-14 (56px) clears the 44px Topbar so this banner never
+        // covers the Start / Pause / End or Live-demo / Fullscreen
+        // controls — otherwise, since it's z-[80] and centered over the
+        // top row, it swallows their clicks and the operator can't End &
+        // Save while the share is paused. Video recording is already
+        // stopped whenever this banner shows, so overlapping the card
+        // below the bar never reaches the recording.
+        <div className="fixed left-1/2 top-14 -translate-x-1/2 z-[80] print:hidden">
           <div
             className="flex items-center gap-3 px-4 py-2.5 rounded-md border border-border-strong bg-bg shadow-lg text-[13px]"
             style={{ boxShadow: "var(--shadow-lg)" }}

@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useStore } from "@/lib/store";
-import { isAdminUser } from "@/lib/auth-client";
 import { useTranslations } from "@/lib/i18n";
 import { ModalShell } from "@/components/modals/ModalShell";
 import { Eyebrow, Button, BrandMark } from "@/components/ui";
@@ -290,17 +288,16 @@ function CommentaryBody({
 
 export function LiveView({
   isFullscreen = false,
-  onToggleFullscreen,
   phoneMode = false,
-  onTogglePhoneMode,
   onStartRequest,
 }: {
+  /** Fullscreen / Live-demo are toggled from the Topbar now (see
+   *  components/Topbar.tsx). LiveView only reads these two flags to
+   *  drive the card's fixed-height / narrow-column layout. */
   isFullscreen?: boolean;
-  onToggleFullscreen?: () => void;
   /** "Live 演示" layout — the two output boxes go narrow + tall.
    *  Set before recording; locked once recording starts. */
   phoneMode?: boolean;
-  onTogglePhoneMode?: () => void;
   /** Called when the empty-state "Start a new session" button is
    *  clicked. Same handler the Topbar Start button calls — opens
    *  StartModal. Optional so LiveView still works in isolation. */
@@ -333,15 +330,6 @@ export function LiveView({
   const isUploadMode = false;
   const forceSetSpeakerRole = useStore((s) => s.forceSetSpeakerRole);
   const [retagModalOpen, setRetagModalOpen] = useState(false);
-
-  // Gate the portaled control cluster (see below) so createPortal only runs
-  // client-side after mount (document.body is undefined during SSR).
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-  // When the admin debug panel occupies the right 360px column (admin +
-  // not fullscreen), inset the portaled controls to its left so they don't
-  // cover it; otherwise sit in the viewport's top-right corner.
-  const adminDebugRail = isAdminUser(useStore((s) => s.user)) && !isFullscreen;
 
   const [interim, setInterim] = useState("");
   useEffect(() => {
@@ -749,8 +737,8 @@ export function LiveView({
               to this element so the saved video shows only the
               coaching panel.
 
-              The fullscreen toggle button is positioned absolute in
-              this card's top-right. */}
+              The Live-demo / Fullscreen toggles live in the Topbar
+              (components/Topbar.tsx), outside this crop target. */}
           <div
             id="ic-capture-region"
             className="sticky top-0 z-10 relative border border-border rounded-lg overflow-hidden bg-bg flex flex-col mb-6"
@@ -797,153 +785,14 @@ export function LiveView({
                   }
             }
           >
-            {/* Fullscreen toggle in the card's top-right corner. Lives
-                INSIDE the card (not in the Topbar) per product spec —
-                so the user always has a one-click exit even when the
-                Topbar is auto-hidden in fullscreen. Ghost-button
-                styling so it doesn't compete with the coaching
-                content.
-                LOCKED during active recording (recording / paused
-                statuses). Toggling fullscreen mid-recording causes a
-                cropTarget bbox change → MediaRecorder reference-frame
-                contamination → brief visual artifact in the saved
-                video. To eliminate this entirely we lock the toggle:
-                user picks fullscreen BEFORE clicking Begin (ready-bar
-                phase, status="starting") and is then committed for
-                the duration. Escape key is similarly gated in
-                app/page.tsx. */}
-            {/* Top-right control cluster. Both toggles are LOCKED during
-                active recording (recording / paused) — the user picks
-                the layout BEFORE clicking Begin, then it's committed for
-                the duration. Toggling either mid-recording would move /
-                resize the Region Capture crop target → 花屏 in the saved
-                video, so we gate them off. */}
-            {(onTogglePhoneMode || onToggleFullscreen) && mounted && (() => {
-              const controlsLocked =
-                live.status === "recording" || live.status === "paused";
-              // Portal the control cluster to <body> so it escapes the card's
-              // `sticky z-10` stacking context. Otherwise the ready-bar popup
-              // ("Set your view size" — fixed z-40) always paints OVER these
-              // buttons no matter their z-index, because the whole card is
-              // trapped at z-10 in the root context. Fixed top-right + z-50
-              // keeps Live demo / Fullscreen visible & clickable above the
-              // popup at ANY screen size, and outside the recording crop
-              // region (card bbox unchanged → no 花屏).
-              return createPortal(
-              <div
-                className="fixed top-2 z-50 flex items-center gap-1.5 print:hidden"
-                style={{ right: adminDebugRail ? 368 : 8 }}
-              >
-                {/* "Live 演示" — narrow-tall (iPhone-ish) vs default
-                    wide-flat (iPad-ish) box layout. */}
-                {onTogglePhoneMode && (
-                  <button
-                    type="button"
-                    onClick={controlsLocked ? undefined : onTogglePhoneMode}
-                    disabled={controlsLocked}
-                    aria-pressed={phoneMode}
-                    title={
-                      controlsLocked
-                        ? t(
-                            "Layout is locked during recording — set this before you click Begin.",
-                            "录制期间无法切换布局 —— 请在点击 Begin 之前设置好。"
-                          )
-                        : phoneMode
-                          ? t("Switch to wide layout", "切换回宽屏布局")
-                          : t("Switch to Live-demo layout", "切换到 Live 演示布局")
-                    }
-                    className="btn btn-ghost btn-sm"
-                  >
-                    {/* Phone / tablet frame icon. Portrait rounded rect
-                        when we'd switch INTO phone mode; wider rect when
-                        we'd switch back to the default layout. */}
-                    <svg
-                      width="12"
-                      height="12"
-                      viewBox="0 0 14 14"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      {phoneMode ? (
-                        /* back-to-wide: landscape frame */
-                        <rect x="1.5" y="3.5" width="11" height="7" rx="1.2" />
-                      ) : (
-                        /* to-phone: portrait frame */
-                        <>
-                          <rect x="3.5" y="1.5" width="7" height="11" rx="1.5" />
-                          <line x1="6" y1="10.7" x2="8" y2="10.7" />
-                        </>
-                      )}
-                    </svg>
-                    <span>
-                      {phoneMode
-                        ? t("Wide", "宽屏")
-                        : t("Live demo", "Live 演示")}
-                    </span>
-                  </button>
-                )}
-                {/* Fullscreen toggle — lives inside the card so there's
-                    always a one-click exit even when the Topbar is
-                    auto-hidden in fullscreen. */}
-                {onToggleFullscreen && (
-                  <button
-                    type="button"
-                    onClick={controlsLocked ? undefined : onToggleFullscreen}
-                    disabled={controlsLocked}
-                    title={
-                      controlsLocked
-                        ? t(
-                            "Fullscreen is locked during recording — set this before you click Begin.",
-                            "录制期间无法切换全屏 —— 请在点击 Begin 之前设置好。"
-                          )
-                        : isFullscreen
-                          ? t("Exit fullscreen (Esc)", "退出全屏 (Esc)")
-                          : t("Fullscreen", "全屏")
-                    }
-                    className="btn btn-ghost btn-sm"
-                  >
-                    {/* Fullscreen toggle icon — SVG instead of Unicode
-                        `⤡` / `⤢` since those glyphs fall back
-                        inconsistently on some font stacks. Two arrows
-                        pointing into / out of the corners of a square. */}
-                    <svg
-                      width="12"
-                      height="12"
-                      viewBox="0 0 14 14"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      aria-hidden="true"
-                    >
-                      {isFullscreen ? (
-                        /* Exit: arrows pointing IN (toward center) */
-                        <>
-                          <path d="M6 2v3H3M2 6h3V3M8 12V9h3M12 8H9v3" />
-                        </>
-                      ) : (
-                        /* Enter: arrows pointing OUT (toward corners) */
-                        <>
-                          <path d="M3 6V3h3M11 3h-3v3M3 8v3h3M11 8v3H8" />
-                        </>
-                      )}
-                    </svg>
-                    <span>
-                      {isFullscreen
-                        ? t("Exit", "退出全屏")
-                        : t("Fullscreen", "全屏")}
-                    </span>
-                  </button>
-                )}
-              </div>,
-              document.body
-              );
-            })()}
+            {/* Layout controls (Live demo / Fullscreen) now live in
+                the Topbar as flex items (see components/Topbar.tsx),
+                not here. They used to be portaled to <body> at
+                `fixed z-50`, which overlapped the Topbar's End /
+                Pause and swallowed their clicks during recording.
+                As real Topbar children they can't overlap anything,
+                and being outside this crop target they never affect
+                the recording bbox (no 花屏). */}
             {/* (1) Current Question — fixed-height top bar.
                 Five phase states (no fallback-Lead bridging):
                   1. Awaiting Identity — pre-confirmation
