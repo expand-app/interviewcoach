@@ -66,7 +66,26 @@ function unauthorized() {
  * an unset secret must 401 everyone rather than degrade to open.
  */
 function authorized(req: Request): boolean {
-  const expected = (process.env.INTERNAL_USAGE_TOKEN_SHA256 ?? "").trim().toLowerCase();
+  // The default IS the hash, deliberately committed. It is not a credential:
+  // what authenticates is its PREIMAGE, and recovering that from a sha256 is
+  // computationally out of reach — the plaintext is a 43-byte high-entropy
+  // random string, so there is no dictionary/rainbow-table path either. (That
+  // premise matters: publish the hash of a human-chosen password and you have
+  // handed out an offline cracking target.) The real credential lives in
+  // exactly two places: LKC's cluster Secret, and the password manager.
+  //
+  // This does not contradict "never hardcode a token default" — that rule is
+  // about PLAINTEXT, where a committed default is a live credential. A
+  // committed hash is useless to whoever reads it, which is the entire point
+  // of #1049.
+  //
+  // The env override stays so a rotation needs no deploy.
+  const expected = (
+    process.env.INTERNAL_USAGE_TOKEN_SHA256 ??
+    "cd481417b3f35d0b4625f0524ebc22e7d49251b4dc9506a11b434e5012d801c9"
+  )
+    .trim()
+    .toLowerCase();
   if (!expected) {
     console.warn("[llm-usage] INTERNAL_USAGE_TOKEN_SHA256 unset — refusing every request");
     return false;
