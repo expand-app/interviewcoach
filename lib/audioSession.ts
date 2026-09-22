@@ -2474,6 +2474,21 @@ export class AudioSession {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
     }
+    // Stop the share-ended watchdog. tearDown() stops the screen-share
+    // video track on purpose (pause / stop), which flips its readyState
+    // to "ended". If the watchdog kept polling, it would — the instant
+    // pause flips to false at the top of the NEXT start() (resume),
+    // before the fresh track replaces croppedVideoTrack — read the stale
+    // dead track as "ended" and false-fire notifyShareEnded, popping the
+    // "Screen recording paused" banner right after a resume even though
+    // resume already re-acquired a healthy share. Clearing it here means
+    // pause parks the watchdog; start() builds a fresh one for the new
+    // track on resume. (The stop() path also clears it further down; this
+    // covers the pause path, where the stop teardown does not run.)
+    if (this.shareTrackWatchdog) {
+      clearInterval(this.shareTrackWatchdog);
+      this.shareTrackWatchdog = null;
+    }
     // Unlock browser zoom — recording is ending (pause or stop), so
     // the user should be able to zoom freely again. On pause/resume
     // the lock is re-attached at the top of the next start().
