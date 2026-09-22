@@ -1235,6 +1235,19 @@ export class AudioSession {
           this.shareTrackWatchdog = setInterval(() => {
             if (this.shareEnded) return; // already handled
             if (this.stopped) return;
+            // Pausing the session tears down the video track on purpose
+            // (pause() → tearDown() → track.stop()), which flips
+            // readyState to "ended". Without this guard the watchdog reads
+            // that as an accidental share drop and fires the "Screen
+            // recording paused — Resume Sharing" banner ~2s after every
+            // Pause — a false alarm the user can't even act on, since
+            // resumeScreenShare() refuses while paused. Skip while paused;
+            // resume() re-runs start(), which resets `paused` to false and
+            // rebuilds this watchdog, so genuine drops after resume are
+            // still caught. (The track "ended" EVENT — the primary signal
+            // for a real drop mid-recording — is unaffected: track.stop()
+            // does not dispatch "ended", so pause never triggers it.)
+            if (this.paused) return;
             const t = this.croppedVideoTrack;
             if (t && t.readyState === "ended") {
               this.notifyShareEnded("watchdog-readystate");
