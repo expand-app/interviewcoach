@@ -71,9 +71,15 @@ function authorized(req: Request): boolean {
     console.warn("[llm-usage] INTERNAL_USAGE_TOKEN_SHA256 unset — refusing every request");
     return false;
   }
-  const got = createHash("sha256")
-    .update(req.headers.get("x-internal-token") ?? "")
-    .digest("hex");
+  const token = req.headers.get("x-internal-token") ?? "";
+  // An empty token is never a valid credential — rejected before hashing. Not
+  // redundant: if sha256("") is ever configured by mistake (a generator command
+  // that read an empty line produces exactly that), a request with NO header at
+  // all would hash to a matching digest and open this endpoint to everyone. The
+  // "unset secret" check above does not catch it, because that value is
+  // non-empty and looks perfectly configured.
+  if (!token) return false;
+  const got = createHash("sha256").update(token).digest("hex");
   const a = Buffer.from(got, "utf8");
   const b = Buffer.from(expected, "utf8");
   // A malformed setting (not a 64-char hex digest) would make the lengths
