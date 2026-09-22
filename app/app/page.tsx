@@ -555,6 +555,11 @@ export default function Page() {
       // The browser may re-prompt for tab share if system-audio was
       // enabled; that's the cost of fully releasing the mic on pause
       // per user spec.
+      //
+      // Clear any "share paused" banner as we resume. The watchdog no
+      // longer false-fires on resume (it's parked during pause now), but
+      // reset defensively so resume always lands on a clean banner state.
+      setShareEnded(false);
       void getOrchestrator().resume();
       return;
     }
