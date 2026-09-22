@@ -89,7 +89,7 @@ Write the JSON.`;
   // Same retry shape as the other model-backed routes — one
   // ECONNRESET shouldn't lose the summary. 2 attempts, 2s backoff.
   async function callWithRetry() {
-    const client = getDeepseekClient();
+    const client = getDeepseekClient("summarize_context");
     const doCall = () =>
       client.chat.completions.create({
         model: DEEPSEEK_MODEL,

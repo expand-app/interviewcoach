@@ -36,7 +36,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ roles: {} });
   }
 
-  const client = getDeepseekClient();
+  const client = getDeepseekClient("identify_speakers");
 
   const system = `You identify the role of each speaker in a recorded interview.
 

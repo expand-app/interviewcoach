@@ -69,7 +69,7 @@ Write the JSON.`;
 
   // Retry shape mirrors the other model-backed routes.
   async function callWithRetry() {
-    const client = getDeepseekClient();
+    const client = getDeepseekClient("summarize_interviewer");
     const doCall = () =>
       client.chat.completions.create({
         model: DEEPSEEK_MODEL,

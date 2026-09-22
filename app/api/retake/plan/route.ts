@@ -141,7 +141,7 @@ Rules:
 Return ONLY the JSON object, no markdown fences.`;
 
   try {
-    const client = getDeepseekClient();
+    const client = getDeepseekClient("retake_plan");
     const resp = await client.chat.completions.create({
       model: DEEPSEEK_MODEL,
       max_tokens: 3000,

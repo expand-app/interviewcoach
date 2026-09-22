@@ -23,6 +23,8 @@
  */
 
 import OpenAI from "openai";
+
+import { recordUsage, type UsageFeature } from "@/lib/usage";
 import nodeFetch, { type RequestInit as NodeFetchInit } from "node-fetch";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import type { Agent as HttpAgent } from "http";
@@ -203,14 +205,60 @@ async function proxyAwareFetch(
  * Throws when DEEPSEEK_API_KEY is missing — callers should surface a
  * 500 with that message to the UI so the setup issue is obvious.
  */
-export function getDeepseekClient(): OpenAI {
+export function getDeepseekClient(feature?: UsageFeature): OpenAI {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error("DEEPSEEK_API_KEY not set");
-  return new OpenAI({
+  const client = new OpenAI({
     apiKey,
     baseURL: DEEPSEEK_BASE_URL,
     // The SDK's `fetch` option is typed as the web-standard fetch;
     // our shim is runtime-compatible for the subset the SDK uses.
     fetch: proxyAwareFetch as unknown as typeof fetch,
   });
+  return feature ? withUsageMetering(client, feature) : client;
+}
+
+/**
+ * Wrap `chat.completions.create` so every non-streaming call lands one
+ * `llm_call_usage` row (#1122 — LKC's token digest pulls those rows).
+ *
+ * Metering at the factory rather than at each call site is deliberate: there
+ * are a dozen routes, several of them retry inside a closure or race the
+ * promise against a timeout, and rewriting those invocations to thread a
+ * recorder through would be a far larger diff than passing one string. Each
+ * route changes from `getDeepseekClient()` to `getDeepseekClient("<feature>")`
+ * and is covered.
+ *
+ * A retry loop meters every attempt that came back with a usage block, which
+ * is correct — each attempt was billed.
+ *
+ * **Streams are skipped here.** With `stream: true` the SDK resolves to an
+ * async iterable, and its usage only arrives in a final chunk when the request
+ * asked for `stream_options: { include_usage: true }`. Tapping the iterator
+ * from in here would mean buffering somebody else's stream, so the one
+ * streaming route (/api/commentary) records from its own final chunk instead.
+ * The `params.stream` check is what keeps this wrapper from reporting a bogus
+ * zero-token row for those calls.
+ *
+ * Nothing here can reject: `recordUsage` swallows its own failures, and the
+ * response is returned before metering is awaited only in the sense that the
+ * await cannot change it.
+ */
+function withUsageMetering(client: OpenAI, feature: UsageFeature): OpenAI {
+  const completions = client.chat.completions;
+  const original = completions.create.bind(completions);
+
+  // The SDK's `create` is heavily overloaded (streaming vs not) and its
+  // APIPromise carries extra methods; nothing in this app uses those
+  // (`withResponse` / `asResponse` appear nowhere), so a plain async wrapper
+  // is safe here. Revisit if a call site ever reaches for them.
+  completions.create = (async (params: any, options?: any) => {
+    const resp = await original(params, options);
+    if (!params?.stream) {
+      await recordUsage(feature, (resp as any)?.usage, params?.model ?? "");
+    }
+    return resp;
+  }) as typeof completions.create;
+
+  return client;
 }

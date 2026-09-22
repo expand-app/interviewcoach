@@ -59,7 +59,7 @@ ${jd.slice(0, 4000)}
 Write the title.`;
 
   try {
-    const client = getDeepseekClient();
+    const client = getDeepseekClient("session_title");
     const resp = await client.chat.completions.create({
       model: DEEPSEEK_MODEL,
       max_tokens: 40,
