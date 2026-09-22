@@ -147,31 +147,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_started
 ALTER TABLE sessions
   ADD COLUMN IF NOT EXISTS video_mov_s3_key TEXT;
 
--- Backfill score_error for orphan sessions whose score never ran
--- (early closing-prompt race / network blip / page closed
--- pre-scoring). Without this, PastView shows a "Scoring this
--- session…" spinner forever — no code path ever fires the score
--- call again for these rows. Two passes:
---   (1) Empty sessions (duration<10s OR no questions captured) —
---       these will never produce a useful score even on retry.
---   (2) Sessions with content but missing score AND scoreError —
---       these CAN be re-scored; tell the user to click Re-score.
--- Idempotent: WHERE clause excludes rows already marked, so future
--- migration runs touch nothing. New sessions never satisfy this
--- because endLive's pre-flight guard sets score_error explicitly
--- when applicable.
-UPDATE sessions
-   SET score_error = 'Empty session — no content captured during recording.'
- WHERE score IS NULL
-   AND score_error IS NULL
-   AND (duration_seconds < 10
-        OR id NOT IN (SELECT DISTINCT session_id FROM questions));
-
-UPDATE sessions
-   SET score_error = 'Scoring did not complete on this session. Click Re-score to try again.'
- WHERE score IS NULL
-   AND score_error IS NULL;
-
 -- =====================================================================
 -- questions — Lead and Probe questions, ordered by `position`.
 -- parent_question_id NULL = Lead, set = Probe under that Lead.
@@ -341,3 +316,83 @@ ALTER TABLE sessions
   ADD COLUMN IF NOT EXISTS session_mode TEXT NOT NULL DEFAULT 'live';
 CREATE INDEX IF NOT EXISTS idx_sessions_parent
   ON sessions(parent_session_id);
+
+-- =====================================================================
+-- llm_call_usage — one row per metered LLM call (#1122).
+--
+-- LKC's daily「LLM Token 花费日报」aggregates every service's spend by
+-- pulling GET /internal/llm-usage/daily over an arbitrary
+-- [since, until) window — it prices DeepSeek peak vs off-peak from
+-- sub-intervals of a single day. So this has to be per-call rows with a
+-- real timestamp, not a daily rollup.
+--
+-- Raw counts only, never money: pricing lives in exactly one place (the
+-- hub, against its own rate table), so no service can drift on rates.
+--
+-- The DeepSeek cache split is the whole point of having two input
+-- columns. Its `prompt_tokens` INCLUDES cache hits, which bill at
+-- roughly a tenth of the uncached rate — booking the whole prompt as
+-- input overstates the bill. So input_tokens = prompt_cache_miss_tokens
+-- and cache_read_tokens = prompt_cache_hit_tokens.
+--
+-- feature is a stable snake_case key, never a display label: the label
+-- the digest renders is mapped at the reporting boundary, so renaming it
+-- cannot rewrite history.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS llm_call_usage (
+  id                  BIGSERIAL PRIMARY KEY,
+  feature             TEXT        NOT NULL,
+  provider            TEXT        NOT NULL DEFAULT 'deepseek',
+  model               TEXT        NOT NULL DEFAULT '',
+  calls               INTEGER     NOT NULL DEFAULT 1,
+  input_tokens        INTEGER     NOT NULL DEFAULT 0,
+  output_tokens       INTEGER     NOT NULL DEFAULT 0,
+  cache_read_tokens   INTEGER     NOT NULL DEFAULT 0,
+  cache_write_tokens  INTEGER     NOT NULL DEFAULT 0,
+  total_tokens        INTEGER     NOT NULL DEFAULT 0,
+  -- TRUE when the response carried no prompt_cache_hit/miss split, so
+  -- the whole prompt was booked as uncached. Flagged rather than hidden:
+  -- a number nobody can reconcile is worse than one marked approximate.
+  cache_split_missing BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- The hub's only query shape: a window, grouped by the three reporting
+-- dimensions.
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_window
+  ON llm_call_usage(created_at, feature, provider);
+
+-- =====================================================================
+-- One-off data backfills. THESE MUST STAY AT THE BOTTOM: this file is
+-- replayed in full on every process's first DB call, and a statement
+-- that reads a table declared further down aborts the whole run — on a
+-- fresh database everything after the failure point silently never gets
+-- created. The `questions` subquery below is exactly that case, and it
+-- used to sit ~400 lines above `CREATE TABLE questions`.
+-- =====================================================================
+
+-- Backfill score_error for orphan sessions whose score never ran
+-- (early closing-prompt race / network blip / page closed
+-- pre-scoring). Without this, PastView shows a "Scoring this
+-- session…" spinner forever — no code path ever fires the score
+-- call again for these rows. Two passes:
+--   (1) Empty sessions (duration<10s OR no questions captured) —
+--       these will never produce a useful score even on retry.
+--   (2) Sessions with content but missing score AND scoreError —
+--       these CAN be re-scored; tell the user to click Re-score.
+-- Idempotent: WHERE clause excludes rows already marked, so future
+-- migration runs touch nothing. New sessions never satisfy this
+-- because endLive's pre-flight guard sets score_error explicitly
+-- when applicable.
+UPDATE sessions
+   SET score_error = 'Empty session — no content captured during recording.'
+ WHERE score IS NULL
+   AND score_error IS NULL
+   AND (duration_seconds < 10
+        OR id NOT IN (SELECT DISTINCT session_id FROM questions));
+
+UPDATE sessions
+   SET score_error = 'Scoring did not complete on this session. Click Re-score to try again.'
+ WHERE score IS NULL
+   AND score_error IS NULL;
+
