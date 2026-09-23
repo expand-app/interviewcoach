@@ -148,7 +148,7 @@ async function expandSingle(
   jd: string,
   resume: string
 ): Promise<string | null> {
-  const client = getDeepseekClient();
+  const client = getDeepseekClient("expand_suggestions");
   const user = buildUserPrompt(item, jd, resume);
 
   const doCall = () =>

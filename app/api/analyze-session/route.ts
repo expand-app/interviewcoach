@@ -56,7 +56,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "missing log" }, { status: 400 });
   }
 
-  const client = getDeepseekClient();
+  const client = getDeepseekClient("analyze_session");
 
   const system = `You are an expert QA engineer for "puebulo", a live
 coaching app that listens to interviews and overlays real-time AI

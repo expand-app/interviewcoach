@@ -128,7 +128,7 @@ export async function POST(req: Request) {
   const sessionIsMature =
     sessionElapsedSec >= 5 * 60 && priorLeadCount >= 1;
 
-  const client = getDeepseekClient();
+  const client = getDeepseekClient("classify_moment");
 
   // === Layer 2 branch: confirmation-focused prompt ===
   // Runs in parallel with the main classifier. Asks ONE specific binary

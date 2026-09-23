@@ -1,4 +1,5 @@
 import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { recordUsage } from "@/lib/usage";
 
 export const runtime = "nodejs";
 
@@ -117,7 +118,7 @@ ${trimmedProfile}
     return new Response("Missing candidateQuestion", { status: 400 });
   }
 
-  const client = getDeepseekClient();
+  const client = getDeepseekClient("commentary");
 
   // ==== SUGGESTED-ANSWER BLOCK (shared across all 4 modes / 6 prompts) ====
   // The user wants every commentary / hint to end with a tiny English
@@ -526,17 +527,34 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
           model: DEEPSEEK_MODEL,
           max_tokens: 600,
           stream: true,
+          // Without this a streamed call reports NO usage at all, and this is
+          // the highest-volume call in the app (it fires every ~220 chars of
+          // answer) — the one most worth having in the token digest (#1122).
+          // It costs one extra final chunk whose `choices` is empty; the loop
+          // below already tolerates that via optional chaining.
+          stream_options: { include_usage: true },
           messages: [
             { role: "system", content: systemForMode },
             { role: "user", content: userMsg },
           ],
         });
 
+        // The usage chunk is the last one and carries no content. Captured
+        // rather than metered inline so a mid-stream failure doesn't book a
+        // partial row: DeepSeek sends no usage chunk in that case anyway.
+        let streamUsage: unknown = null;
         for await (const chunk of messageStream) {
+          const usage = (chunk as { usage?: unknown }).usage;
+          if (usage) streamUsage = usage;
           const delta = chunk.choices[0]?.delta?.content;
           if (delta) send({ type: "delta", text: delta });
         }
         send({ type: "done" });
+        // After "done" on purpose — the DB insert must not sit between the
+        // last token and the client being told the comment is complete.
+        // The client factory's wrapper skips streams, so this is the only
+        // place a commentary row is written.
+        await recordUsage("commentary", streamUsage as never, DEEPSEEK_MODEL);
       } catch (e) {
         const msg = e instanceof Error ? e.message : "unknown";
         send({ type: "error", error: msg });

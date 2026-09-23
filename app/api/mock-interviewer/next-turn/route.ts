@@ -136,7 +136,7 @@ Return ONLY JSON: {"action": "followup" | "next" | "wrapup", "utterance": string
 - action "wrapup": utterance = "", nextSlotIndex = ${currentSlotIndex}`;
 
   try {
-    const client = getDeepseekClient();
+    const client = getDeepseekClient("mock_interviewer");
     const resp = await client.chat.completions.create({
       model: DEEPSEEK_MODEL,
       max_tokens: 400,

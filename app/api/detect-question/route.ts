@@ -32,7 +32,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ isQuestion: false });
   }
 
-  const client = getDeepseekClient();
+  const client = getDeepseekClient("detect_question");
 
   const system = `You are a classifier inside a live interview assistant. You decide if the latest utterance from the transcript stream is the interviewer asking a NEW question.
 

@@ -760,7 +760,7 @@ Score the interview. Return JSON only.`;
   // wall-clock — a third attempt would push past most users'
   // patience and the 90s client-side timeout.
   async function callModelWithRetry() {
-    const client = getDeepseekClient();
+    const client = getDeepseekClient("score_session");
     const doCall = () =>
       client.chat.completions.create({
         model: DEEPSEEK_MODEL,
@@ -1005,7 +1005,7 @@ Score the interview. Return JSON only.`;
         });
       }
       try {
-        const client = getDeepseekClient();
+        const client = getDeepseekClient("score_session");
         const strictAddendum =
           "\n\n--- OVERRIDE INSTRUCTION (MANDATORY) ---\n" +
           "Your previous response declined to grade this session (returned " +
