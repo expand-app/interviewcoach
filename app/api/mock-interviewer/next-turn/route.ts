@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -136,10 +136,10 @@ Return ONLY JSON: {"action": "followup" | "next" | "wrapup", "utterance": string
 - action "wrapup": utterance = "", nextSlotIndex = ${currentSlotIndex}`;
 
   try {
-    const client = getDeepseekClient("mock_interviewer");
+    const client = getLunaClient("mock_interviewer");
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 400,
+      model: LUNA_MODEL,
+      max_completion_tokens: 400,
       messages: [{ role: "user", content: prompt }],
     });
     const text =

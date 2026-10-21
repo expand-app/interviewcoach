@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -25,10 +25,10 @@ interface Body {
  * summary isn't ready, so failure here is non-fatal.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "DEEPSEEK_API_KEY not set", fallback: true },
+      { error: "OPENAI_API_KEY not set", fallback: true },
       { status: 200 }
     );
   }
@@ -69,11 +69,11 @@ Write the JSON.`;
 
   // Retry shape mirrors the other model-backed routes.
   async function callWithRetry() {
-    const client = getDeepseekClient("summarize_interviewer");
+    const client = getLunaClient("summarize_interviewer");
     const doCall = () =>
       client.chat.completions.create({
-        model: DEEPSEEK_MODEL,
-        max_tokens: 400,
+        model: LUNA_MODEL,
+        max_completion_tokens: 400,
         messages: [
           { role: "system", content: system },
           { role: "user", content: user },

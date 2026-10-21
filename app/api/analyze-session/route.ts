@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 // Analysis is a single model call with a large context (full log +
@@ -38,7 +38,7 @@ interface Finding {
  * Auto-diagnose a puebulo session.
  *
  * Given the debug log (events + timestamps) and the transcript (what
- * was actually said), a DeepSeek pass identifies behavioral bugs and
+ * was actually said), a Luna pass identifies behavioral bugs and
  * coaching-quality issues in the orchestrator. Returns a structured
  * list the user can review and selectively export to Claude Code for
  * implementation.
@@ -56,7 +56,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "missing log" }, { status: 400 });
   }
 
-  const client = getDeepseekClient("analyze_session");
+  const client = getLunaClient("analyze_session");
 
   const system = `You are an expert QA engineer for "puebulo", a live
 coaching app that listens to interviews and overlays real-time AI
@@ -73,7 +73,7 @@ Speech pipeline:
   assigned the opposite role.
 
 State machine (per-utterance):
-- classify-moment (DeepSeek) decides: chitchat / interviewer_speaking /
+- classify-moment (Luna) decides: chitchat / interviewer_speaking /
   question_finalized, with a questionRelation (new_topic / follow_up / null).
 - When question_finalized fires, a 4-layer filter gates the commit:
   L0: reject-cache for repeat hallucinations
@@ -191,8 +191,8 @@ Produce JSON with your findings.`;
 
   try {
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 8000,
+      model: LUNA_MODEL,
+      max_completion_tokens: 8000,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },

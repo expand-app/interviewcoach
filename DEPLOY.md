@@ -24,8 +24,8 @@ npm install
 
 # 3. Set up your API key
 cp .env.local.example .env.local
-# Open .env.local in any text editor and paste your DeepSeek API key
-# Get one at https://platform.deepseek.com/api_keys
+# Open .env.local in any text editor and paste your GPT-6 Luna API key
+# Get one at https://platform.openai.com/api-keys
 
 # 4. Run the dev server
 npm run dev
@@ -69,7 +69,7 @@ git push -u origin main
    - Build Command: `npm run build` (default)
    - Output Directory: `.next` (default)
 4. Click **Environment Variables** and add:
-   - `DEEPSEEK_API_KEY` = `sk-...` (your real key)
+   - `OPENAI_API_KEY` = `sk-...` (your real key)
 5. Click **Deploy**
 
 First deploy takes ~2 minutes. After it finishes you get a URL like `https://interview-coach-abc123.vercel.app`.
@@ -102,7 +102,7 @@ You're on Safari or Firefox. Use Chrome or Edge.
 
 ### The page loads but nothing happens when I click Start
 Open the browser's DevTools console (F12 → Console tab). Look for red errors. Most likely either:
-- `DEEPSEEK_API_KEY` isn't set — check your `.env.local`
+- `OPENAI_API_KEY` isn't set — check your `.env.local`
 - You're on a non-HTTPS URL and the browser is blocking microphone access
 
 ### AI commentary appears then disappears
@@ -116,25 +116,53 @@ Replace `lib/audioSession.ts` with a WebSocket-based Deepgram streaming version.
 
 ---
 
-## Cost estimate (DeepSeek only, Web Speech API is free)
+## Text-model cost and cache validation
 
-Published `deepseek-flash` rates (off-peak; peak hours are 2x):
+All former DeepSeek text calls now use OpenAI `gpt-6-luna` in Standard mode,
+with `reasoning_effort: none`. Speech recognition, TTS and the optional
+Realtime voice engine are separate and unchanged.
 
-| | per 1M tokens |
-|---|---|
-| input, cache miss | $0.15 |
-| input, cache hit | $0.003 |
-| output | $0.60 |
+Published short-context prices (USD / 1M tokens, checked 2026-10-21):
 
-Repeated system prompts — the commentary coach prompt, the scoring
-rubric — are cached automatically, so a busy session pays the cache-hit
-rate on most of its input.
+| Input | Cache read | 30-minute cache write | Output |
+|---|---|---|---|
+| $0.10 | $0.01 | $0.125 | $0.50 |
 
-A 30-minute interview runs on the order of **$0.02-0.04**. Treat that as
-an order of magnitude, not a quote: the rates above are published, but
-the call volume behind the estimate (roughly 50 question-detection
-calls, 15 commentary streams, one scorecard, plus titles and summaries)
-is an assumption that has not been measured against production traffic.
+Cache writes replace ordinary input pricing for those tokens; do not add
+both rates. Requests above 272K input tokens have different pricing.
+Official pricing: https://developers.openai.com/api/docs/models/gpt-6-luna
 
-Every route shares one model, so there is no cheap-tier/expensive-tier
-tradeoff to tune — cost scales with call volume and prompt size only.
+`lib/luna-request.ts` uses explicit 30-minute cache breakpoints on leading
+instructions/session context only. Changing transcript text is not cached.
+Prefixes below 1,024 tokens are ineligible; no padding or cache warmup calls
+are sent. Commentary keeps shared rules first, stable JD/resume context
+second, and changing question/answer/dialogue last. A first write and later
+reads are billed by OpenAI; cache hits and latency are not guaranteed.
+
+The existing `llm_call_usage` table records provider `openai`, actual model,
+ordinary input, cache reads, cache writes and output separately. Historical
+DeepSeek rows remain intact and the internal daily-report contract is
+unchanged. Verify the billing hub has a `gpt-6-luna` pricing rule before
+production release. Do not estimate a monthly bill without actual usage.
+
+Validation:
+
+```bash
+npm run test:luna          # local mocked transport/accounting checks; no API key
+npm run check:types
+npm run smoke:luna         # 6 small billable calls, fictional data; local key needed
+```
+
+The smoke check exercises the real classification, commentary (SSE) and
+question-detection routes without writing to the database. It checks cache
+reads on repeated classification/commentary requests even when the current
+question changes, and prints only token counts, timings and estimated cost.
+A zero cache hit fails validation; investigate routing, prefix stability and
+eligibility before release. This is a smoke check, not a full quality eval.
+
+For deployment, configure `OPENAI_API_KEY` in the hosting environment; local
+`.env.local` is not deployed. Do not change `NEXT_PUBLIC_RETAKE_ENGINE` just
+to enable Luna: it selects the voice engine only. Keep `DEEPGRAM_API_KEY`.
+Never commit keys, and never overwrite an existing `.env.local` from the
+example file when updating an installation. Switching production requires a
+separate release after validation; these edits do not deploy automatically.

@@ -17,7 +17,7 @@
  * so the same session doesn't double-fire if multiple opens hit fast.
  */
 
-import { getDeepseekClient, DEEPSEEK_MODEL } from "./deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "./luna-client";
 import { query, withTx } from "./db";
 import { logSessionEvent, logSessionEvents } from "./session-event-log";
 
@@ -183,10 +183,10 @@ ${itemsBlock}
 
 Write the JSON.`;
 
-    const client = getDeepseekClient();
+    const client = getLunaClient("expand_suggestions");
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 8000,
+      model: LUNA_MODEL,
+      max_completion_tokens: 8000,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },

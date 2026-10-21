@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -141,10 +141,10 @@ Rules:
 Return ONLY the JSON object, no markdown fences.`;
 
   try {
-    const client = getDeepseekClient("retake_plan");
+    const client = getLunaClient("retake_plan");
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 3000,
+      model: LUNA_MODEL,
+      max_completion_tokens: 3000,
       messages: [{ role: "user", content: prompt }],
     });
     const text =

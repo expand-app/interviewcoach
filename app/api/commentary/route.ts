@@ -1,4 +1,4 @@
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 import { recordUsage } from "@/lib/usage";
 
 export const runtime = "nodejs";
@@ -64,9 +64,9 @@ interface CommentaryBody {
  * every ~80 words of new answer text).
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return new Response("DEEPSEEK_API_KEY not set", { status: 500 });
+    return new Response("OPENAI_API_KEY not set", { status: 500 });
   }
 
   const body = (await req.json()) as CommentaryBody;
@@ -118,7 +118,7 @@ ${trimmedProfile}
     return new Response("Missing candidateQuestion", { status: 400 });
   }
 
-  const client = getDeepseekClient("commentary");
+  const client = getLunaClient("commentary");
 
   // ==== SUGGESTED-ANSWER BLOCK (shared across all 4 modes / 6 prompts) ====
   // The user wants every commentary / hint to end with a tiny English
@@ -147,19 +147,6 @@ Rules for the SAY block:
 - The marker \`---SAY---\` MUST be on its own line, exactly as written, before the Try: line.`;
 
   const systemEn = `You are a senior interview coach silently observing a live interview. Write ONE short, pointed observation about how the answer is going.
-
-=== JOB DESCRIPTION ===
-${jd}
-=== END JD ===
-
-${resume ? `=== CANDIDATE RESUME ===
-${resume}
-=== END RESUME ===
-
-Use the resume to cross-check claims. Flag claimed experience not on the resume; note missed opportunities to invoke relevant resume experience.
-` : ""}
-${interviewerBlockEn}
-The interviewer's question: "${question}"
 
 Your job:
 - Write ONE observation, 2–3 sentences (HARD upper bound: ~40 words / ~200 characters). This must fit in a FIXED display pane that ALSO has to render a 15-30 word "Try this" suggestion below it — anything longer will be clipped at the bottom. Use the space to actually develop a point: name the moment, name the gap or strength, say what to do or watch for next. Don't pad; one sharp sentence is fine when that's all there is.
@@ -229,19 +216,6 @@ This prevents Commentary from confidently critiquing based on a possibly-mishear
 If prior comments exist for this same answer, don't repeat — add a NEW angle, or switch register (if you've been critical, find something real to praise, and vice versa).${SAY_BLOCK}`;
 
   const systemZh = `你是一位资深面试教练,正在旁观一场真实面试。你在看候选人回答一个具体问题,就这段回答的进行情况给出一句简短、有针对性的观察。
-
-=== 岗位描述 (JD) ===
-${jd}
-=== JD 结束 ===
-
-${resume ? `=== 候选人简历 ===
-${resume}
-=== 简历结束 ===
-
-用简历来核对候选人说的内容。如果他声称的经历在简历上看不出来,指出来。如果简历上有相关经历但他没提到,也指出这个错过的机会。
-` : ""}
-${interviewerBlockZh}
-面试官的问题:"${question}"
 
 你的任务:
 - 写一条观察,2-3 句(硬性上限:主体 80 字以内,英文术语不计入)。这段要放进一个固定大小的展示框,框下面还要放一个 15-30 词的"Try this"建议块,主体超长会从底部裁掉。用这个空间真正展开:指出哪个瞬间、问题/亮点是什么、下一步该怎么做或看什么。不要硬凑;只有一句 sharp 的就停。
@@ -340,11 +314,6 @@ DRIFT DETECTION(重要):
   // and how to pick up the thread — not judge an answer.
   const systemListening = `你是一位资深面试教练,正在旁观一场真实面试。面试官现在正在说一段比较长的话 —— 可能在介绍团队 / 产品 / 案例背景,也可能在铺垫一个问题,或者在给反馈。你的任务不是评价候选人的答案,而是帮候选人 READ 这段信息:告诉他应该抓什么、面试官在关心什么、接下来怎么接。
 
-=== 岗位描述 (JD) ===
-${jd}
-=== JD 结束 ===
-
-${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}${interviewerBlockZh}
 输出形式:
 - 一条"听力提示",2-3 句(硬性上限:主体 80 字以内,英文术语不计入)。要放进固定大小的展示框,框下面还要放一个 15-30 词的"Try this"建议块,主体超长会从底部裁掉。抓面试官刚说的具体细节、点出他的关切,再给一句候选人可以怎么接的建议。不要硬凑;短 sharp 也可以。
 - 中文为主,关键词保留英文。
@@ -368,11 +337,6 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
 
   const systemListeningEn = `You are a senior interview coach observing a live interview. The interviewer is currently monologuing — describing the team / product / case background, or setting up a problem, or giving context. Your job is NOT to judge an answer. It's to help the candidate READ this monologue: what to catch, what the interviewer cares about, how to pick up the thread.
 
-=== JOB DESCRIPTION ===
-${jd}
-=== END JD ===
-
-${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}${interviewerBlockEn}
 Output:
 - ONE listening tip, 2–3 sentences (HARD upper bound: ~40 words / ~200 characters). This must fit in a FIXED display pane that ALSO has to render a 15-30 word "Try this" suggestion below it — anything longer will be clipped at the bottom. Catch the specific detail the interviewer just revealed, flag what they care about, and give one concrete suggestion for how the candidate can pick up the thread. Don't pad — a sharp short tip is fine.
 - ENGLISH, with technical terms preserved.
@@ -415,11 +379,7 @@ Don't phrase this as a judgment. It's a tip, not a score.${SAY_BLOCK}`;
   //   - Sandbagging — only asking about benefits / WFH / promotion path
   const systemCandidateQuestionEn = `You are a senior interview coach observing a live interview during the REVERSE Q&A phase — the interviewer has finished their questions and turned the floor over to the candidate ("any questions for me?"). The candidate is now asking the interviewer questions, and your job is to evaluate the QUALITY of the candidate's question and (where relevant) how to follow it up.
 
-=== JOB DESCRIPTION ===
-${jd}
-=== END JD ===
 
-${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\n\n` : ""}${interviewerBlockEn}
 
 Your job: ONE short observation, 2–3 sentences (HARD upper bound: ~40 words / ~200 characters). Fits in a fixed display pane that ALSO has to render a 15-30 word "Try this" suggestion below — anything longer is clipped. ENGLISH with technical terms preserved. May use <strong>...</strong> for 1–2 key terms. No markdown. No preamble.
 
@@ -452,11 +412,6 @@ Examples:
 
   const systemCandidateQuestionZh = `你是一位资深面试教练,正在旁观一场真实面试的 REVERSE Q&A 阶段 —— 面试官的问题问完了,把发言权交给了候选人("你有什么想问我的?"),候选人现在在问面试官问题。你的工作是评价**候选人这个问题的质量**,以及在哪里可以追问。
 
-=== 岗位描述 (JD) ===
-${jd}
-=== JD 结束 ===
-
-${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}${interviewerBlockZh}
 
 输出:一条观察,2-3 句(硬性上限:主体 80 字以内,英文术语不计入)。要放进固定大小展示框,框下面还要放一个 15-30 词的"Try this"建议块,主体超长会从底部裁掉。中文为主,英文术语保留。可以用 <strong>...</strong> 标 1-2 个关键词。不要 markdown,不要开场白。
 
@@ -497,8 +452,8 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
         ? `候选人现在向面试官问的问题:\n"""\n${candidateQuestion}\n"""${dialogueBlock}\n\n评价这个问题的质量,并(如果合适)建议一个追问方向。`
         : `Candidate's current question to the interviewer:\n"""\n${candidateQuestion}\n"""${dialogueBlock}\n\nEvaluate the quality of this question, and (where relevant) suggest a follow-up.`
       : lang === "zh"
-        ? `候选人目前的回答:\n"""\n${answer}\n"""${dialogueBlock}${priorBlock}\n\n给出你的下一句观察。`
-        : `Candidate's answer so far:\n"""\n${answer}\n"""${dialogueBlock}${priorBlock}\n\nGive your next observation.`;
+        ? `面试官的问题:"${question}"\n\n候选人目前的回答:\n"""\n${answer}\n"""${dialogueBlock}${priorBlock}\n\n给出你的下一句观察。`
+        : `Interviewer's question: "${question}"\n\nCandidate's answer so far:\n"""\n${answer}\n"""${dialogueBlock}${priorBlock}\n\nGive your next observation.`;
 
   const systemForMode =
     mode === "listening"
@@ -513,6 +468,15 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
         ? systemZh
         : systemEn;
 
+  // Rules are shared across sessions; this second prefix is stable within
+  // a session. Only the final user message contains the changing question,
+  // answer, dialogue and prior comments.
+  const sessionContext = `=== JOB DESCRIPTION ===
+${jd}
+=== END JD ===
+
+${resume ? `=== CANDIDATE RESUME ===\n${resume}\n=== END RESUME ===\nUse the resume to cross-check claims. Flag claimed experience not on the resume; note missed opportunities to invoke relevant resume experience.\n\n` : ""}${lang === "zh" ? interviewerBlockZh : interviewerBlockEn}`;
+
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
@@ -524,8 +488,8 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
         // the candidate is still on the topic — first-token latency
         // matters far more here than total completion time.
         const messageStream = await client.chat.completions.create({
-          model: DEEPSEEK_MODEL,
-          max_tokens: 600,
+          model: LUNA_MODEL,
+          max_completion_tokens: 600,
           stream: true,
           // Without this a streamed call reports NO usage at all, and this is
           // the highest-volume call in the app (it fires every ~220 chars of
@@ -534,14 +498,15 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
           // below already tolerates that via optional chaining.
           stream_options: { include_usage: true },
           messages: [
-            { role: "system", content: systemForMode },
+            { role: "developer", content: systemForMode },
+            { role: "developer", content: sessionContext },
             { role: "user", content: userMsg },
           ],
         });
 
         // The usage chunk is the last one and carries no content. Captured
         // rather than metered inline so a mid-stream failure doesn't book a
-        // partial row: DeepSeek sends no usage chunk in that case anyway.
+        // partial row: Luna sends no usage chunk in that case anyway.
         let streamUsage: unknown = null;
         for await (const chunk of messageStream) {
           const usage = (chunk as { usage?: unknown }).usage;
@@ -554,7 +519,7 @@ ${resume ? `=== 候选人简历 ===\n${resume}\n=== 简历结束 ===\n\n` : ""}$
         // last token and the client being told the comment is complete.
         // The client factory's wrapper skips streams, so this is the only
         // place a commentary row is written.
-        await recordUsage("commentary", streamUsage as never, DEEPSEEK_MODEL);
+        await recordUsage("commentary", streamUsage as never, LUNA_MODEL);
       } catch (e) {
         const msg = e instanceof Error ? e.message : "unknown";
         send({ type: "error", error: msg });
