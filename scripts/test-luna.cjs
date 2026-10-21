@@ -4,6 +4,94 @@ const { createLoader } = require('./load-typescript.cjs');
 const load = createLoader();
 const { prepareLunaRequest } = load('lib/luna-request.ts');
 const { normalizeUsage } = load('lib/usage-tokens.ts');
+const { assertFinalizedQuestion } = require('./luna-smoke-assertions.cjs');
+
+test('classification smoke rejects malformed model output hidden by route fallbacks', async () => {
+  const question = 'How did you measure the impact of your work?';
+  let modelText;
+  const routeLoad = createLoader({
+    '@/lib/luna-client': { LUNA_MODEL: 'gpt-6-luna', getLunaClient: () => ({ chat: { completions: {
+      create: async () => ({ choices: [{ message: { content: modelText } }] }),
+    } } }) },
+    'node:fs/promises': { appendFile: async () => {} },
+  });
+  const previousKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = 'test-key-not-a-secret';
+  try {
+    const route = routeLoad('app/api/classify-moment/route.ts');
+    const body = { utterances: [
+      { speaker: 'interviewer', text: question },
+      { speaker: 'candidate', text: 'In my previous role I compared the latency before and after the release using traces.' },
+    ], currentState: 'idle', msSinceLastTranscript: 4000 };
+    for (const bad of ['not JSON', '{}', '{"state":"nonsense"}',
+      '{"state":"question_finalized","question":""}',
+      '{"state":"question_finalized","question":"What is your favorite food?"}']) {
+      modelText = bad;
+      const response = await route.POST(new Request('http://localhost/test', { method: 'POST', body: JSON.stringify(body) }));
+      assert.equal(response.status, 200); // intentional product fallback
+      const data = await response.json();
+      assert.throws(() => assertFinalizedQuestion(data, question)); // smoke must reject it
+    }
+    modelText = JSON.stringify({ state: 'question_finalized', question, summary: 'Discussing impact', questionRelation: 'new_topic' });
+    const response = await route.POST(new Request('http://localhost/test', { method: 'POST', body: JSON.stringify(body) }));
+    assertFinalizedQuestion(await response.json(), question);
+  } finally {
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+  }
+});
+
+test('mock-interview turns reuse fixed prefixes while slot/depth/answers remain uncached', async () => {
+  const requests = [];
+  let modelResult = { action: 'next', utterance: 'You measured latency. Let us discuss reliability.' };
+  const routeLoad = createLoader({ '@/lib/luna-client': {
+    LUNA_MODEL: 'gpt-6-luna', getLunaClient: () => ({ chat: { completions: {
+      create: async params => {
+        requests.push(prepareLunaRequest(params, 'mock_interviewer'));
+        return { choices: [{ message: { content: JSON.stringify(modelResult) } }] };
+      },
+    } } }),
+  } });
+  const route = routeLoad('app/api/mock-interviewer/next-turn/route.ts');
+  const base = { jd: 'FIXED_ROLE_DESCRIPTION', language: 'en', followupDepth: 0,
+    planSlots: ['SLOT_ZERO', 'SLOT_ONE', 'SLOT_TWO'].map(question => ({ question, topic: 'engineering', style: 'behavioral', allowFollowups: true })) };
+  async function turn(body) {
+    const response = await route.POST(new Request('http://localhost/test', { method: 'POST', body: JSON.stringify({ ...base, ...body }) }));
+    assert.equal(response.status, 200);
+    return (await response.json()).result;
+  }
+  await turn({ currentSlotIndex: 0, currentQuestionText: 'CHANGING_QUESTION_ZERO',
+    candidateAnswer: 'CHANGING_ANSWER_ZERO: I measured API latency and improved our slow query.',
+    recentTranscript: [{ speaker: 'candidate', text: 'CHANGING_TRANSCRIPT_ZERO' }] });
+  await turn({ currentSlotIndex: 1, currentQuestionText: 'CHANGING_QUESTION_ONE', followupDepth: 1,
+    candidateAnswer: 'CHANGING_ANSWER_ONE: I added a dashboard showing error rates and API latency.',
+    recentTranscript: [{ speaker: 'candidate', text: 'CHANGING_TRANSCRIPT_ONE' }] });
+  assert.deepEqual(requests[0].messages.slice(0, 2), requests[1].messages.slice(0, 2));
+  for (const request of requests) {
+    assert.equal(request.prompt_cache_options.mode, 'explicit');
+    for (const message of request.messages.slice(0, 2)) {
+      assert.deepEqual(message.content[0].prompt_cache_breakpoint, { mode: 'explicit' });
+    }
+    assert.match(request.messages[1].content[0].text, /FIXED_ROLE_DESCRIPTION/);
+    assert.doesNotMatch(JSON.stringify(request.messages.slice(0, 2)), /CHANGING_|SLOT_ZERO|SLOT_ONE|SLOT_TWO/);
+    assert.equal(request.messages[2].role, 'user');
+  }
+  assert.match(requests[0].messages[2].content, /currentSlotIndex: 0/);
+  assert.match(requests[1].messages[2].content, /currentSlotIndex: 1/);
+  assert.match(requests[1].messages[2].content, /follow-up depth 1/);
+  assert.match(requests[1].messages[2].content, /CHANGING_ANSWER_ONE/);
+  assert.match(requests[1].messages[2].content, /CHANGING_TRANSCRIPT_ONE/);
+  // Keep the existing product guard: forbidden probes must never be spoken.
+  modelResult = { action: 'followup', utterance: 'FORBIDDEN_PROBE' };
+  const result = await turn({ currentSlotIndex: 0, currentQuestionText: 'Question', followupDepth: 2,
+    candidateAnswer: 'I measured API latency and improved the query execution plan substantially.' });
+  assert.equal(result.action, 'next');
+  assert.equal(result.nextSlotIndex, 1);
+  assert.equal(result.utterance, '');
+  const count = requests.length;
+  assert.equal((await turn({ currentSlotIndex: 2, currentQuestionText: 'Last question', followupDepth: 2, candidateAnswer: 'Done.' })).action, 'wrapup');
+  assert.equal(requests.length, count); // final unprobeable turn still avoids an API call
+});
 
 test('changing dialogue leaves reusable rule/session prefixes identical', () => {
   const base = { model: 'gpt-6-luna', max_completion_tokens: 600, messages: [

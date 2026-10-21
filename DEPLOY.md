@@ -134,6 +134,8 @@ Official pricing: https://developers.openai.com/api/docs/models/gpt-6-luna
 
 `lib/luna-request.ts` uses explicit 30-minute cache breakpoints on leading
 instructions/session context only. Changing transcript text is not cached.
+The per-turn mock interviewer also separates stable rules and role context
+from changing slot/depth/answer/transcript data.
 Prefixes below 1,024 tokens are ineligible; no padding or cache warmup calls
 are sent. Commentary keeps shared rules first, stable JD/resume context
 second, and changing question/answer/dialogue last. A first write and later
@@ -150,13 +152,18 @@ Validation:
 ```bash
 npm run test:luna          # local mocked transport/accounting checks; no API key
 npm run check:types
-npm run smoke:luna         # 6 small billable calls, fictional data; local key needed
+npm run smoke:luna         # 8 small billable calls, fictional data; local key needed
 ```
 
-The smoke check exercises the real classification, commentary (SSE) and
-question-detection routes without writing to the database. It checks cache
+The smoke check exercises the real classification, commentary (SSE),
+question-detection and per-turn mock-interview routes without writing to the database. It checks cache
 reads on repeated classification/commentary requests even when the current
-question changes, and prints only token counts, timings and estimated cost.
+question changes and across mock-interview turns. Classification must return
+the expected finalized state and the actual interviewer question, so a safe
+fallback after invalid model JSON cannot pass. The mock-interview fixture uses
+a detailed role description above the cache minimum; a shorter real role
+description can legitimately produce zero cache reads and writes. The check
+prints only token counts, timings and estimated cost.
 A zero cache hit fails validation; investigate routing, prefix stability and
 eligibility before release. This is a smoke check, not a full quality eval.
 
