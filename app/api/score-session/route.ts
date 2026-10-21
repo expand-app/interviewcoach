@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import type { SessionScore, Question } from "@/types/session";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 import { logSessionEvent } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
@@ -96,10 +96,10 @@ function verdictForPercent(percent: number): SessionScore["verdict"] {
  * Session so past-session views don't re-call the model.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "DEEPSEEK_API_KEY not set" },
+      { error: "OPENAI_API_KEY not set" },
       { status: 500 }
     );
   }
@@ -736,9 +736,8 @@ INSUFFICIENT gate: requires questionsWithEvidence < 3 AND totalEvidenceChars < 1
 
 Score the interview. Return JSON only.`;
 
-  // Diagnostic: log the rough prompt size before firing. deepseek-flash
-  // handles ~200K input tokens but the bigger risk is route latency at
-  // ~5K-tokens-per-1K-chars rates → 30s+ generation on huge prompts.
+  // Diagnostic: log rough prompt size before firing. Large transcripts
+  // increase input cost and processing latency even within the context limit.
   // Helps explain a hang as "too big" rather than "API down".
   const systemChars = system.length;
   const userChars = user.length;
@@ -760,10 +759,10 @@ Score the interview. Return JSON only.`;
   // wall-clock — a third attempt would push past most users'
   // patience and the 90s client-side timeout.
   async function callModelWithRetry() {
-    const client = getDeepseekClient("score_session");
+    const client = getLunaClient("score_session");
     const doCall = () =>
       client.chat.completions.create({
-        model: DEEPSEEK_MODEL,
+        model: LUNA_MODEL,
         // max_tokens 4000 (was 1500) — Chinese-output sessions (one
         // tenant ran a 12-question / 15K-char Uber interview that
         // kept landing on empty `dimensions: []` because the model's
@@ -771,7 +770,7 @@ Score the interview. Return JSON only.`;
         // tokens and JSON extraction caught a truncated array). The
         // provider limit is well above this; over-budgeting wastes
         // nothing because billing is on actually-emitted tokens.
-        max_tokens: 4000,
+        max_completion_tokens: 4000,
         // temperature: 0 makes scoring deterministic — same input
         // always produces the same verdict. The default lets the model
         // wobble between "insufficient_data" and a real grade on
@@ -1005,7 +1004,7 @@ Score the interview. Return JSON only.`;
         });
       }
       try {
-        const client = getDeepseekClient("score_session");
+        const client = getLunaClient("score_session");
         const strictAddendum =
           "\n\n--- OVERRIDE INSTRUCTION (MANDATORY) ---\n" +
           "Your previous response declined to grade this session (returned " +
@@ -1033,12 +1032,12 @@ Score the interview. Return JSON only.`;
           "IS enough to grade. Pick weights and scores that reflect what " +
           "you observed, even if rough.";
         const strictResp = await client.chat.completions.create({
-          model: DEEPSEEK_MODEL,
+          model: LUNA_MODEL,
           // Match the primary call's bumped budget so the retry
           // can also produce full Chinese justifications without
           // hitting the same truncation that triggered this
           // override in the first place.
-          max_tokens: 4000,
+          max_completion_tokens: 4000,
           // Bump temperature for the retry. With temp 0, an
           // identical retry will deterministically produce the
           // SAME bad output (the model is locked into a local

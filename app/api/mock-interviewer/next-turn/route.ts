@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -100,13 +100,30 @@ export async function POST(req: Request) {
     .map((t) => `${t.speaker === "interviewer" ? "YOU" : "CANDIDATE"}: ${t.text}`)
     .join("\n");
 
-  const prompt = `You are a professional interviewer running a live mock interview (spoken, voice-based). Decide your next move and produce EXACTLY what you will say next.
+  // These leading messages stay identical across turns. The shared Luna
+  // client places explicit cache breakpoints on them, while the changing
+  // turn below remains ordinary input (no repeated cache writes).
+  const rules = `You are a professional interviewer running a live mock interview (spoken, voice-based). Decide your next move and produce EXACTLY what you will say next.
 
-# Role you are hiring for
-${(jd ?? "").slice(0, 2000)}
+# Decision rules
+- Follow up ONLY when the current turn explicitly allows it AND the answer left a specific, concrete thread worth probing (a claim without evidence, an interesting decision, a vague area the role cares about). A complete, well-evidenced answer → move on.
+- ECHO THE CANDIDATE: open your utterance by briefly reflecting ONE specific detail from their answer, mirroring their own words — like a real interviewer ("Cutting the pipeline latency from four hours to twenty minutes — that's a serious win."). One short sentence, genuinely reactive, never generic filler like "great answer". Vary the phrasing across turns.
+- After the echo: for "followup", ask your probe; for "next", transition naturally into the next planned question ("...I'd like to switch gears a bit —"). You may lightly rephrase the planned question to connect to the conversation, but keep its topic and difficulty identical.
+- Keep the WHOLE utterance under 3 sentences — brisk, conversational momentum, no dead air.
+- When this was the last planned question and you're not following up → action "wrapup" (utterance empty).
+- Speak in ${language === "zh" ? "Chinese" : "English"}. Natural spoken style — it will be read aloud by TTS. No lists, no stage directions, no quotes around the question.
 
-# Current question you asked (follow-up depth ${followupDepth})
+Return ONLY JSON: {"action": "followup" | "next" | "wrapup", "utterance": string, "nextSlotIndex": number}
+- action "followup": utterance = your follow-up question (with a brief natural lead-in), nextSlotIndex = currentSlotIndex
+- action "next": utterance = acknowledgment + next question, nextSlotIndex = currentSlotIndex + 1
+- action "wrapup": utterance = "", nextSlotIndex = currentSlotIndex`;
+
+  const sessionContext = `# Role you are hiring for
+${(jd ?? "").slice(0, 2000)}`;
+
+  const turn = `# Current question you asked (follow-up depth ${followupDepth})
 "${currentQuestionText}"
+currentSlotIndex: ${currentSlotIndex}
 
 # Candidate's answer (verbatim transcript, may have speech artifacts)
 "${(candidateAnswer ?? "").slice(0, 3000)}"
@@ -121,26 +138,19 @@ ${
     : "(none — this was the last planned question)"
 }
 
-# Decision rules
-- May you ask a follow-up now? ${canFollowup ? "YES (at most one more level)" : "NO (move on)"}
-- Follow up ONLY if the answer left a specific, concrete thread worth probing (a claim without evidence, an interesting decision, a vague area the role cares about). A complete, well-evidenced answer → move on.
-- ECHO THE CANDIDATE: open your utterance by briefly reflecting ONE specific detail from their answer, mirroring their own words — like a real interviewer ("Cutting the pipeline latency from four hours to twenty minutes — that's a serious win."). One short sentence, genuinely reactive, never generic filler like "great answer". Vary the phrasing across turns.
-- After the echo: for "followup", ask your probe; for "next", transition naturally into the next planned question ("...I'd like to switch gears a bit —"). You may lightly rephrase the planned question to connect to the conversation, but keep its topic and difficulty identical.
-- Keep the WHOLE utterance under 3 sentences — brisk, conversational momentum, no dead air.
-- When this was the last planned question and you're not following up → action "wrapup" (utterance empty).
-- Speak in ${language === "zh" ? "Chinese" : "English"}. Natural spoken style — it will be read aloud by TTS. No lists, no stage directions, no quotes around the question.
-
-Return ONLY JSON: {"action": "followup" | "next" | "wrapup", "utterance": string, "nextSlotIndex": number}
-- action "followup": utterance = your follow-up question (with a brief natural lead-in), nextSlotIndex = ${currentSlotIndex}
-- action "next": utterance = acknowledgment + next question, nextSlotIndex = ${currentSlotIndex + 1}
-- action "wrapup": utterance = "", nextSlotIndex = ${currentSlotIndex}`;
+# Follow-up permission for this turn
+${canFollowup ? "YES (at most one more level)" : "NO (move on)"}`;
 
   try {
-    const client = getDeepseekClient("mock_interviewer");
+    const client = getLunaClient("mock_interviewer");
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 400,
-      messages: [{ role: "user", content: prompt }],
+      model: LUNA_MODEL,
+      max_completion_tokens: 400,
+      messages: [
+        { role: "developer", content: rules },
+        { role: "developer", content: sessionContext },
+        { role: "user", content: turn },
+      ],
     });
     const text =
       resp.choices[0]?.message?.content ?? "";

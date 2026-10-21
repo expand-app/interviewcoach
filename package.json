@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:luna": "node --test scripts/test-luna.cjs",
+    "smoke:luna": "node scripts/smoke-luna.cjs",
+    "check:types": "tsc --noEmit --incremental false"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1039.0",

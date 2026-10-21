@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -21,9 +21,9 @@ interface DetectBody {
  * "so uh tell me about yourself".
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return NextResponse.json({ error: "DEEPSEEK_API_KEY not set" }, { status: 500 });
+    return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 500 });
   }
 
   const body = (await req.json()) as DetectBody;
@@ -32,7 +32,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ isQuestion: false });
   }
 
-  const client = getDeepseekClient("detect_question");
+  const client = getLunaClient("detect_question");
 
   const system = `You are a classifier inside a live interview assistant. You decide if the latest utterance from the transcript stream is the interviewer asking a NEW question.
 
@@ -57,8 +57,8 @@ ${utterance}
 
   try {
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 200,
+      model: LUNA_MODEL,
+      max_completion_tokens: 200,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },

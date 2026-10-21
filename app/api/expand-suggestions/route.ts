@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 import { logSessionEvent, logSessionEvents } from "@/lib/session-event-log";
 
 export const runtime = "nodejs";
@@ -148,7 +148,7 @@ async function expandSingle(
   jd: string,
   resume: string
 ): Promise<string | null> {
-  const client = getDeepseekClient("expand_suggestions");
+  const client = getLunaClient("expand_suggestions");
   const user = buildUserPrompt(item, jd, resume);
 
   const doCall = () =>
@@ -156,8 +156,8 @@ async function expandSingle(
       // Smaller per-item prompt + simpler output shape lets us cap
       // tokens MUCH lower than the batch call's 8000. 800 covers the
       // 220-word target with margin.
-      model: DEEPSEEK_MODEL,
-      max_tokens: 800,
+      model: LUNA_MODEL,
+      max_completion_tokens: 800,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: user },
@@ -252,10 +252,10 @@ async function mapWithConcurrency<T, R>(
 }
 
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "DEEPSEEK_API_KEY not set", fallback: true },
+      { error: "OPENAI_API_KEY not set", fallback: true },
       { status: 200 }
     );
   }
@@ -300,7 +300,7 @@ export async function POST(req: Request) {
   // 429 floods that we'd then have to retry.
   //
   // NOTE: this number was tuned against Anthropic's rate limits and
-  // has NOT been re-measured against DeepSeek's, which throttle
+  // has NOT been re-measured against Luna's, which throttle
   // differently. If end-of-session expansion starts throwing 429s,
   // this is the knob.
   const CONCURRENCY = 8;

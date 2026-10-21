@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -20,10 +20,10 @@ interface IdentifyBody {
  * later when more text accumulates.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: "DEEPSEEK_API_KEY not set" },
+      { error: "OPENAI_API_KEY not set" },
       { status: 500 }
     );
   }
@@ -36,7 +36,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ roles: {} });
   }
 
-  const client = getDeepseekClient("identify_speakers");
+  const client = getLunaClient("identify_speakers");
 
   const system = `You identify the role of each speaker in a recorded interview.
 
@@ -75,8 +75,8 @@ Classify each speaker number you have enough evidence for.`;
 
   try {
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 200,
+      model: LUNA_MODEL,
+      max_completion_tokens: 200,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },

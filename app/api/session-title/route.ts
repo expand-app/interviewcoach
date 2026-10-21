@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDeepseekClient, DEEPSEEK_MODEL } from "@/lib/deepseek-client";
+import { getLunaClient, LUNA_MODEL } from "@/lib/luna-client";
 
 export const runtime = "nodejs";
 
@@ -24,10 +24,10 @@ interface TitleBody {
  * any failure so the UI always has something to render.
  */
 export async function POST(req: Request) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { title: "Live Interview Session", error: "DEEPSEEK_API_KEY not set" },
+      { title: "Live Interview Session", error: "OPENAI_API_KEY not set" },
       { status: 200 }
     );
   }
@@ -59,10 +59,10 @@ ${jd.slice(0, 4000)}
 Write the title.`;
 
   try {
-    const client = getDeepseekClient("session_title");
+    const client = getLunaClient("session_title");
     const resp = await client.chat.completions.create({
-      model: DEEPSEEK_MODEL,
-      max_tokens: 40,
+      model: LUNA_MODEL,
+      max_completion_tokens: 40,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
